@@ -1,0 +1,114 @@
+# Keyword rules for matching/highlighting collected items.
+#
+# priority: critical | warn | info
+# pattern: Python regex (re.IGNORECASE applied by default)
+# tags: list of labels shown on the dashboard
+#
+# Edit this file live — the matcher hot-reloads within one poll cycle.
+# Add your specific target indicators in the "TARGET" section below.
+
+# ── TARGET (fill in your investigation specifics) ─────────────────────────────
+# Uncomment and set one or more patterns for the entity you are investigating.
+# These fire as critical so they stand out immediately.
+#
+# - pattern: "(?i)\\bMyTargetOrg\\b"
+#   priority: critical
+#   tags: [target]
+#
+# - pattern: "(?i)mytarget\\.de"
+#   priority: critical
+#   tags: [target, domain]
+#
+# - pattern: "DE\\d{2}[ ]?\\d{4}[ ]?\\d{4}[ ]?\\d{4}[ ]?\\d{4}[ ]?\\d{2}"
+#   priority: critical
+#   tags: [target, iban]
+
+
+# ── Explicit breach offerings (high confidence) ───────────────────────────────
+# Require breach-type term AND sale/price signal in proximity — avoids news articles.
+
+- pattern: "(?i)\\b(combolist|combo.?list|credential.?dump|credential.?leak|fullz|account.?dump|log.?stealer|infostealer|stealer.?log)\\b"
+  priority: warn
+  tags: [credentials, breach-type]
+  notes: "Specific breach product terms — high signal even without sale context"
+
+- pattern: "(?i)\\b(database|sql.?dump|mysql.?dump|csv.?dump|data.?dump|db.?dump).{0,60}(for.sale|selling|buy|\\$\\d+|€\\d+|\\d+\\s*(USD|EUR|XMR|BTC)|leak|dump)\\b"
+  priority: warn
+  tags: [database, breach-type]
+  notes: "Database dump with explicit sale or leak context — excludes bare 'database' mentions"
+
+- pattern: "(?i)\\b(KYC|know.your.customer|identity.?document|passport.?scan).{0,40}(dump|leak|sell|offer|for.sale)\\b"
+  priority: warn
+  tags: [kyc, identity]
+
+- pattern: "(?i)\\b(credit.?card|debit.?card|carding|cvv|fullz.?cc|cc.?dump).{0,30}(dump|leak|sell|buy|offer|for.sale)\\b"
+  priority: warn
+  tags: [payment-card]
+
+- pattern: "(?i)\\b(bank.?account|banking.?data|wire.?transfer|SEPA|account.?number).{0,40}(dump|leak|sell|for.sale)\\b"
+  priority: warn
+  tags: [banking, payment]
+
+- pattern: "(?i)\\b(PII|personally.identifiable|social.?security|SSN|date.?of.?birth|DOB|home.?address).{0,40}(dump|leak|sell|for.sale|\\d+[kKmM]|records)\\b"
+  priority: warn
+  tags: [pii]
+
+- pattern: "(?i)\\b(initial.?access|access.?for.sale|rdp.?for.sale|vpn.?for.sale|webshell|foothold).{0,40}(sell|buy|\\$\\d+|€\\d+|\\d+\\s*(USD|EUR|XMR|BTC))\\b"
+  priority: warn
+  tags: [access]
+  notes: "Initial access brokers — only when a price or sale signal is nearby"
+
+- pattern: "(?i)\\b(email.?list|email.?database|mail.?dump|subscribers.?dump).{0,30}(\\d+[kKmM]|records|entries)\\b"
+  priority: info
+  tags: [email-list]
+
+- pattern: "(?i)\\b(\\d+[\\.\\s]?[kKmM]|million|billion).{0,15}(record|account|credential|user|customer).{0,30}(leak|dump|sell|for.sale|breach)\\b"
+  priority: info
+  tags: [scale]
+  notes: "Scale + breach context required — avoids '1M users registered' type posts"
+
+- pattern: "(?i)\\b(proof|free.?sample|telegram.?sample).{0,30}(data|dump|leak|record|credential)\\b"
+  priority: info
+  tags: [offer-proof]
+  notes: "Proof-of-offering — only when paired with breach content"
+
+- pattern: "(?i)\\b(darkweb|dark.?market|darknet.?market|underground.?forum|hacking.?forum).{0,40}(data|dump|sell|credential|record|leak)\\b"
+  priority: info
+  tags: [marketplace]
+
+
+# ── Ransomware — DACH-relevant only ──────────────────────────────────────────
+# Generic ransomware victim posts (non-DACH) were 71/78 of all warn matches.
+# Split: DACH victims → warn; named groups without geo → info.
+
+- pattern: "(?i)\\b(ransomware|ransom.?group|extortion|double.?extortion|victim.?published).{0,80}(\\.(de|at|ch)\\b|\\bgermany\\b|\\bgerman\\b|\\bdeutsch|\\bAustria\\b|\\bSchweiz\\b|\\bDACH\\b)"
+  priority: warn
+  tags: [ransomware, geo-dach]
+  notes: "Ransomware victim with DACH domain or geography — high relevance"
+
+- pattern: "(?i)\\b(LockBit|BlackCat|ALPHV|Cl0p|Clop|Play|Royal|Black.?Basta|Rhysida|Akira|8Base|Medusa|RansomHub|INC.?Ransom|Cactus).{0,80}(\\.(de|at|ch)\\b|\\bgermany\\b|\\bgerman\\b|\\bdeutsch|\\bDACH\\b)"
+  priority: warn
+  tags: [ransomware-group, geo-dach]
+  notes: "Named ransomware group + DACH geography"
+
+- pattern: "(?i)\\b(LockBit|BlackCat|ALPHV|Cl0p|Clop|Play|Royal|Black.?Basta|Rhysida|Akira|8Base|Medusa|RansomHub|INC.?Ransom|Cactus)\\b"
+  priority: info
+  tags: [ransomware-group]
+  notes: "Named group without DACH geo — informational only"
+
+
+# ── Geographic scope ──────────────────────────────────────────────────────────
+- pattern: "(?i)\\b(germany|german|deutsch(land)?|österreich|austria|schweiz|switzerland|DACH)\\b"
+  priority: info
+  tags: [geo-dach]
+
+- pattern: "(?i)\\b(EU|European.?Union|eurozone).{0,30}(data|record|customer|user|citizen).{0,30}(leak|dump|sell|breach)\\b"
+  priority: info
+  tags: [geo-eu]
+  notes: "EU data with breach context — tighter than before"
+
+
+# ── HIBP / breach catalog signals ────────────────────────────────────────────
+- pattern: "(?i)\\b(unverified|sensitive.?breach|fabricated)\\b"
+  priority: info
+  tags: [hibp-meta]

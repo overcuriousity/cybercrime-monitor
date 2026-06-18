@@ -1,0 +1,248 @@
+# Source configuration for marketplace-monitor.
+# Top-level keys: nitter_instances (list), sources (list)
+
+nitter_instances:
+  - "https://nitter.net"
+  - "https://nitter.privacydev.net"
+  - "https://nitter.poast.org"
+
+sources:
+
+  # ── Clearnet leak forums ──────────────────────────────────────────────────
+  - id: breachforums
+    name: "BreachForums"
+    type: html_forum
+    url: "https://breachforums.st/Forum-Databases"  # update URL to current live mirror
+    interval_seconds: 600
+    jitter: 120
+    enabled: false  # DNS resolution failed — domain likely moved
+    row_selector: "tr.inline_row"
+    title_selector: "span.subject_new a, span.subject_old a"
+    url_selector: "span.subject_new a, span.subject_old a"
+    date_selector: "span.lastpost span"
+
+  - id: leakbase
+    name: "Leakbase"
+    type: html_forum
+    url: "https://leakbase.io/forums/leaks.10/"
+    interval_seconds: 900
+    jitter: 180
+    enabled: false  # redirects to traffic broker — domain likely changed
+    row_selector: "div.structItem--thread"
+    title_selector: "div.structItem-title a:last-child"
+    url_selector: "div.structItem-title a:last-child"
+    date_selector: "time"
+
+  - id: darkforums
+    name: "DarkForums"
+    type: html_forum
+    url: "https://darkforums.st/Forum-Data-Leaks"  # update to current mirror URL
+    interval_seconds: 900
+    jitter: 150
+    enabled: false  # 301 → timeout, domain likely moved
+    row_selector: "tr.inline_row"
+    title_selector: "span.subject_new a, span.subject_old a"
+    url_selector: "span.subject_new a, span.subject_old a"
+    date_selector: "span.lastpost span"
+
+  - id: nulled
+    name: "Nulled.to"
+    type: html_forum
+    url: "https://www.nulled.to/forum/127-databases/"
+    interval_seconds: 1200
+    jitter: 240
+    enabled: false  # needs: re-verify selectors against current live markup before re-enabling
+    row_selector: "tr.topic_row"
+    title_selector: "td.col_f_content a.topic_title"
+    url_selector: "td.col_f_content a.topic_title"
+    date_selector: "td.col_f_post abbr"
+
+  # ── Tor .onion forums ───────────────────────────────────────────────────────
+  - id: dread_leaks
+    name: "Dread /d/Leaks"
+    type: tor_forum
+    url: "http://dreadytofatroptsdj6io7l3xptbet6onoyno2yv7jicoxknyazubrad.onion/d/Leaks"
+    interval_seconds: 1800
+    jitter: 300
+    enabled: false  # needs: Playwright+Tor — Dread serves a JS waiting-room page selectolax can't render
+    row_selector: "div.post-row, div.listing-item"
+    title_selector: "p.title a, h4 a"
+    url_selector: "p.title a, h4 a"
+    date_selector: "span.created time, span.time"
+
+  - id: dread_databases
+    name: "Dread /d/Databases"
+    type: tor_forum
+    url: "http://dreadytofatroptsdj6io7l3xptbet6onoyno2yv7jicoxknyazubrad.onion/d/Databases"
+    interval_seconds: 1800
+    jitter: 300
+    enabled: false  # needs: Playwright+Tor — Dread serves a JS waiting-room page selectolax can't render
+    row_selector: "div.post-row, div.listing-item"
+    title_selector: "p.title a, h4 a"
+    url_selector: "p.title a, h4 a"
+    date_selector: "span.created time, span.time"
+
+  - id: doxbin_tor
+    name: "Doxbin (Tor)"
+    type: tor_forum
+    url: "http://CHANGEME.onion/"  # confirmed dead (SOCKS connect failure, 3/3 attempts) — find current mirror
+    interval_seconds: 2400
+    jitter: 400
+    enabled: false  # needs: live mirror URL — last known onion address no longer resolves
+    row_selector: "tr.content"
+    title_selector: "td.title a"
+    url_selector: "td.title a"
+    date_selector: "td.date"
+
+  # ── X via Nitter RSS ───────────────────────────────────────────────────────
+  # All three configured public instances verified dead as of 2026-06:
+  # nitter.net returns HTTP 200 with an empty body (no RSS content),
+  # nitter.privacydev.net times out, nitter.poast.org returns 403. Public
+  # Nitter instances are effectively gone — re-enable only against a private/
+  # self-hosted instance added to nitter_instances above.
+  - id: nitter_darkwebinformer
+    name: "X/@DarkWebInformer"
+    type: nitter
+    account: "DarkWebInformer"
+    interval_seconds: 180
+    jitter: 30
+    enabled: false  # needs: a working Nitter instance (private/self-hosted) — see note above
+
+  - id: nitter_vxunderground
+    name: "X/@vxunderground"
+    type: nitter
+    account: "vxunderground"
+    interval_seconds: 300
+    jitter: 60
+    enabled: false  # needs: a working Nitter instance (private/self-hosted) — see note above
+
+  - id: nitter_falconfeeds
+    name: "X/@FalconFeedsio"
+    type: nitter
+    account: "FalconFeedsio"
+    interval_seconds: 300
+    jitter: 60
+    enabled: false  # needs: a working Nitter instance (private/self-hosted) — see note above
+
+  - id: nitter_h4ckmanac
+    name: "X/@H4ckManac"
+    type: nitter
+    account: "H4ckManac"
+    interval_seconds: 300
+    jitter: 60
+    enabled: false  # needs: a working Nitter instance (private/self-hosted) — see note above
+
+  - id: nitter_sodiummunch
+    name: "X/@sodiummunch"
+    type: nitter
+    account: "sodiummunch"
+    interval_seconds: 600
+    jitter: 90
+    enabled: false  # account not found on Nitter (404/403); also blocked by the dead-instances note above
+
+  # ── Mastodon public tag timelines ─────────────────────────────────────────
+  # infosec.exchange now blocks unauthenticated tag timeline access (422).
+  # mastodon.social still allows public access.
+  - id: mastodon_dataleak
+    name: "Mastodon #dataleak"
+    type: mastodon
+    instance: "mastodon.social"
+    tag: "dataleak"
+    interval_seconds: 300
+    jitter: 60
+    enabled: true
+
+  - id: mastodon_databreach
+    name: "Mastodon #databreach"
+    type: mastodon
+    instance: "mastodon.social"
+    tag: "databreach"
+    interval_seconds: 300
+    jitter: 60
+    enabled: true
+
+  - id: mastodon_breach
+    name: "Mastodon #breach"
+    type: mastodon
+    instance: "mastodon.social"
+    tag: "breach"
+    interval_seconds: 600
+    jitter: 90
+    enabled: true
+
+  - id: mastodon_ransomware
+    name: "Mastodon #ransomware"
+    type: mastodon
+    instance: "mastodon.social"
+    tag: "ransomware"
+    interval_seconds: 600
+    jitter: 90
+    enabled: true
+
+  # ── Paste sites ────────────────────────────────────────────────────────────
+  - id: pastebin_archive
+    name: "Pastebin Archive"
+    type: paste
+    url: "https://pastebin.com/archive"
+    interval_seconds: 300
+    jitter: 60
+    enabled: true
+    fetch_content: false
+
+  - id: rentry_recent
+    name: "Rentry Recent"
+    type: paste
+    url: "https://rentry.co/api/pages"
+    interval_seconds: 600
+    jitter: 90
+    enabled: false  # needs: current API path — /api/pages 404s, rentry's listing API has changed
+
+  # ── HIBP breach feed ───────────────────────────────────────────────────────
+  - id: hibp
+    name: "HaveIBeenPwned Breaches"
+    type: hibp
+    interval_seconds: 3600
+    jitter: 300
+    enabled: true
+
+  # ── RSS/Atom feeds ─────────────────────────────────────────────────────────
+  # Far more stable than HTML scraping (see html_forum/tor_forum sources above,
+  # most of which are disabled due to markup drift) — the feed format is a
+  # stable contract.
+  - id: rss_databreaches
+    name: "DataBreaches.net"
+    type: rss
+    url: "https://databreaches.net/feed/"
+    interval_seconds: 900
+    jitter: 120
+    enabled: true
+    source_tags: [breach-news]
+
+  - id: rss_cisa_advisories
+    name: "CISA Cybersecurity Advisories"
+    type: rss
+    url: "https://www.cisa.gov/cybersecurity-advisories/all.xml"
+    interval_seconds: 1800
+    jitter: 180
+    enabled: true
+    source_tags: [advisory, government]
+
+  - id: rss_bleepingcomputer
+    name: "BleepingComputer"
+    type: rss
+    url: "https://www.bleepingcomputer.com/feed/"
+    interval_seconds: 900
+    jitter: 120
+    enabled: true
+    source_tags: [security-news]
+
+  # ── Ransomware leak-site tracker ───────────────────────────────────────────
+  # Structured JSON (victim, group/actor, country, attack date) from
+  # ransomware.live — no scraping, no Tor. Free tier is rate-limited to
+  # 1 req/min, so interval_seconds must stay >= 90.
+  - id: ransomware_live_recent
+    name: "ransomware.live recent victims"
+    type: ransomware_live
+    interval_seconds: 300
+    jitter: 60
+    enabled: true

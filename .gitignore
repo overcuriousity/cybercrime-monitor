@@ -1,0 +1,29 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets
+.env
+
+# Real operational config — can carry investigation TARGET indicators
+# (keywords.yaml) or be otherwise deployment-specific (sources.yaml: live
+# .onion URLs, your specific monitored accounts/tags). Templates are
+# tracked instead — see config/*.yaml.example.
+config/keywords.yaml
+config/sources.yaml
+
+# Runtime data (breach DB, HIBP dedupe state)
+data/
+# Belt-and-suspenders: no DB file should ever live anywhere else in the repo
+# (api/static/ is served publicly via StaticFiles — see api/app.py's startup check)
+*.db
+*.db-shm
+*.db-wal
+

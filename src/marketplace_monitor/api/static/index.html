@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Marketplace Monitor</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <div class="logo">
+      <span class="logo-icon">⬡</span>
+      <span class="logo-text">Marketplace Monitor</span>
+    </div>
+    <div class="header-stats">
+      <span id="total-count" class="stat-badge">— items</span>
+      <span id="sse-status" class="sse-status disconnected" title="Live feed status">●</span>
+    </div>
+    <nav class="tabs">
+      <button class="tab active" data-tab="feed">Feed</button>
+      <button class="tab" data-tab="settings">Keywords</button>
+    </nav>
+  </header>
+
+  <!-- ── Feed tab ─────────────────────────────────────────────────────────── -->
+  <div id="tab-feed" class="tab-content active">
+    <div class="dashboard-pane">
+      <section class="gauge-row">
+        <div class="gauge-card">
+          <div class="gauge-value" id="gauge-critical-24h">—</div>
+          <div class="gauge-label prio-critical">Critical (24h)</div>
+        </div>
+        <div class="gauge-card">
+          <div class="gauge-value" id="gauge-total">—</div>
+          <div class="gauge-label">Total items</div>
+        </div>
+        <div class="gauge-card">
+          <div class="gauge-value" id="gauge-sources-ok">—</div>
+          <div class="gauge-label">Sources healthy</div>
+        </div>
+        <div class="gauge-card hidden" id="gauge-classifier-card">
+          <div class="gauge-value" id="gauge-classifier-backlog">—</div>
+          <div class="gauge-label">Classifier backlog</div>
+        </div>
+      </section>
+
+      <section class="chart-row">
+        <div class="chart-card chart-card-wide">
+          <h3>Activity (last 48h)</h3>
+          <div class="chart-canvas"><canvas id="chart-timeseries"></canvas></div>
+        </div>
+        <div class="chart-card">
+          <h3>Priority breakdown</h3>
+          <div class="chart-canvas"><canvas id="chart-priority"></canvas></div>
+        </div>
+        <div class="chart-card">
+          <h3>By source</h3>
+          <div class="chart-canvas"><canvas id="chart-sources"></canvas></div>
+        </div>
+        <div class="chart-card">
+          <h3>Top ransomware groups</h3>
+          <div class="chart-canvas"><canvas id="chart-actors"></canvas></div>
+        </div>
+      </section>
+    </div>
+
+    <div class="feed-body">
+      <aside class="sidebar">
+        <section class="filter-section">
+          <h3>Filter</h3>
+          <input type="search" id="search-input" placeholder="Search titles & snippets…" autocomplete="off">
+        </section>
+
+        <section class="filter-section">
+          <h3>Priority</h3>
+          <label class="radio-row">
+            <input type="radio" name="priority" value="" checked> All
+          </label>
+          <label class="radio-row prio-info">
+            <input type="radio" name="priority" value="info"> Info +
+          </label>
+          <label class="radio-row prio-warn">
+            <input type="radio" name="priority" value="warn"> Warn +
+          </label>
+          <label class="radio-row prio-critical">
+            <input type="radio" name="priority" value="critical"> Critical only
+          </label>
+          <label class="radio-row matched-only-row">
+            <input type="checkbox" id="matched-only"> Matched only
+          </label>
+          <label class="radio-row matched-only-row hidden" id="show-filtered-row">
+            <input type="checkbox" id="show-filtered"> Show filtered (admin)
+          </label>
+        </section>
+
+        <section class="filter-section">
+          <h3>Sources</h3>
+          <div id="source-legend" class="source-legend"></div>
+          <div id="source-filters"></div>
+        </section>
+      </aside>
+
+      <main class="feed">
+        <div id="new-items-banner" class="hidden">
+          <button onclick="applyFilters()">▲ Load new items</button>
+        </div>
+        <div id="feed-list"></div>
+        <div id="feed-empty" class="empty-state hidden">No items match your filters.</div>
+        <button id="load-more" class="load-more hidden">Load more</button>
+      </main>
+    </div>
+  </div>
+
+  <!-- ── Settings tab ─────────────────────────────────────────────────────── -->
+  <div id="tab-settings" class="tab-content hidden">
+    <div class="settings-pane">
+      <h2>Keyword Rules <span class="badge info">keywords.yaml</span></h2>
+      <p class="hint">Edit YAML directly. Rules are compiled with Python <code>re</code> — patterns have <code>re.IGNORECASE</code> applied unless you embed <code>(?-i)</code>. Save to hot-reload.</p>
+      <p class="hint">Admin token required — this view can reveal investigation target indicators and writes regex straight to disk.</p>
+      <div class="settings-actions">
+        <input type="password" id="kw-token" placeholder="Admin token" autocomplete="off">
+        <button id="kw-token-load" class="btn-primary">Unlock</button>
+        <span id="kw-token-status"></span>
+      </div>
+      <div id="kw-error" class="error-box hidden"></div>
+      <textarea id="kw-editor" spellcheck="false" rows="30" disabled></textarea>
+      <div class="settings-actions">
+        <button id="kw-save" class="btn-primary" disabled>Save &amp; Reload</button>
+        <span id="kw-status"></span>
+      </div>
+    </div>
+  </div>
+
+  <script src="/chart.umd.min.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
