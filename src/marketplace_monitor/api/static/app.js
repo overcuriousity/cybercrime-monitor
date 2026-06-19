@@ -14,6 +14,18 @@ const state = {
     matchedOnly: false,
     showFiltered: false,
     sources: new Set(),
+    since: '',
+    until: '',
+    crimeType: '',
+    actor: '',
+    victim: '',
+    classified: '',
+    minConfidence: 0,
+    cveId: '',
+    ioc: '',
+    tag: '',
+    extraKey: '',
+    clusterSize: '',
   },
   classifierEnabled: false, // set after the first /api/classifier/health check
   classifierPollSince: null,
@@ -31,12 +43,28 @@ const sourceLegend   = document.getElementById('source-legend');
 const searchInput    = document.getElementById('search-input');
 const matchedOnlyCb  = document.getElementById('matched-only');
 const showFilteredCb = document.getElementById('show-filtered');
+const sinceInput     = document.getElementById('since-input');
+const untilInput     = document.getElementById('until-input');
+const crimeTypeInput = document.getElementById('crime-type-input');
+const actorInput     = document.getElementById('actor-input');
+const victimInput    = document.getElementById('victim-input');
+const classifiedInput = document.getElementById('classified-input');
+const confidenceInput = document.getElementById('confidence-input');
+const confidenceValue = document.getElementById('confidence-value');
+const cveInput       = document.getElementById('cve-input');
+const iocInput       = document.getElementById('ioc-input');
+const tagInput       = document.getElementById('tag-input');
+const extraKeyInput  = document.getElementById('extra-key-input');
+const clusterSizeInput = document.getElementById('cluster-size-input');
 
 // ── Init ───────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
   initTabs();
+  loadFiltersFromUrl();
   await loadSources();
   await initClassifierUi(); // must run before the first applyFilters so badges render correctly
+  await loadCaseStats(); // populates crime-type dropdown
+  syncFilterControls();
   await applyFilters();
   connectSSE();
   initKeywordsAuth();
@@ -44,6 +72,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   initDashboard();
   setInterval(loadDashboard, 30000);
+
+  initCases();
+  initStatusBar();
 
   searchInput.addEventListener('input', debounce(() => {
     state.filters.search = searchInput.value.trim();
@@ -63,6 +94,23 @@ document.addEventListener('DOMContentLoaded', async () => {
       applyFilters();
     }));
   loadMoreBtn.addEventListener('click', loadMore);
+
+  sinceInput.addEventListener('change', () => { state.filters.since = sinceInput.value; applyFilters(); });
+  untilInput.addEventListener('change', () => { state.filters.until = untilInput.value; applyFilters(); });
+  crimeTypeInput.addEventListener('change', () => { state.filters.crimeType = crimeTypeInput.value; applyFilters(); });
+  actorInput.addEventListener('input', debounce(() => { state.filters.actor = actorInput.value.trim(); applyFilters(); }, 400));
+  victimInput.addEventListener('input', debounce(() => { state.filters.victim = victimInput.value.trim(); applyFilters(); }, 400));
+  classifiedInput.addEventListener('change', () => { state.filters.classified = classifiedInput.value; applyFilters(); });
+  confidenceInput.addEventListener('input', () => {
+    state.filters.minConfidence = parseFloat(confidenceInput.value) || 0;
+    confidenceValue.textContent = confidenceInput.value > 0 ? `≥ ${confidenceInput.value}` : '';
+    applyFilters();
+  });
+  cveInput.addEventListener('input', debounce(() => { state.filters.cveId = cveInput.value.trim(); applyFilters(); }, 400));
+  iocInput.addEventListener('input', debounce(() => { state.filters.ioc = iocInput.value.trim(); applyFilters(); }, 400));
+  tagInput.addEventListener('input', debounce(() => { state.filters.tag = tagInput.value.trim(); applyFilters(); }, 400));
+  extraKeyInput.addEventListener('input', debounce(() => { state.filters.extraKey = extraKeyInput.value.trim(); applyFilters(); }, 400));
+  clusterSizeInput.addEventListener('input', debounce(() => { state.filters.clusterSize = clusterSizeInput.value; applyFilters(); }, 400));
 });
 
 // ── Tabs ───────────────────────────────────────────────────────────────────
@@ -90,8 +138,9 @@ async function loadSources() {
     state.sources = data;
     // Only default new/unseen sources to "checked" — periodic health
     // refreshes (see setInterval) must not silently re-enable a source the
-    // user deliberately unchecked.
-    if (isFirstLoad) {
+    // user deliberately unchecked. If the URL already selected specific
+    // sources, preserve that instead of checking everything.
+    if (isFirstLoad && state.filters.sources.size === 0) {
       data.forEach(s => state.filters.sources.add(s.id));
       renderSourceLegend(); // static — render once, not on every health refresh
     }
@@ -288,6 +337,7 @@ async function applyFilters() {
   state.offset = 0;
   state.pendingLive = [];
   newBanner.classList.add('hidden');
+  pushFiltersToUrl();
 
   const params = buildParams(0, state.pageSize);
   let data;
@@ -340,6 +390,18 @@ function buildParams(offset, limit) {
   if (f.priority)     p.set('priority', f.priority);
   if (f.matchedOnly)  p.set('matched_only', 'true');
   if (f.showFiltered) p.set('show_filtered', 'true');
+  if (f.since)        p.set('since', toIsoUtc(f.since));
+  if (f.until)        p.set('until', toIsoUtc(f.until));
+  if (f.crimeType)    p.set('crime_type', f.crimeType);
+  if (f.actor)        p.set('actor', f.actor);
+  if (f.victim)       p.set('victim', f.victim);
+  if (f.classified)   p.set('classified', f.classified);
+  if (f.minConfidence > 0) p.set('min_confidence', String(f.minConfidence));
+  if (f.cveId)        p.set('cve_id', f.cveId);
+  if (f.ioc)          p.set('ioc', f.ioc);
+  if (f.tag)          p.set('tag', f.tag);
+  if (f.extraKey)     p.set('extra_key', f.extraKey);
+  if (f.clusterSize)  p.set('cluster_size', f.clusterSize);
   // Only send source_id when it actually narrows the result (a subset of
   // known sources is checked) — when everything is checked this is
   // equivalent to no filter, and omitting it keeps the URL short and
@@ -348,6 +410,80 @@ function buildParams(offset, limit) {
     f.sources.forEach(id => p.append('source_id', id));
   }
   return p.toString();
+}
+
+// datetime-local values are local-time strings without timezone. Convert to
+// ISO-8601 UTC so the server sees an unambiguous instant.
+function toIsoUtc(localValue) {
+  if (!localValue) return '';
+  const d = new Date(localValue);
+  return isNaN(d.getTime()) ? '' : d.toISOString();
+}
+
+function loadFiltersFromUrl() {
+  const p = new URLSearchParams(location.search);
+  const f = state.filters;
+  f.search = p.get('search') || '';
+  f.priority = p.get('priority') || '';
+  f.matchedOnly = p.get('matched_only') === 'true';
+  f.showFiltered = p.get('show_filtered') === 'true';
+  f.since = p.get('since') || '';
+  f.until = p.get('until') || '';
+  f.crimeType = p.get('crime_type') || '';
+  f.actor = p.get('actor') || '';
+  f.victim = p.get('victim') || '';
+  f.classified = p.get('classified') || '';
+  f.minConfidence = parseFloat(p.get('min_confidence') || '0') || 0;
+  f.cveId = p.get('cve_id') || '';
+  f.ioc = p.get('ioc') || '';
+  f.tag = p.get('tag') || '';
+  f.extraKey = p.get('extra_key') || '';
+  f.clusterSize = p.get('cluster_size') || '';
+  const sourceIds = p.getAll('source_id');
+  if (sourceIds.length) {
+    f.sources = new Set(sourceIds);
+  }
+}
+
+function syncFilterControls() {
+  const f = state.filters;
+  searchInput.value = f.search;
+  document.querySelectorAll('input[name="priority"]').forEach(r => {
+    r.checked = r.value === f.priority;
+  });
+  matchedOnlyCb.checked = f.matchedOnly;
+  showFilteredCb.checked = f.showFiltered;
+  sinceInput.value = f.since ? formatDatetimeLocal(f.since) : '';
+  untilInput.value = f.until ? formatDatetimeLocal(f.until) : '';
+  crimeTypeInput.value = f.crimeType;
+  actorInput.value = f.actor;
+  victimInput.value = f.victim;
+  classifiedInput.value = f.classified;
+  confidenceInput.value = f.minConfidence || 0;
+  confidenceValue.textContent = f.minConfidence > 0 ? `≥ ${f.minConfidence}` : '';
+  cveInput.value = f.cveId;
+  iocInput.value = f.ioc;
+  tagInput.value = f.tag;
+  extraKeyInput.value = f.extraKey;
+  clusterSizeInput.value = f.clusterSize;
+}
+
+function formatDatetimeLocal(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  // YYYY-MM-DDTHH:mm in local time
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function pushFiltersToUrl() {
+  const p = new URLSearchParams(buildParams(0, state.pageSize));
+  p.delete('limit');
+  p.delete('offset');
+  const qs = p.toString();
+  const url = qs ? `?${qs}` : location.pathname;
+  history.replaceState(null, '', url);
 }
 
 function renderItems(items, append) {
@@ -526,9 +662,13 @@ function connectSSE() {
 
   es.onmessage = (ev) => {
     if (!ev.data) return;
-    let item;
-    try { item = JSON.parse(ev.data); } catch { return; }
-    handleLiveItem(item);
+    let payload;
+    try { payload = JSON.parse(ev.data); } catch { return; }
+    if (payload && payload.type === 'status') {
+      handleStatusEvent(payload);
+    } else {
+      handleLiveItem(payload);
+    }
   };
 
   es.onerror = () => {
@@ -798,3 +938,335 @@ function renderActorsBar(actors) {
 
 // expose for banner button
 window.applyFilters = applyFilters;
+
+// ── Cases ──────────────────────────────────────────────────────────────────
+// Case-centric view on top of pipeline/correlate.py's deduplicated incidents
+// — distinct from the raw Feed tab above. See /api/cases* (api/routes.py).
+const casesState = {
+  cases: [],
+  offset: 0,
+  pageSize: 50,
+  hasMore: false,
+  selectedId: null,
+  filters: { search: '', significance: '', kevOnly: false, crimeType: '' },
+};
+
+const casesList       = document.getElementById('cases-list');
+const casesEmpty      = document.getElementById('cases-empty');
+const casesLoadMoreBtn = document.getElementById('cases-load-more');
+const caseSearchInput = document.getElementById('case-search-input');
+const caseKevOnlyCb   = document.getElementById('case-kev-only');
+const caseCrimeTypeLegend = document.getElementById('case-crime-type-legend');
+const caseDetailPane  = document.getElementById('case-detail');
+const caseDetailEmpty = document.getElementById('case-detail-empty');
+
+function initCases() {
+  caseSearchInput.addEventListener('input', debounce(() => {
+    casesState.filters.search = caseSearchInput.value.trim();
+    applyCaseFilters();
+  }, 400));
+  caseKevOnlyCb.addEventListener('change', () => {
+    casesState.filters.kevOnly = caseKevOnlyCb.checked;
+    applyCaseFilters();
+  });
+  document.querySelectorAll('input[name="case-significance"]').forEach(r =>
+    r.addEventListener('change', () => {
+      casesState.filters.significance = document.querySelector('input[name="case-significance"]:checked')?.value || '';
+      applyCaseFilters();
+    }));
+  casesLoadMoreBtn.addEventListener('click', loadMoreCases);
+
+  loadCaseStats();
+  applyCaseFilters();
+  setInterval(loadCaseStats, 30000);
+}
+
+function caseQueryParams(extra = {}) {
+  const params = new URLSearchParams();
+  if (casesState.filters.search) params.set('search', casesState.filters.search);
+  if (casesState.filters.significance) params.set('min_significance', casesState.filters.significance);
+  if (casesState.filters.kevOnly) params.set('in_kev', 'true');
+  if (casesState.filters.crimeType) params.set('crime_type', casesState.filters.crimeType);
+  Object.entries(extra).forEach(([k, v]) => params.set(k, v));
+  return params.toString();
+}
+
+async function applyCaseFilters() {
+  casesState.offset = 0;
+  try {
+    const data = await api('/api/cases?' + caseQueryParams({ limit: casesState.pageSize, offset: 0 }));
+    casesState.cases = data.cases;
+    casesState.hasMore = data.cases.length === casesState.pageSize && data.total > casesState.pageSize;
+    renderCasesList();
+  } catch (e) {
+    console.error('Failed to load cases', e);
+  }
+}
+
+async function loadMoreCases() {
+  casesState.offset += casesState.pageSize;
+  try {
+    const data = await api('/api/cases?' + caseQueryParams({ limit: casesState.pageSize, offset: casesState.offset }));
+    casesState.cases = casesState.cases.concat(data.cases);
+    casesState.hasMore = data.cases.length === casesState.pageSize;
+    renderCasesList();
+  } catch (e) {
+    console.error('Failed to load more cases', e);
+  }
+}
+
+async function loadCaseStats() {
+  try {
+    const stats = await api('/api/stats/cases');
+    document.getElementById('gauge-cases-total').textContent = stats.total.toLocaleString();
+    document.getElementById('gauge-cases-kev').textContent = stats.in_kev.toLocaleString();
+    renderCrimeTypeLegend(stats.by_crime_type || []);
+    populateCrimeTypeDropdown(stats.by_crime_type || []);
+  } catch (e) {
+    console.error('Failed to load case stats', e);
+  }
+}
+
+function populateCrimeTypeDropdown(byCrimeType) {
+  const current = crimeTypeInput.value;
+  crimeTypeInput.innerHTML = '<option value="">Any</option>';
+  byCrimeType.forEach(({ crime_type }) => {
+    const opt = document.createElement('option');
+    opt.value = crime_type;
+    opt.textContent = crime_type;
+    crimeTypeInput.appendChild(opt);
+  });
+  crimeTypeInput.value = current || '';
+}
+
+function renderCrimeTypeLegend(byCrimeType) {
+  caseCrimeTypeLegend.innerHTML = '';
+  byCrimeType.forEach(({ crime_type, n }) => {
+    const item = document.createElement('span');
+    item.className = 'legend-item crime-type-filter';
+    item.textContent = `${crime_type} (${n})`;
+    item.style.cursor = 'pointer';
+    item.classList.toggle('active', casesState.filters.crimeType === crime_type);
+    item.addEventListener('click', () => {
+      casesState.filters.crimeType = casesState.filters.crimeType === crime_type ? '' : crime_type;
+      renderCrimeTypeLegend(byCrimeType);
+      applyCaseFilters();
+    });
+    caseCrimeTypeLegend.appendChild(item);
+  });
+}
+
+function renderCasesList() {
+  casesList.innerHTML = '';
+  casesEmpty.classList.toggle('hidden', casesState.cases.length > 0);
+  casesState.cases.forEach(c => casesList.appendChild(buildCaseCard(c)));
+  casesLoadMoreBtn.classList.toggle('hidden', !casesState.hasMore);
+
+  // Critical-count gauge is derived client-side from the loaded page rather
+  // than a dedicated endpoint — good enough for an at-a-glance count without
+  // adding another /api/stats/cases query param.
+  const criticalCount = casesState.cases.filter(c => c.significance === 'critical').length;
+  document.getElementById('gauge-cases-critical').textContent = criticalCount.toLocaleString();
+}
+
+function buildCaseCard(c) {
+  const card = document.createElement('div');
+  card.className = 'item-card' + (c.significance ? ' prio-' + c.significance : '');
+  card.dataset.caseId = c.id;
+  if (c.id === casesState.selectedId) card.classList.add('flashUpdate');
+
+  const meta = document.createElement('div');
+  meta.className = 'item-meta';
+
+  if (c.significance) {
+    const chip = document.createElement('span');
+    chip.className = 'tag-chip prio-' + c.significance;
+    chip.textContent = c.significance.toUpperCase();
+    meta.appendChild(chip);
+  }
+
+  const crimeChip = document.createElement('span');
+  crimeChip.className = 'tag-chip';
+  crimeChip.textContent = c.crime_type;
+  meta.appendChild(crimeChip);
+
+  if (c.in_kev) {
+    const kevChip = document.createElement('span');
+    kevChip.className = 'tag-chip prio-critical';
+    kevChip.textContent = 'KEV';
+    kevChip.title = 'A linked CVE is in CISA\'s Known Exploited Vulnerabilities catalog';
+    meta.appendChild(kevChip);
+  }
+
+  if (c.source_count > 1) {
+    const clusterChip = document.createElement('span');
+    clusterChip.className = 'tag-chip cluster-chip';
+    clusterChip.textContent = `↻ ${c.source_count} sources`;
+    meta.appendChild(clusterChip);
+  }
+
+  const time = document.createElement('span');
+  time.className = 'item-time';
+  time.textContent = fmtTime(c.last_seen);
+  meta.appendChild(time);
+
+  card.appendChild(meta);
+
+  const titleDiv = document.createElement('div');
+  titleDiv.className = 'item-title';
+  titleDiv.textContent = c.title;
+  card.appendChild(titleDiv);
+
+  if (c.damaged_party || c.attribution) {
+    const sub = document.createElement('div');
+    sub.className = 'item-snippet';
+    const bits = [];
+    if (c.damaged_party) bits.push(`Victim: ${c.damaged_party}`);
+    if (c.attribution) bits.push(`Attribution: ${c.attribution}`);
+    if (c.cve_ids && c.cve_ids.length) bits.push(`CVEs: ${c.cve_ids.join(', ')}`);
+    sub.textContent = bits.join(' · ');
+    card.appendChild(sub);
+  }
+
+  card.addEventListener('click', () => selectCase(c.id));
+  return card;
+}
+
+async function selectCase(id) {
+  casesState.selectedId = id;
+  document.querySelectorAll('[data-case-id]').forEach(el => {
+    el.classList.toggle('flashUpdate', Number(el.dataset.caseId) === id);
+  });
+  try {
+    const { case: c, items } = await api(`/api/cases/${id}`);
+    renderCaseDetail(c, items);
+  } catch (e) {
+    console.error('Failed to load case detail', e);
+  }
+}
+
+function renderCaseDetail(c, items) {
+  caseDetailEmpty.classList.add('hidden');
+  caseDetailPane.classList.remove('hidden');
+  caseDetailPane.innerHTML = '';
+
+  const h = document.createElement('h3');
+  h.textContent = c.title;
+  caseDetailPane.appendChild(h);
+
+  const fields = [
+    ['Significance', c.significance],
+    ['Crime type', c.crime_type],
+    ['Victim', c.damaged_party],
+    ['Sector', c.damaged_party_sector],
+    ['Country', c.damaged_party_country],
+    ['Attribution', c.attribution],
+    ['Status', c.status],
+    ['CVEs', c.cve_ids.join(', ') || null],
+    ['In KEV', c.in_kev ? 'yes' : 'no'],
+    ['First seen', fmtTime(c.first_seen)],
+    ['Last seen', fmtTime(c.last_seen)],
+    ['Sources', String(c.source_count)],
+  ];
+  fields.forEach(([label, value]) => {
+    if (!value) return;
+    const row = document.createElement('div');
+    row.className = 'hint';
+    row.innerHTML = `<strong>${escHtml(label)}:</strong> ${escHtml(String(value))}`;
+    caseDetailPane.appendChild(row);
+  });
+
+  if (c.summary) {
+    const summary = document.createElement('div');
+    summary.className = 'item-snippet';
+    summary.textContent = c.summary;
+    caseDetailPane.appendChild(summary);
+  }
+
+  const itemsHeader = document.createElement('h3');
+  itemsHeader.textContent = `Corroborating reports (${items.length})`;
+  caseDetailPane.appendChild(itemsHeader);
+
+  items.forEach(it => {
+    const row = document.createElement('div');
+    row.className = 'item-card';
+    const a = document.createElement('a');
+    a.href = isSafeUrl(it.url) ? it.url : '#';
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    a.textContent = it.title;
+    row.appendChild(a);
+    const meta = document.createElement('div');
+    meta.className = 'item-time';
+    meta.textContent = `${it.source_name} · ${fmtTime(it.seen_at)}`;
+    row.appendChild(meta);
+    caseDetailPane.appendChild(row);
+  });
+}
+
+// ── Real-time subsystem status bar ───────────────────────────────────────────
+function initStatusBar() {
+  updateStatusBar();
+  setInterval(updateStatusBar, 10000);
+}
+
+async function updateStatusBar() {
+  try {
+    const s = await api('/api/status');
+    renderStatusBar(s);
+  } catch (e) {
+    console.error('Failed to load status', e);
+    setStatusPill('status-scheduler', 'status: unreachable', 'error');
+  }
+}
+
+function renderStatusBar(s) {
+  const sched = s.scheduler || {};
+  setStatusPill('status-scheduler', sched.running ? 'scheduler: running' : 'scheduler: stopped', sched.running ? 'ok' : 'error');
+
+  const src = s.sources || {};
+  const srcText = `sources: ${src.total - src.failing_count}/${src.total} healthy`;
+  setStatusPill('status-sources', srcText, src.failing_count > 0 ? 'warn' : 'ok');
+
+  const cls = s.classifier || {};
+  const clsText = cls.backend === 'none'
+    ? 'classifier: disabled'
+    : `classifier: ${cls.backlog || 0} backlog`;
+  const clsState = cls.consecutive_errors >= 3 ? 'error' : (cls.backlog > 50 ? 'warn' : 'ok');
+  setStatusPill('status-classifier', clsText, clsState);
+
+  const corr = s.correlation || {};
+  const corrText = `correlator: ${corr.backlog || 0} backlog`;
+  const corrState = corr.consecutive_errors >= 3 ? 'error' : (corr.backlog > 50 ? 'warn' : 'ok');
+  setStatusPill('status-correlation', corrText, corrState);
+
+  const res = s.research || {};
+  const resText = res.running > 0
+    ? `research: running (${res.running})`
+    : `research: ${res.queued || 0} queued`;
+  setStatusPill('status-research', resText, res.consecutive_errors >= 3 ? 'error' : (res.running > 0 ? 'active' : 'ok'));
+
+  const heal = s.heal || {};
+  const pending = (heal.proposals || {}).pending || 0;
+  const healText = `heal: ${pending} pending`;
+  setStatusPill('status-heal', healText, heal.consecutive_errors >= 3 ? 'error' : (pending > 0 ? 'active' : 'ok'));
+
+  const kev = s.kev || {};
+  const kevText = `KEV: ${(kev.count || 0).toLocaleString()}`;
+  setStatusPill('status-kev', kevText, 'ok');
+}
+
+function setStatusPill(id, text, state) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = text;
+  el.className = 'status-pill status-' + state;
+}
+
+// SSE may also push lightweight status events from background jobs.
+function handleStatusEvent(payload) {
+  // A full status payload mirrors /api/status; partial payloads update
+  // individual subsystems. Refresh the bar from the server to keep it simple
+  // and consistent.
+  updateStatusBar();
+}

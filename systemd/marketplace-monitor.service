@@ -1,5 +1,5 @@
 [Unit]
-Description=Marketplace Monitor — dark-web breach feed dashboard
+Description=Marketplace Monitor — real-time cybercrime landscape monitor
 After=network-online.target tor.service
 Wants=network-online.target
 

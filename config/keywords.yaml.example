@@ -1,30 +1,16 @@
-# Keyword rules for matching/highlighting collected items.
+# Keyword rules — a cheap pre-filter/hint layer, not the authoritative
+# significance signal. Every item still goes through LLM structured
+# extraction (see llm/backend.py) when llm_backend != "none"; these regex
+# matches just give that extraction a hint and provide a zero-config
+# fallback (instant Gotify on 'critical') when the LLM layer is disabled.
 #
 # priority: critical | warn | info
 # pattern: Python regex (re.IGNORECASE applied by default)
 # tags: list of labels shown on the dashboard
 #
 # Edit this file live — the matcher hot-reloads within one poll cycle.
-# Add your specific target indicators in the "TARGET" section below.
 
-# ── TARGET (fill in your investigation specifics) ─────────────────────────────
-# Uncomment and set one or more patterns for the entity you are investigating.
-# These fire as critical so they stand out immediately.
-#
-# - pattern: "(?i)\\bMyTargetOrg\\b"
-#   priority: critical
-#   tags: [target]
-#
-# - pattern: "(?i)mytarget\\.de"
-#   priority: critical
-#   tags: [target, domain]
-#
-# - pattern: "DE\\d{2}[ ]?\\d{4}[ ]?\\d{4}[ ]?\\d{4}[ ]?\\d{4}[ ]?\\d{2}"
-#   priority: critical
-#   tags: [target, iban]
-
-
-# ── Explicit breach offerings (high confidence) ───────────────────────────────
+# ── Explicit breach/data-sale offerings (high confidence) ────────────────────
 # Require breach-type term AND sale/price signal in proximity — avoids news articles.
 
 - pattern: "(?i)\\b(combolist|combo.?list|credential.?dump|credential.?leak|fullz|account.?dump|log.?stealer|infostealer|stealer.?log)\\b"
@@ -76,37 +62,27 @@
   priority: info
   tags: [marketplace]
 
+# ── Vulnerability exploitation ────────────────────────────────────────────────
 
-# ── Ransomware — DACH-relevant only ──────────────────────────────────────────
-# Generic ransomware victim posts (non-DACH) were 71/78 of all warn matches.
-# Split: DACH victims → warn; named groups without geo → info.
-
-- pattern: "(?i)\\b(ransomware|ransom.?group|extortion|double.?extortion|victim.?published).{0,80}(\\.(de|at|ch)\\b|\\bgermany\\b|\\bgerman\\b|\\bdeutsch|\\bAustria\\b|\\bSchweiz\\b|\\bDACH\\b)"
+- pattern: "(?i)\\bCVE-\\d{4}-\\d{4,}\\b"
   priority: warn
-  tags: [ransomware, geo-dach]
-  notes: "Ransomware victim with DACH domain or geography — high relevance"
+  tags: [cve]
+  notes: "Any CVE mention — enrich/cve.py and enrich/kev.py decide significance"
 
-- pattern: "(?i)\\b(LockBit|BlackCat|ALPHV|Cl0p|Clop|Play|Royal|Black.?Basta|Rhysida|Akira|8Base|Medusa|RansomHub|INC.?Ransom|Cactus).{0,80}(\\.(de|at|ch)\\b|\\bgermany\\b|\\bgerman\\b|\\bdeutsch|\\bDACH\\b)"
+- pattern: "(?i)\\b(actively.?exploited|zero.?day|0.?day|in.the.wild|exploit.?(kit|chain|poc)|proof.of.concept)\\b"
   priority: warn
-  tags: [ransomware-group, geo-dach]
-  notes: "Named ransomware group + DACH geography"
+  tags: [exploitation]
+
+# ── Ransomware ────────────────────────────────────────────────────────────────
+
+- pattern: "(?i)\\b(ransomware|ransom.?group|extortion|double.?extortion|victim.?published)\\b"
+  priority: warn
+  tags: [ransomware]
 
 - pattern: "(?i)\\b(LockBit|BlackCat|ALPHV|Cl0p|Clop|Play|Royal|Black.?Basta|Rhysida|Akira|8Base|Medusa|RansomHub|INC.?Ransom|Cactus)\\b"
   priority: info
   tags: [ransomware-group]
-  notes: "Named group without DACH geo — informational only"
-
-
-# ── Geographic scope ──────────────────────────────────────────────────────────
-- pattern: "(?i)\\b(germany|german|deutsch(land)?|österreich|austria|schweiz|switzerland|DACH)\\b"
-  priority: info
-  tags: [geo-dach]
-
-- pattern: "(?i)\\b(EU|European.?Union|eurozone).{0,30}(data|record|customer|user|citizen).{0,30}(leak|dump|sell|breach)\\b"
-  priority: info
-  tags: [geo-eu]
-  notes: "EU data with breach context — tighter than before"
-
+  notes: "Named ransomware group — informational; significance is decided by extraction"
 
 # ── HIBP / breach catalog signals ────────────────────────────────────────────
 - pattern: "(?i)\\b(unverified|sensitive.?breach|fabricated)\\b"

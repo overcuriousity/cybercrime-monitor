@@ -1,15 +1,19 @@
-"""Process-local health tracking for the classifier backend — mirrors the
+"""Process-local health tracking for the LLM extraction backend — mirrors the
 top-level `health.py` pattern for source collectors, kept as a separate
-single-instance registry since the classifier isn't a sources.yaml entry and
-joining it into the source-keyed dict would mean nothing (routes.py:
-api_sources joins against load_sources(), which has no "classifier" id).
+single-instance registry since the extraction backend isn't a sources.yaml
+entry and joining it into the source-keyed dict would mean nothing (routes.py:
+api_sources joins against load_sources(), which has no "llm" id).
 """
+import asyncio
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from ..api.sse import broadcaster
+
 
 @dataclass
-class ClassifierHealth:
+class LLMHealth:
     last_run_at: str | None = None
     last_success_at: str | None = None
     last_batch_size: int = 0
@@ -19,11 +23,19 @@ class ClassifierHealth:
     consecutive_errors: int = 0
 
 
-_health = ClassifierHealth()
+_health = LLMHealth()
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _emit(payload: dict) -> None:
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(broadcaster.broadcast_status("classifier", payload))
+    except RuntimeError:
+        pass
 
 
 def record_run_start() -> None:
@@ -35,13 +47,15 @@ def record_success(items_classified: int) -> None:
     _health.last_batch_size = items_classified
     _health.total_classified += items_classified
     _health.consecutive_errors = 0
+    _emit({"backlog": None, "last_batch_size": items_classified})
 
 
 def record_error(error: str) -> None:
     _health.last_error = error[:300]
     _health.last_error_at = _now_iso()
     _health.consecutive_errors += 1
+    _emit({"error": error[:300], "consecutive_errors": _health.consecutive_errors})
 
 
-def get() -> ClassifierHealth:
+def get() -> LLMHealth:
     return _health

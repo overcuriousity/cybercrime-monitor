@@ -18,9 +18,20 @@
     </div>
     <nav class="tabs">
       <button class="tab active" data-tab="feed">Feed</button>
+      <button class="tab" data-tab="cases">Cases</button>
       <button class="tab" data-tab="settings">Keywords</button>
     </nav>
   </header>
+
+  <div id="status-bar" class="status-bar" title="Subsystem status — refreshes every 10s">
+    <span class="status-pill" id="status-scheduler">scheduler: —</span>
+    <span class="status-pill" id="status-sources">sources: —</span>
+    <span class="status-pill" id="status-classifier">classifier: —</span>
+    <span class="status-pill" id="status-correlation">correlator: —</span>
+    <span class="status-pill" id="status-research">research: —</span>
+    <span class="status-pill" id="status-heal">heal: —</span>
+    <span class="status-pill" id="status-kev">KEV: —</span>
+  </div>
 
   <!-- ── Feed tab ─────────────────────────────────────────────────────────── -->
   <div id="tab-feed" class="tab-content active">
@@ -67,8 +78,16 @@
     <div class="feed-body">
       <aside class="sidebar">
         <section class="filter-section">
-          <h3>Filter</h3>
-          <input type="search" id="search-input" placeholder="Search titles & snippets…" autocomplete="off">
+          <h3>Search</h3>
+          <input type="search" id="search-input" placeholder="Titles & snippets…" autocomplete="off">
+        </section>
+
+        <section class="filter-section">
+          <h3>Time range</h3>
+          <label class="filter-label">Since</label>
+          <input type="datetime-local" id="since-input" step="60">
+          <label class="filter-label">Until</label>
+          <input type="datetime-local" id="until-input" step="60">
         </section>
 
         <section class="filter-section">
@@ -94,6 +113,38 @@
         </section>
 
         <section class="filter-section">
+          <h3>Classification</h3>
+          <label class="filter-label">Crime type</label>
+          <select id="crime-type-input"><option value="">Any</option></select>
+          <label class="filter-label">Actor</label>
+          <input type="text" id="actor-input" placeholder="e.g. LockBit" autocomplete="off">
+          <label class="filter-label">Victim</label>
+          <input type="text" id="victim-input" placeholder="Organization…" autocomplete="off">
+          <label class="filter-label">Classified</label>
+          <select id="classified-input">
+            <option value="">Any</option>
+            <option value="true">Yes</option>
+            <option value="false">No</option>
+          </select>
+          <label class="filter-label">Min confidence <span id="confidence-value"></span></label>
+          <input type="range" id="confidence-input" min="0" max="1" step="0.05" value="0">
+        </section>
+
+        <section class="filter-section">
+          <h3>Indicators</h3>
+          <label class="filter-label">CVE id</label>
+          <input type="text" id="cve-input" placeholder="CVE-2024-…" autocomplete="off">
+          <label class="filter-label">IOC</label>
+          <input type="text" id="ioc-input" placeholder="Domain / IP / hash…" autocomplete="off">
+          <label class="filter-label">Source tag</label>
+          <input type="text" id="tag-input" placeholder="e.g. security-news" autocomplete="off">
+          <label class="filter-label">Extra key</label>
+          <input type="text" id="extra-key-input" placeholder="JSON substring…" autocomplete="off">
+          <label class="filter-label">Min cluster size</label>
+          <input type="number" id="cluster-size-input" min="1" placeholder="1" step="1">
+        </section>
+
+        <section class="filter-section">
           <h3>Sources</h3>
           <div id="source-legend" class="source-legend"></div>
           <div id="source-filters"></div>
@@ -108,6 +159,70 @@
         <div id="feed-empty" class="empty-state hidden">No items match your filters.</div>
         <button id="load-more" class="load-more hidden">Load more</button>
       </main>
+    </div>
+  </div>
+
+  <!-- ── Cases tab ────────────────────────────────────────────────────────── -->
+  <div id="tab-cases" class="tab-content hidden">
+    <div class="dashboard-pane">
+      <section class="gauge-row">
+        <div class="gauge-card">
+          <div class="gauge-value" id="gauge-cases-total">—</div>
+          <div class="gauge-label">Total cases</div>
+        </div>
+        <div class="gauge-card">
+          <div class="gauge-value" id="gauge-cases-critical">—</div>
+          <div class="gauge-label prio-critical">Critical</div>
+        </div>
+        <div class="gauge-card">
+          <div class="gauge-value" id="gauge-cases-kev">—</div>
+          <div class="gauge-label">In CISA KEV</div>
+        </div>
+      </section>
+    </div>
+
+    <div class="feed-body">
+      <aside class="sidebar">
+        <section class="filter-section">
+          <h3>Filter</h3>
+          <input type="search" id="case-search-input" placeholder="Search victim, actor, title…" autocomplete="off">
+        </section>
+
+        <section class="filter-section">
+          <h3>Significance</h3>
+          <label class="radio-row">
+            <input type="radio" name="case-significance" value="" checked> All
+          </label>
+          <label class="radio-row prio-info">
+            <input type="radio" name="case-significance" value="info"> Info +
+          </label>
+          <label class="radio-row prio-warn">
+            <input type="radio" name="case-significance" value="warn"> Warn +
+          </label>
+          <label class="radio-row prio-critical">
+            <input type="radio" name="case-significance" value="critical"> Critical only
+          </label>
+          <label class="radio-row matched-only-row">
+            <input type="checkbox" id="case-kev-only"> KEV only
+          </label>
+        </section>
+
+        <section class="filter-section">
+          <h3>Crime type</h3>
+          <div id="case-crime-type-legend" class="source-legend"></div>
+        </section>
+      </aside>
+
+      <main class="feed">
+        <div id="cases-list"></div>
+        <div id="cases-empty" class="empty-state hidden">No cases match your filters.</div>
+        <button id="cases-load-more" class="load-more hidden">Load more</button>
+      </main>
+
+      <aside class="sidebar" id="case-detail-pane">
+        <div id="case-detail-empty" class="hint">Select a case to see corroborating reports and details.</div>
+        <div id="case-detail" class="hidden"></div>
+      </aside>
     </div>
   </div>
 

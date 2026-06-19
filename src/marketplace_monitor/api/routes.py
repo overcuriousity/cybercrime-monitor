@@ -1,25 +1,41 @@
 import asyncio
 import hmac
+import json
 import logging
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .. import health
-from ..classifier import health as classifier_health
+from ..llm import health as llm_health
 from ..db import (
+    count_cases,
+    count_cases_needing_research,
+    count_heal_proposals_by_status,
     count_items,
-    count_unclassified,
+    count_kev_catalog,
+    count_running_research_runs,
+    count_uncorrelated_extracted_items,
+    count_unextracted,
+    fetch_cases,
     fetch_items,
-    get_recent_classifications,
+    get_case_by_id,
+    get_case_items,
+    get_recent_extractions,
     stats_by_priority,
     stats_by_source,
+    stats_cases_by_crime_type,
+    stats_cases_in_kev,
     stats_timeseries,
     stats_top_actors,
     stats_top_keywords,
 )
 from ..matcher import matcher
+from ..pipeline import correlate as correlate_health
+from ..research import agent as research_health
+from ..research import heal as heal_health
 from ..scheduler import load_sources
 from ..settings import settings
 from .sse import TooManySubscribers, broadcaster
@@ -57,7 +73,7 @@ async def healthz(request: Request):
     body = {
         "db": "ok" if db_ok else "error",
         "scheduler": "ok" if scheduler_ok else "error",
-        "classifier_backend": settings.classifier_backend,
+        "classifier_backend": settings.llm_backend,
         "sources_total": len(enabled_sources),
         "sources_failing": failing,
     }
@@ -70,10 +86,9 @@ def _is_valid_admin_token(token: str | None) -> bool:
 
 
 async def require_admin(x_admin_token: str | None = Header(default=None)):
-    """Gate for the keyword editor — it can read the investigation TARGET
-    indicators and write arbitrary regex to disk. Fails closed: if no
-    ADMIN_TOKEN is configured, the endpoints are unreachable rather than
-    silently public."""
+    """Gate for the keyword editor — it can write arbitrary regex to disk.
+    Fails closed: if no ADMIN_TOKEN is configured, the endpoints are
+    unreachable rather than silently public."""
     if not _is_valid_admin_token(x_admin_token):
         raise HTTPException(status_code=403, detail="Admin token required")
 
@@ -94,6 +109,18 @@ async def api_items(
     search: str | None = Query(default=None),
     matched_only: bool = Query(default=False),
     show_filtered: bool = Query(default=False),
+    crime_type: str | None = Query(default=None),
+    actor: str | None = Query(default=None),
+    victim: str | None = Query(default=None),
+    cve_id: str | None = Query(default=None),
+    ioc: str | None = Query(default=None),
+    tag: str | None = Query(default=None),
+    classified: bool | None = Query(default=None),
+    min_confidence: float | None = Query(default=None, ge=0.0, le=1.0),
+    cluster_size: int | None = Query(default=None, ge=1),
+    since: str | None = Query(default=None),
+    until: str | None = Query(default=None),
+    extra_key: str | None = Query(default=None),
     x_admin_token: str | None = Header(default=None),
 ):
     # show_filtered reveals classifier-flagged false positives — admin-gated
@@ -102,6 +129,22 @@ async def api_items(
     # themselves. The base feed stays fully public either way.
     if show_filtered and not _is_valid_admin_token(x_admin_token):
         raise HTTPException(status_code=403, detail="Admin token required to view filtered items")
+
+    filter_kwargs = {
+        "crime_type": crime_type,
+        "actor": actor,
+        "victim": victim,
+        "cve_id": cve_id,
+        "ioc": ioc,
+        "tag": tag,
+        "classified": classified,
+        "min_confidence": min_confidence,
+        "cluster_size": cluster_size,
+        "since": since,
+        "until": until,
+        "extra_key": extra_key,
+    }
+
     items = await fetch_items(
         db,
         limit=limit,
@@ -111,6 +154,7 @@ async def api_items(
         search=search,
         matched_only=matched_only,
         show_filtered=show_filtered,
+        **filter_kwargs,
     )
     # total must reflect the SAME filters as the items query, or the
     # frontend's hasMore/"load more" math goes stale the moment any filter
@@ -122,6 +166,7 @@ async def api_items(
         search=search,
         matched_only=matched_only,
         show_filtered=show_filtered,
+        **filter_kwargs,
     )
     return {"total": total, "items": items}
 
@@ -270,9 +315,9 @@ async def api_stats_top_actors(db=Depends(get_db), limit: int = Query(default=10
 
 @router.get("/api/classifier/health")
 async def api_classifier_health(db=Depends(get_db)):
-    h = classifier_health.get()
+    h = llm_health.get()
     return {
-        "backend": settings.classifier_backend,
+        "backend": settings.llm_backend,
         "last_run_at": h.last_run_at,
         "last_success_at": h.last_success_at,
         "last_batch_size": h.last_batch_size,
@@ -280,13 +325,169 @@ async def api_classifier_health(db=Depends(get_db)):
         "last_error": h.last_error,
         "last_error_at": h.last_error_at,
         "consecutive_errors": h.consecutive_errors,
-        "backlog": await count_unclassified(db),
+        "backlog": await count_unextracted(db),
     }
 
 
 @router.get("/api/classifier/recent")
 async def api_classifier_recent(db=Depends(get_db), since: str = Query(...)):
-    """Items classified after `since` (ISO-8601) — powers the frontend's
+    """Items extracted after `since` (ISO-8601) — powers the frontend's
     incremental poll so already-rendered cards can be patched in place
     instead of a full feed re-render."""
-    return {"updates": await get_recent_classifications(db, since_iso=since)}
+    return {"updates": await get_recent_extractions(db, since_iso=since)}
+
+
+@router.get("/api/status")
+async def api_status(request: Request, db=Depends(get_db)):
+    """Unified live subsystem status — scheduler, collectors, classifier,
+    case correlator, KEV refresh, hermes-agent research/heal. Read-only and
+    safe for public dashboard use (only counts/scheduler metadata)."""
+    scheduler = getattr(request.app.state, "scheduler", None)
+    scheduler_running = bool(scheduler and scheduler.running)
+
+    jobs = []
+    if scheduler:
+        for job in scheduler.get_jobs():
+            jobs.append(
+                {
+                    "id": job.id,
+                    "name": job.name,
+                    "next_run_at": job.next_run_time.isoformat() if job.next_run_time else None,
+                    "pending": getattr(job, "pending", None),
+                }
+            )
+
+    sources = load_sources()
+    enabled_sources = [s for s in sources if s.get("enabled", True)]
+    failing = [
+        s["id"]
+        for s in enabled_sources
+        if (health.get(s["id"]) or health.SourceHealth(s["id"])).consecutive_errors >= 3
+    ]
+
+    h = llm_health.get()
+    ch = correlate_health.get()
+    rh = research_health.get()
+    hh = heal_health.get()
+
+    cooldown_iso = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+
+    # Approximate KEV age from the catalog's most recent date_added (CISA
+    # publishes the date each CVE was added to the catalog). The scheduler
+    # next_run_time is also returned for "next refresh" visibility.
+    kev_next_run = None
+    for job in jobs:
+        if job["id"] == "_kev_refresh":
+            kev_next_run = job["next_run_at"]
+            break
+
+    return {
+        "scheduler": {"running": scheduler_running, "jobs": jobs},
+        "sources": {
+            "total": len(enabled_sources),
+            "failing": failing,
+            "failing_count": len(failing),
+        },
+        "classifier": {
+            "backend": settings.llm_backend,
+            "last_run_at": h.last_run_at,
+            "last_success_at": h.last_success_at,
+            "last_batch_size": h.last_batch_size,
+            "total_classified": h.total_classified,
+            "last_error": h.last_error,
+            "last_error_at": h.last_error_at,
+            "consecutive_errors": h.consecutive_errors,
+            "backlog": await count_unextracted(db),
+        },
+        "correlation": {
+            "last_run_at": ch.last_run_at,
+            "last_success_at": ch.last_success_at,
+            "last_processed_count": ch.last_processed_count,
+            "last_error": ch.last_error,
+            "last_error_at": ch.last_error_at,
+            "consecutive_errors": ch.consecutive_errors,
+            "backlog": await count_uncorrelated_extracted_items(db),
+        },
+        "kev": {
+            "count": await count_kev_catalog(db),
+            "next_refresh_at": kev_next_run,
+        },
+        "research": {
+            "last_run_at": rh.last_run_at,
+            "last_success_at": rh.last_success_at,
+            "last_processed_count": rh.last_processed_count,
+            "last_error": rh.last_error,
+            "last_error_at": rh.last_error_at,
+            "consecutive_errors": rh.consecutive_errors,
+            "running": await count_running_research_runs(db),
+            "queued": await count_cases_needing_research(db, cooldown_iso=cooldown_iso),
+        },
+        "heal": {
+            "last_run_at": hh.last_run_at,
+            "last_success_at": hh.last_success_at,
+            "last_processed_count": hh.last_processed_count,
+            "last_error": hh.last_error,
+            "last_error_at": hh.last_error_at,
+            "consecutive_errors": hh.consecutive_errors,
+            "proposals": await count_heal_proposals_by_status(db),
+        },
+    }
+
+
+# ── Cases (deduplicated incidents) ──────────────────────────────────────────
+# See pipeline/correlate.py — the structured, deduplicated view on top of
+# the raw item feed above.
+
+@router.get("/api/cases")
+async def api_cases(
+    db=Depends(get_db),
+    limit: int = Query(default=100, le=500),
+    offset: int = Query(default=0, ge=0),
+    min_significance: str | None = Query(default=None),
+    crime_type: str | None = Query(default=None),
+    in_kev: bool | None = Query(default=None),
+    search: str | None = Query(default=None),
+):
+    cases = await fetch_cases(
+        db,
+        limit=limit,
+        offset=offset,
+        min_significance=min_significance,
+        crime_type=crime_type,
+        in_kev=in_kev,
+        search=search,
+    )
+    total = await count_cases(db)
+    return {"total": total, "cases": cases}
+
+
+@router.get("/api/cases/{case_id}")
+async def api_case_detail(case_id: int, db=Depends(get_db)):
+    case = await get_case_by_id(db, case_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="Case not found")
+    case["cve_ids"] = json.loads(case["cve_ids"]) if case["cve_ids"] else []
+    case["in_kev"] = bool(case["in_kev"])
+    items = await get_case_items(db, case_id)
+    return {"case": case, "items": items}
+
+
+@router.get("/api/stats/cases")
+async def api_stats_cases(db=Depends(get_db)):
+    return {
+        "total": await count_cases(db),
+        "by_crime_type": await stats_cases_by_crime_type(db),
+        "in_kev": await stats_cases_in_kev(db),
+    }
+
+
+# ── Self-healing source proposals ───────────────────────────────────────────
+# Read-only surface for research/heal.py's output — see that module's
+# docstring for why proposals are never auto-applied to sources.yaml.
+# Admin-gated: a proposal can echo back scraped page content via its notes.
+
+@router.get("/api/heal/proposals", dependencies=[Depends(require_admin)])
+async def api_heal_proposals(db=Depends(get_db), status: str | None = Query(default=None)):
+    from ..db import get_heal_proposals
+
+    return {"proposals": await get_heal_proposals(db, status=status)}

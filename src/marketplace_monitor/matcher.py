@@ -55,9 +55,10 @@ class Matcher:
             log.info("Loaded %d keyword rules from %s", len(rules), self._path)
             if not any(r.priority == "critical" for r in rules):
                 log.warning(
-                    "No 'critical' priority rules loaded — the Gotify alert "
-                    "path will never fire. Uncomment/fill in the TARGET "
-                    "section in %s.",
+                    "No 'critical' priority rules loaded — the regex-only "
+                    "Gotify alert path will never fire (the LLM extraction "
+                    "layer can still alert independently). Add a 'critical' "
+                    "rule to %s if you want regex-level alerting too.",
                     self._path,
                 )
         except Exception as exc:

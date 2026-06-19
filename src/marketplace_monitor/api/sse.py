@@ -54,6 +54,10 @@ class SSEBroadcaster:
         for q in dead:
             self.unsubscribe(q)
 
+    async def broadcast_status(self, subsystem: str, payload: dict) -> None:
+        """Lightweight status event for live dashboard updates."""
+        await self.broadcast({"type": "status", "subsystem": subsystem, **payload})
+
     async def stream(self, q: asyncio.Queue) -> AsyncIterator[str]:
         """Yield SSE-formatted strings from the subscriber queue."""
         try:

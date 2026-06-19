@@ -77,12 +77,12 @@ class BaseCollector(ABC):
             await self.sse.broadcast(payload)
 
             # Instant Gotify on regex 'critical' is ONLY used when the LLM
-            # classifier is disabled (zero-config fallback). Otherwise the
-            # classifier/job.py background job owns alerting — it waits for
+            # extraction layer is disabled (zero-config fallback). Otherwise
+            # the llm/job.py background job owns alerting — it waits for
             # confirmation (cuts false-positive pages) but still guarantees
             # an alert via its own fallback sweep if the backend is down, so
             # disabling this here doesn't risk silently losing real alerts.
-            if settings.classifier_backend == "none":
+            if settings.llm_backend == "none":
                 for m in matches:
                     if m.priority == "critical":
                         await push_gotify(

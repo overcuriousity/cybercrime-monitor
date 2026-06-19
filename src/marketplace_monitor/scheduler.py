@@ -99,27 +99,42 @@ def build_scheduler(db_conn, sse_broadcaster) -> AsyncIOScheduler:
 
     log.info("Scheduled %d collectors", scheduled)
 
-    if settings.classifier_backend != "none":
-        from .classifier.job import run_classification_batch
+    if settings.llm_backend != "none":
+        from .llm.job import run_extraction_batch
 
         scheduler.add_job(
-            run_classification_batch,
-            trigger=IntervalTrigger(seconds=settings.classifier_interval_seconds),
-            id="_classifier",
-            name="LLM classifier",
+            run_extraction_batch,
+            trigger=IntervalTrigger(seconds=settings.llm_interval_seconds),
+            id="_extract",
+            name="LLM extraction",
             next_run_time=_offset_now(10),
-            misfire_grace_time=settings.classifier_interval_seconds,
+            misfire_grace_time=settings.llm_interval_seconds,
             # A batch (N items x LLM latency) can exceed the interval; without
-            # these, concurrent runs could grab the same unclassified rows
+            # these, concurrent runs could grab the same unextracted rows
             # and double-process. coalesce collapses any backlog of missed
             # ticks into one run instead of bursting them all at once.
             max_instances=1,
             coalesce=True,
             kwargs={"db_conn": db_conn},
         )
-        log.info("Scheduled LLM classifier job (backend=%s)", settings.classifier_backend)
+        log.info("Scheduled LLM extraction job (backend=%s)", settings.llm_backend)
     else:
-        log.info("LLM classifier disabled (classifier_backend=none)")
+        log.info("LLM extraction disabled (llm_backend=none)")
+
+    from .pipeline.correlate import run_correlation_batch
+
+    scheduler.add_job(
+        run_correlation_batch,
+        trigger=IntervalTrigger(seconds=settings.correlate_interval_seconds),
+        id="_correlate",
+        name="Case correlation",
+        next_run_time=_offset_now(20),
+        misfire_grace_time=settings.correlate_interval_seconds,
+        max_instances=1,
+        coalesce=True,
+        kwargs={"db_conn": db_conn},
+    )
+    log.info("Scheduled case correlation job")
 
     from . import db as db_module
     from . import health
@@ -165,6 +180,65 @@ def build_scheduler(db_conn, sse_broadcaster) -> AsyncIOScheduler:
         log.info("Scheduled retention job (retention_days=%d)", settings.retention_days)
     else:
         log.info("Retention disabled (retention_days <= 0)")
+
+    if settings.kev_refresh_interval_seconds > 0:
+        from .enrich.kev import refresh_kev_catalog
+
+        async def _refresh_kev(conn) -> None:
+            await refresh_kev_catalog(conn)
+
+        scheduler.add_job(
+            _refresh_kev,
+            trigger=IntervalTrigger(seconds=settings.kev_refresh_interval_seconds),
+            id="_kev_refresh",
+            name="CISA KEV catalog refresh",
+            next_run_time=_offset_now(15),
+            misfire_grace_time=3600,
+            max_instances=1,
+            coalesce=True,
+            kwargs={"conn": db_conn},
+        )
+        log.info("Scheduled CISA KEV catalog refresh job")
+
+    if settings.hermes_research_interval_seconds > 0:
+        from .research.agent import run_research_batch
+
+        scheduler.add_job(
+            run_research_batch,
+            trigger=IntervalTrigger(seconds=settings.hermes_research_interval_seconds),
+            id="_research",
+            name="hermes-agent OSINT research",
+            next_run_time=_offset_now(60),
+            misfire_grace_time=settings.hermes_research_interval_seconds,
+            # A research run can take minutes (hermes_timeout_seconds) — never
+            # let two overlap and double-dispatch hermes-agent.
+            max_instances=1,
+            coalesce=True,
+            kwargs={"db_conn": db_conn},
+        )
+        log.info("Scheduled hermes-agent OSINT research job")
+    else:
+        log.info("hermes-agent research disabled (hermes_research_interval_seconds <= 0)")
+
+    if settings.hermes_heal_interval_seconds > 0:
+        from .research.heal import run_heal_batch
+
+        scheduler.add_job(
+            run_heal_batch,
+            trigger=IntervalTrigger(seconds=settings.hermes_heal_interval_seconds),
+            id="_heal",
+            name="hermes-agent source self-healing",
+            next_run_time=_offset_now(90),
+            misfire_grace_time=settings.hermes_heal_interval_seconds,
+            # Same reasoning as "_research" — a heal investigation can take
+            # minutes; never let two overlap.
+            max_instances=1,
+            coalesce=True,
+            kwargs={"db_conn": db_conn},
+        )
+        log.info("Scheduled hermes-agent source self-healing job")
+    else:
+        log.info("hermes-agent self-healing disabled (hermes_heal_interval_seconds <= 0)")
 
     return scheduler
 

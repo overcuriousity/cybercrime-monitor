@@ -9,9 +9,8 @@ class Settings(BaseSettings):
     bind_host: str = "127.0.0.1"
     bind_port: int = 8000
     # Required to view/edit config/keywords.yaml via the API (GET/PUT /api/keywords).
-    # GET leaks the investigation TARGET indicators (bank name/domain/IBAN) if unset
-    # and reachable publicly; PUT writes regex straight to disk. Set via .env so the
-    # admin UI keeps working while everything else stays open to the public dashboard.
+    # Set via .env so the admin UI keeps working while everything else stays open
+    # to the public dashboard.
     admin_token: str = ""
     tor_socks: str = "socks5h://127.0.0.1:9050"
     gotify_url: str = ""
@@ -22,46 +21,88 @@ class Settings(BaseSettings):
     # max items returned by /api/items
     items_page_size: int = 200
 
-    # LLM classification layer (assigns real priority per item, flags false
-    # positives) — see classifier/ package. "none" disables it entirely and
-    # restores pre-classifier behavior (instant Gotify on regex 'critical',
-    # no classifications table writes) with zero other config required.
+    # ── LLM extraction layer ────────────────────────────────────────────────
+    # Structured-field extraction (crime type, victim, attribution, CVEs,
+    # significance) per item — see llm/ package. "none" disables it entirely
+    # and restores pre-extraction behavior (instant Gotify on regex
+    # 'critical', no extractions table writes) with zero other config
+    # required.
     #
-    # PRIVACY: item title/snippet text — which can include TARGET-tagged
-    # investigation content from config/keywords.yaml — is sent to whatever
-    # classifier_base_url points at for classification. The default (a local
-    # LMStudio instance) keeps everything on-machine; pointing this at a
-    # third-party API sends investigation content to that party.
-    classifier_backend: str = "openai"  # "openai" | "none" (local model: future work)
-    classifier_base_url: str = "http://127.0.0.1:1234/v1"  # LMStudio's default OpenAI-compatible port
-    classifier_api_key: str = ""
-    classifier_model: str = ""  # most local servers ignore this / use whatever's loaded
-    classifier_batch_size: int = 10
-    classifier_interval_seconds: int = 30
+    # "hermes_cli" routes extraction/dedup through the locally-installed
+    # hermes-agent CLI instead of an HTTP endpoint (see hermes_* settings
+    # below and llm/backend.py's module docstring) — useful when there's no
+    # separate OpenAI-compatible server running but `hermes` already works.
+    # llm_base_url/llm_api_key/llm_model are ignored in this mode; the model
+    # used is whatever `hermes model` is configured to (or hermes_model below
+    # to override per-call).
+    #
+    # PRIVACY: item title/snippet text is sent to whatever backend handles
+    # it — llm_base_url for "openai", or hermes-agent's configured
+    # provider for "hermes_cli" (e.g. a cloud API like Kimi/OpenRouter, not
+    # necessarily local — check `hermes status`). The "openai" default (a
+    # local LMStudio/vLLM instance) keeps everything on-machine.
+    llm_backend: str = "openai"  # "openai" | "hermes_cli" | "none"
+    llm_base_url: str = "http://127.0.0.1:1234/v1"  # LMStudio's default OpenAI-compatible port
+    llm_api_key: str = ""
+    llm_model: str = ""  # most local servers ignore this / use whatever's loaded
+    llm_batch_size: int = 10
+    llm_interval_seconds: int = 30
     # Generous: local CPU-bound inference can legitimately take a while
-    # (prompt processing + generation), and a slow classify call has no
+    # (prompt processing + generation), and a slow extract call has no
     # downside here — the job is already decoupled from ingest, and the
     # fallback sweep (below) backstops real critical alerts regardless.
-    classifier_timeout_seconds: float = 90.0
-    # If a regex-'critical' item is still unclassified after this many
-    # minutes (classifier backend down/unreachable), alert on it anyway via
-    # the fallback sweep — a downstream LLM outage must never silently
-    # suppress a real critical alert.
-    classifier_fallback_alert_minutes: int = 10
+    llm_timeout_seconds: float = 90.0
+    # If a regex-'critical' item is still unextracted after this many
+    # minutes (LLM backend down/unreachable), alert on it anyway via the
+    # fallback sweep — a downstream LLM outage must never silently suppress
+    # a real critical alert.
+    llm_fallback_alert_minutes: int = 10
     # A false_positive=true verdict below this confidence is NOT trusted to
     # suppress the item — it stays visible (priority still applied) rather
     # than silently dropping out of the feed on a guess. A low-confidence
     # critical still alerts (never silently swallowed) but the Gotify
     # message flags the low confidence so it gets appropriate scrutiny.
     # 0.0 (default) preserves pre-threshold behavior: every verdict is trusted.
-    classifier_min_confidence: float = 0.0
+    llm_min_confidence: float = 0.0
+
+    # Semantic dedup → case correlation (pipeline/correlate.py) — runs on its
+    # own interval, decoupled from extraction, so a slow merge-adjudication
+    # call never blocks either ingest or extraction.
+    correlate_interval_seconds: int = 45
+
+    # ── hermes-agent integration ────────────────────────────────────────────
+    # hermes-agent (Nous Research's self-improving agent CLI — NOT the Hermes
+    # model) drives the two genuinely agentic roles: autonomous OSINT research
+    # on cases (research/agent.py) and self-healing of broken collectors
+    # (research/heal.py). Both shell out to the locally-installed `hermes`
+    # binary headless (`hermes -z "<prompt>" -t <toolsets>`) via
+    # hermes/runner.py — see that module's docstring for the verified
+    # one-shot contract. Bulk per-item extraction does NOT go through Hermes
+    # (too slow/expensive for volume); it uses llm_backend above, optionally
+    # pointed at `hermes proxy`'s OpenAI-compatible endpoint if you want the
+    # same model/account for both paths.
+    hermes_bin: str = "hermes"
+    hermes_model: str = ""  # empty = whatever Hermes' own `hermes model` default is
+    hermes_toolsets: str = "web,browser"
+    hermes_timeout_seconds: float = 300.0
+    # 0 disables both agentic jobs entirely (research_runs/source-healing
+    # never dispatch) without touching llm_backend.
+    hermes_research_interval_seconds: int = 900
+    hermes_heal_interval_seconds: int = 3600
+    # A source must accumulate this many consecutive collector errors before
+    # the self-healing job will spend a Hermes run investigating it.
+    hermes_heal_error_threshold: int = 5
+
+    # CISA KEV (Known Exploited Vulnerabilities) catalog — refreshed daily
+    # into the kev_catalog table; see enrich/kev.py.
+    kev_feed_url: str = (
+        "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+    )
+    kev_refresh_interval_seconds: int = 86400
 
     # Items older than this are pruned (see db.py:prune_old_items, wired as a
     # daily job in scheduler.py) to keep the DB from growing unbounded.
-    # Critical-priority items and anything matched by a "target"-tagged
-    # keyword rule (config/keywords.yaml's TARGET section — the investigation
-    # indicators) are NEVER pruned regardless of age, since those are
-    # precisely the rows an investigation can't afford to silently lose.
+    # Effective-critical cases/items are NEVER pruned regardless of age.
     retention_days: int = 90
 
     # ── Public-dashboard DoS resistance ─────────────────────────────────────
