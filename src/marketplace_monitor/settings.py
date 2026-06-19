@@ -47,6 +47,21 @@ class Settings(BaseSettings):
     llm_model: str = ""  # most local servers ignore this / use whatever's loaded
     llm_batch_size: int = 10
     llm_interval_seconds: int = 30
+    # When llm_backend="openai" and that endpoint is simply not reachable
+    # (connection refused/timeout — no dedicated LLM server running), and the
+    # `hermes` CLI is already installed/on PATH, transparently route
+    # extraction through it instead (see llm/backend.py's _BackendUnreachable
+    # handling) rather than leaving every item permanently unextracted and
+    # retrying a dead endpoint forever. Does NOT apply when llm_backend is
+    # explicitly set to "hermes_cli" or "none" — those are deliberate
+    # choices, not gaps to paper over. Set false to keep the old
+    # retry-forever-against-openai behavior.
+    llm_auto_fallback_to_hermes: bool = True
+    # How long to keep using the hermes fallback before re-probing the
+    # openai endpoint (so a now-restarted LMStudio/vLLM gets used again
+    # without a process restart, but a permanently-absent one doesn't waste
+    # a request retrying it every single batch).
+    llm_fallback_cooldown_seconds: int = 300
     # Generous: local CPU-bound inference can legitimately take a while
     # (prompt processing + generation), and a slow extract call has no
     # downside here — the job is already decoupled from ingest, and the
@@ -69,6 +84,11 @@ class Settings(BaseSettings):
     # own interval, decoupled from extraction, so a slow merge-adjudication
     # call never blocks either ingest or extraction.
     correlate_interval_seconds: int = 45
+    # Algorithmic (non-LLM) case-to-case relationship scan
+    # (pipeline/cross_correlate.py) — separate from the above, which
+    # dedupes raw items into cases; this links already-distinct cases that
+    # share victim/actor/CVE/IoC overlap, surfaced as "Related cases".
+    cross_correlate_interval_seconds: int = 600
 
     # ── hermes-agent integration ────────────────────────────────────────────
     # hermes-agent (Nous Research's self-improving agent CLI — NOT the Hermes
@@ -92,6 +112,26 @@ class Settings(BaseSettings):
     # A source must accumulate this many consecutive collector errors before
     # the self-healing job will spend a Hermes run investigating it.
     hermes_heal_error_threshold: int = 5
+    # Truly agentic self-improvement loop (research/heal.py + writer.py):
+    # validated heal fixes are written straight to sources.yaml and the
+    # collector is live-rescheduled, low-value sources are auto-disabled/
+    # removed, and a separate discovery job searches for brand-new sources
+    # to add — all gated by sources/value.py's relative investigation-value
+    # judgement (see that module's docstring), not a static confidence
+    # number. Set false to fall back to the old advisory-only behavior
+    # (proposals are still logged to source_heal_proposals either way).
+    source_autoapply_enabled: bool = True
+    # 0 disables the discovery job entirely (independent of hermes_heal_*).
+    hermes_discover_interval_seconds: int = 21600  # 6h — discovery is a slow, exploratory Hermes run
+    # A newly-discovered source is tagged "probationary" and given this many
+    # days to prove itself (sources/value.py needs real run history before
+    # it can judge a source) before the prune path is allowed to act on it.
+    source_probation_days: int = 7
+    # How long a source stays merely "disabled" before remove() deletes the
+    # entry outright — gives a human a window to notice and override an
+    # autonomous disable before it's gone from sources.yaml entirely.
+    source_prune_grace_days: int = 14
+    source_value_refresh_interval_seconds: int = 1800
 
     # CISA KEV (Known Exploited Vulnerabilities) catalog — refreshed daily
     # into the kev_catalog table; see enrich/kev.py.

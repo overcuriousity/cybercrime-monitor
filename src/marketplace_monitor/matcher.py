@@ -125,6 +125,13 @@ class Matcher:
         return any(r.priority == "critical" for r in self._rules)
 
     @property
+    def all_tags(self) -> list[str]:
+        """Distinct tags across all loaded rules — used by
+        research/discover.py to tell Hermes what topics this monitor cares
+        about without reaching into the rule list directly."""
+        return sorted({t for r in self._rules for t in r.tags})
+
+    @property
     def rules_raw(self) -> str:
         try:
             return self._path.read_text(encoding="utf-8")

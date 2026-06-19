@@ -1,17 +1,31 @@
-"""Self-healing for broken/disabled collectors, delegated to hermes-agent —
-same dispatch pattern as research/agent.py: build a prompt, let Hermes drive
-its own web/browser toolsets to investigate, parse a structured proposal
-back. See hermes/runner.py's docstring for the verified `hermes -z`
-contract.
+"""Autonomous source self-improvement loop, delegated to hermes-agent — same
+dispatch pattern as research/agent.py: build a prompt, let Hermes drive its
+own web/browser toolsets to investigate, parse a structured proposal back.
+See hermes/runner.py's docstring for the verified `hermes -z` contract.
 
-Deliberately does NOT auto-apply proposals to sources.yaml — that's a
-config-on-disk + collector-behavior change with no human in the loop, which
-is a different risk class than a database write. A proposal is "validated"
-once a lightweight reachability probe confirms the proposed URL responds;
-applying it to sources.yaml is left to a human reviewing
-source_heal_proposals (surfaced however the operator chooses — direct DB
-query today; a dashboard/admin view is a natural follow-up, not required for
-the proposal pipeline itself to be useful).
+This used to be advisory-only (never touched sources.yaml — see git history
+for the original docstring's reasoning). That stance has changed: every
+change this module makes is still gated by a real check (a reachability
+probe for heal fixes; sources/value.py's relative investigation-value
+judgement for everything) and is fully audited (source_heal_proposals'
+action/applied/before_value/after_value columns) and reversible
+(sources/writer.py backs up sources.yaml before every write) — so the loop
+can run unattended while still being reviewable after the fact. Set
+settings.source_autoapply_enabled=False to fall back to logging proposals
+without applying them.
+
+Three behaviors, one tick each (bounded — a Hermes run can take minutes):
+  1. heal    — investigate a broken/disabled source, probe a proposed fix,
+               apply it (URL swap and/or re-enable) if the probe passes and
+               the source is worth restoring.
+  2. prune   — disable a source sources/value.py judges "dead" (never
+               produced a successful fetch) or "marginal" with corroborating
+               zero-value evidence (no case contribution + negative analyst
+               feedback); remove it outright after a grace period of
+               continued non-value (settings.source_prune_grace_days).
+  3. (discovery is a separate job — see research/discover.py — since it's a
+     different kind of Hermes run: open-ended search vs. investigate-one-
+     source.)
 
 Runs on its own APScheduler interval (scheduler.py's "_heal" job).
 """
@@ -25,8 +39,10 @@ from .. import health
 from ..api.sse import broadcaster
 from ..hermes.runner import run_agent
 from ..http import clearnet_client, tor_client
-from ..scheduler import load_sources
+from ..scheduler import load_sources, reschedule_source, unschedule_source
 from ..settings import settings
+from ..sources import value as source_value
+from ..sources import writer as source_writer
 
 log = logging.getLogger(__name__)
 
@@ -101,7 +117,7 @@ name: {name}
 type: {type}
 current config: {config}
 status: {status_note}
-
+{feedback_note}
 When you are done, respond with ONLY a single-line JSON object as your \
 final message, no markdown fencing, no commentary, exactly these keys:
 {{"found_fix": true|false, "proposed_url": <string|null>, \
@@ -117,6 +133,24 @@ def _status_note(source: dict) -> str:
     if h and h.consecutive_errors:
         return f"{h.consecutive_errors} consecutive errors, last: {h.last_error}"
     return "unknown"
+
+
+def _feedback_note(value: dict | None) -> str:
+    """Digests sources/value.py's cached feedback component into the prompt
+    so Hermes knows *why* a source is being reconsidered, not just that it
+    is — per the "agent consumes user feedback" requirement."""
+    if not value:
+        return ""
+    feedback_score = value.get("components", {}).get("feedback")
+    if feedback_score is None:
+        return ""
+    if feedback_score < 0.5:
+        return (
+            "\nNote: the analyst has flagged recent reports from this source as "
+            "noise/not useful/misattributed more often than useful — if you find "
+            "a replacement, prefer one less likely to repeat that problem.\n"
+        )
+    return ""
 
 
 async def _candidates(db_conn) -> list[dict]:
@@ -139,9 +173,12 @@ async def _candidates(db_conn) -> list[dict]:
     return out
 
 
-async def run_heal_batch(db_conn) -> int:
+async def run_heal_batch(db_conn, scheduler=None, sse_broadcaster=None) -> int:
     """One tick: investigate a bounded number of broken/disabled sources via
-    hermes-agent and record proposals. Returns the number processed."""
+    hermes-agent (auto-applying validated fixes), then run a prune pass over
+    every source's cached investigation-value. Returns the number of heal
+    investigations processed (prune actions are logged separately, not
+    counted here — they don't consume a Hermes run)."""
     if settings.hermes_heal_interval_seconds <= 0:
         return 0
 
@@ -151,13 +188,19 @@ async def run_heal_batch(db_conn) -> int:
     try:
         for src in candidates:
             try:
-                await _heal_one(db_conn, src)
+                await _heal_one(db_conn, src, scheduler=scheduler, sse_broadcaster=sse_broadcaster)
                 processed += 1
             except Exception as exc:
                 log.error("[heal] source %s failed: %s", src["id"], exc)
 
         if processed:
             log.info("[heal] processed %d source(s)", processed)
+
+        try:
+            await _prune_pass(db_conn, scheduler=scheduler, sse_broadcaster=sse_broadcaster)
+        except Exception as exc:
+            log.error("[heal] prune pass failed: %s", exc)
+
         record_success(processed)
     except Exception as exc:
         log.error("[heal] batch failed: %s", exc)
@@ -167,13 +210,15 @@ async def run_heal_batch(db_conn) -> int:
     return processed
 
 
-async def _heal_one(db_conn, source: dict) -> None:
+async def _heal_one(db_conn, source: dict, *, scheduler, sse_broadcaster) -> None:
+    value = (await db.get_source_value(db_conn, source["id"]))
     prompt = _HEAL_PROMPT_TEMPLATE.format(
         source_id=source["id"],
         name=source.get("name", source["id"]),
         type=source.get("type", "unknown"),
         config={k: v for k, v in source.items() if k not in ("id",)},
         status_note=_status_note(source),
+        feedback_note=_feedback_note(value),
     )
     result = await run_agent(
         prompt,
@@ -188,6 +233,7 @@ async def _heal_one(db_conn, source: dict) -> None:
             source_id=source["id"],
             proposal={},
             notes=f"hermes run failed: {result.error}",
+            action="heal",
         )
         log.warning("[heal] source %s: hermes run failed (%s)", source["id"], result.error)
         return
@@ -198,6 +244,7 @@ async def _heal_one(db_conn, source: dict) -> None:
         source_id=source["id"],
         proposal=data,
         notes=data.get("proposed_config_notes") if isinstance(data, dict) else None,
+        action="heal",
     )
 
     proposed_url = data.get("proposed_url") if isinstance(data, dict) else None
@@ -205,23 +252,28 @@ async def _heal_one(db_conn, source: dict) -> None:
         await db.update_heal_proposal_status(db_conn, proposal_id=proposal_id, status="rejected")
         return
 
-    await _probe_and_update(db_conn, proposal_id=proposal_id, url=proposed_url, source=source)
+    await _probe_and_apply(
+        db_conn, proposal_id=proposal_id, url=proposed_url, source=source, value=value,
+        scheduler=scheduler, sse_broadcaster=sse_broadcaster,
+    )
 
 
-async def _probe_and_update(db_conn, *, proposal_id: int, url: str, source: dict) -> None:
+async def _probe_and_apply(
+    db_conn, *, proposal_id: int, url: str, source: dict, value: dict | None, scheduler, sse_broadcaster
+) -> None:
     """Lightweight reachability check — not a full collector run (that would
-    need dynamically constructing the right collector instance per type).
-    A 2xx response is "worth a human looking at"; anything else means the
-    proposal itself didn't pan out and shouldn't be surfaced as actionable."""
+    need dynamically constructing the right collector instance per type). A
+    2xx response, combined with sources/value.py's should_apply_heal()
+    judgement, is what gates actually writing sources.yaml — see that
+    function's docstring for why there's no static confidence cutoff here."""
     use_tor = source.get("type") == "tor_forum" or "tor" in (source.get("tags") or [])
+    probe_ok = False
     try:
         client_cm = tor_client(timeout=60.0) if use_tor else clearnet_client(timeout=30.0)
         async with client_cm as client:
             resp = await client.get(url)
-        if 200 <= resp.status_code < 300:
-            await db.update_heal_proposal_status(db_conn, proposal_id=proposal_id, status="validated")
-            log.info("[heal] source %s: proposal validated (%s)", source["id"], url)
-        else:
+        probe_ok = 200 <= resp.status_code < 300
+        if not probe_ok:
             await db.update_heal_proposal_status(
                 db_conn, proposal_id=proposal_id, status="probe_failed",
                 error=f"HTTP {resp.status_code}",
@@ -230,3 +282,120 @@ async def _probe_and_update(db_conn, *, proposal_id: int, url: str, source: dict
         await db.update_heal_proposal_status(
             db_conn, proposal_id=proposal_id, status="probe_failed", error=str(exc) or repr(exc)
         )
+        return
+
+    if not probe_ok:
+        return
+
+    await db.update_heal_proposal_status(db_conn, proposal_id=proposal_id, status="validated")
+    log.info("[heal] source %s: proposal validated (%s)", source["id"], url)
+
+    if not settings.source_autoapply_enabled:
+        return
+    if not source_value.should_apply_heal(value=value, probe_ok=probe_ok):
+        log.info("[heal] source %s: not applying — value judgement declined", source["id"])
+        return
+
+    try:
+        before, after = source_writer.update_field(
+            source["id"], reason="hermes-agent heal fix", url=url, enabled=True
+        )
+    except source_writer.SourceWriteError as exc:
+        log.error("[heal] source %s: apply failed: %s", source["id"], exc)
+        return
+
+    await db.record_applied_change(db_conn, proposal_id=proposal_id, before=before, after=after)
+    log.info("[heal] source %s: auto-applied fix to sources.yaml", source["id"])
+
+    if scheduler is not None:
+        fresh = next((s for s in load_sources() if s["id"] == source["id"]), None)
+        if fresh is not None:
+            reschedule_source(scheduler, db_conn, sse_broadcaster, fresh)
+
+
+# ── Prune pass ────────────────────────────────────────────────────────────────
+# Every heal tick also sweeps the cached investigation-value snapshot
+# (sources/value.py, refreshed independently on its own interval) and acts
+# on sources judged not worth keeping. Two-stage so an autonomous disable is
+# never instantly destructive: disable first, only remove the entry after
+# source_prune_grace_days of continued non-value.
+
+def _min_history(source_id: str) -> bool:
+    """A source has "earned an opinion" once it's actually been tried
+    multiple times — never prune a source on the strength of a single tick
+    (health.py has no first-seen timestamp to measure tenure directly, so
+    this uses observed attempt volume as the proxy instead)."""
+    h = health.get(source_id)
+    if h is None or h.last_run_at is None:
+        return False
+    return h.total_items_fetched > 0 or h.consecutive_errors >= 3 or h.consecutive_empty >= 3
+
+
+async def _prune_pass(db_conn, *, scheduler, sse_broadcaster) -> None:
+    if not settings.source_autoapply_enabled:
+        return
+    values = await db.get_all_source_values(db_conn)
+    sources_by_id = {s["id"]: s for s in load_sources()}
+
+    for source_id, src in sources_by_id.items():
+        value = values.get(source_id)
+        if value is None:
+            continue
+        min_history = _min_history(source_id)
+        if not source_value.should_prune(value=value, min_history=min_history):
+            continue
+
+        if src.get("enabled", True):
+            await _disable_source(db_conn, src, value, scheduler=scheduler, sse_broadcaster=sse_broadcaster)
+        else:
+            await _maybe_remove_source(db_conn, src, value)
+
+
+async def _disable_source(db_conn, source: dict, value: dict, *, scheduler, sse_broadcaster) -> None:
+    reason = f"investigation-value classification={value['classification']} (auto-prune)"
+    try:
+        before, after = source_writer.disable(source["id"], reason=reason)
+    except source_writer.SourceWriteError as exc:
+        log.error("[heal] prune %s: disable failed: %s", source["id"], exc)
+        return
+    proposal_id = await db.create_heal_proposal(
+        db_conn, source_id=source["id"], proposal={"classification": value["classification"]},
+        notes=reason, action="prune",
+    )
+    await db.update_heal_proposal_status(db_conn, proposal_id=proposal_id, status="validated")
+    await db.record_applied_change(db_conn, proposal_id=proposal_id, before=before, after=after)
+    log.info("[heal] auto-disabled low-value source %s (%s)", source["id"], value["classification"])
+    if scheduler is not None:
+        unschedule_source(scheduler, source["id"])
+
+
+async def _maybe_remove_source(db_conn, source: dict, value: dict) -> None:
+    """Already disabled by a prior prune pass — remove outright once the
+    grace period has elapsed with no recovery (a heal investigation that
+    found a fix would have re-enabled it before this runs)."""
+    proposals = await db.get_heal_proposals(db_conn, status="validated")
+    disabled_at = None
+    for p in proposals:
+        if p["source_id"] == source["id"] and p.get("action") == "prune" and p.get("applied"):
+            disabled_at = p["created_at"]
+            break
+    if disabled_at is None:
+        return
+    try:
+        elapsed = datetime.now(timezone.utc) - datetime.fromisoformat(disabled_at)
+    except ValueError:
+        return
+    if elapsed < timedelta(days=settings.source_prune_grace_days):
+        return
+
+    try:
+        before = source_writer.remove(source["id"], reason="grace period elapsed, no recovery")
+    except source_writer.SourceWriteError as exc:
+        log.error("[heal] prune %s: remove failed: %s", source["id"], exc)
+        return
+    proposal_id = await db.create_heal_proposal(
+        db_conn, source_id=source["id"], proposal={}, notes="removed after grace period", action="prune",
+    )
+    await db.update_heal_proposal_status(db_conn, proposal_id=proposal_id, status="validated")
+    await db.record_applied_change(db_conn, proposal_id=proposal_id, before=before, after={})
+    log.info("[heal] removed pruned source %s after grace period", source["id"])

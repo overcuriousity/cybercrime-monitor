@@ -21,6 +21,13 @@ class LLMHealth:
     last_error: str | None = None
     last_error_at: str | None = None
     consecutive_errors: int = 0
+    # True while extraction is transparently running through the hermes-agent
+    # CLI because settings.llm_backend="openai" is configured but that
+    # endpoint is unreachable (see llm/backend.py's auto-fallback). Surfaced
+    # so the dashboard can show "running on hermes fallback" instead of
+    # silently reporting the configured backend while actually using a
+    # different one.
+    using_fallback: bool = False
 
 
 _health = LLMHealth()
@@ -55,6 +62,12 @@ def record_error(error: str) -> None:
     _health.last_error_at = _now_iso()
     _health.consecutive_errors += 1
     _emit({"error": error[:300], "consecutive_errors": _health.consecutive_errors})
+
+
+def set_using_fallback(active: bool) -> None:
+    if _health.using_fallback != active:
+        _health.using_fallback = active
+        _emit({"using_fallback": active})
 
 
 def get() -> LLMHealth:

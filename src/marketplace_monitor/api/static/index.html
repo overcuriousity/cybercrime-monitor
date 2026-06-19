@@ -181,48 +181,39 @@
       </section>
     </div>
 
-    <div class="feed-body">
-      <aside class="sidebar">
-        <section class="filter-section">
-          <h3>Filter</h3>
-          <input type="search" id="case-search-input" placeholder="Search victim, actor, title…" autocomplete="off">
-        </section>
+    <div class="case-toolbar">
+      <input type="search" id="case-search-input"
+             placeholder="Search victim, actor, CVE, IoC, title…" autocomplete="off">
+      <div class="case-toolbar-filters">
+        <select id="case-significance-select" title="Minimum significance">
+          <option value="">All significance</option>
+          <option value="info">Info +</option>
+          <option value="warn">Warn +</option>
+          <option value="critical">Critical only</option>
+        </select>
+        <select id="case-crime-type-select" title="Crime type">
+          <option value="">All crime types</option>
+        </select>
+        <label class="matched-only-row">
+          <input type="checkbox" id="case-kev-only"> KEV only
+        </label>
+        <input type="date" id="case-since-input" title="From">
+        <input type="date" id="case-until-input" title="To">
+        <button id="case-filters-clear" class="link-button" type="button">Clear</button>
+      </div>
+    </div>
 
-        <section class="filter-section">
-          <h3>Significance</h3>
-          <label class="radio-row">
-            <input type="radio" name="case-significance" value="" checked> All
-          </label>
-          <label class="radio-row prio-info">
-            <input type="radio" name="case-significance" value="info"> Info +
-          </label>
-          <label class="radio-row prio-warn">
-            <input type="radio" name="case-significance" value="warn"> Warn +
-          </label>
-          <label class="radio-row prio-critical">
-            <input type="radio" name="case-significance" value="critical"> Critical only
-          </label>
-          <label class="radio-row matched-only-row">
-            <input type="checkbox" id="case-kev-only"> KEV only
-          </label>
-        </section>
-
-        <section class="filter-section">
-          <h3>Crime type</h3>
-          <div id="case-crime-type-legend" class="source-legend"></div>
-        </section>
-      </aside>
-
-      <main class="feed">
+    <div class="case-body">
+      <nav class="case-rail">
         <div id="cases-list"></div>
         <div id="cases-empty" class="empty-state hidden">No cases match your filters.</div>
         <button id="cases-load-more" class="load-more hidden">Load more</button>
-      </main>
+      </nav>
 
-      <aside class="sidebar" id="case-detail-pane">
-        <div id="case-detail-empty" class="hint">Select a case to see corroborating reports and details.</div>
+      <main class="case-detail" id="case-detail-pane">
+        <div id="case-detail-empty" class="hint">Select a case to see the full case file.</div>
         <div id="case-detail" class="hidden"></div>
-      </aside>
+      </main>
     </div>
   </div>
 

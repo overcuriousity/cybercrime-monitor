@@ -86,8 +86,10 @@ You are assisting a cybercrime intelligence monitor. Research the following \
 incident using web search and any pages you need to fetch. Try to: confirm \
 the incident is real and ongoing/recent, identify the threat actor or \
 seller if not already known, identify the victim organization if not \
-already known, and find corroborating independent sources (not just the \
-original report below).
+already known, find any concrete indicators of compromise (domains, \
+hashes, IPs, onion addresses, leak-site URLs) tied to this incident, and \
+find corroborating independent sources (not just the original report \
+below).
 
 INCIDENT:
 Title: {title}
@@ -95,14 +97,47 @@ Crime type: {crime_type}
 Known victim: {victim}
 Known attribution: {attribution}
 CVEs: {cve_ids}
+Known IoCs: {iocs}
 Summary so far: {summary}
-
+{gap_note}
 When you are done, respond with ONLY a single-line JSON object as your \
 final message, no markdown fencing, no commentary, exactly these keys:
 {{"confirmed": true|false, "attribution": <string|null>, "damaged_party": <string|null>, \
 "summary": "<2-3 sentence summary of what you found>", "sources": [<url>...], \
-"confidence": <0.0-1.0>}}
+"iocs": [<string>...], "confidence": <0.0-1.0>}}
 """
+
+
+def _gap_note(case: dict) -> str:
+    """Built only for forced re-research (research_requested_at set) — names
+    what's actually missing so a re-trigger digs into gaps instead of
+    repeating the same generic pass. A naturally-queued first pass has no
+    history to diff against, so it gets no gap note (the base prompt already
+    asks for everything)."""
+    if not case.get("research_requested_at"):
+        return ""
+    missing = []
+    if not case.get("attribution"):
+        missing.append("threat actor / seller attribution")
+    if not case.get("damaged_party"):
+        missing.append("victim organization")
+    if not case.get("damaged_party_sector"):
+        missing.append("victim sector")
+    if not case.get("damaged_party_country"):
+        missing.append("victim country")
+    if not case.get("iocs"):
+        missing.append("indicators of compromise")
+    if not missing:
+        return (
+            "\nThis case has already been researched before but was re-queued for "
+            "deeper research — dig further than a surface-level search, and look "
+            "for additional corroborating sources beyond what's already known.\n"
+        )
+    return (
+        "\nThis case was specifically re-queued for deeper research because the "
+        f"following is still missing: {', '.join(missing)}. Focus your search on "
+        "filling these gaps.\n"
+    )
 
 
 def _build_prompt(case: dict) -> str:
@@ -112,7 +147,9 @@ def _build_prompt(case: dict) -> str:
         victim=case.get("damaged_party") or "unknown",
         attribution=case.get("attribution") or "unknown",
         cve_ids=", ".join(case.get("cve_ids") or []) or "none",
+        iocs=", ".join(case.get("iocs") or []) or "none",
         summary=case.get("summary") or "(none yet)",
+        gap_note=_gap_note(case),
     )
 
 
@@ -171,6 +208,9 @@ async def _research_one(db_conn, case: dict) -> None:
             sources=[],
             error=result.error or "no parseable result",
         )
+        # A forced re-research request must not retry every tick forever if
+        # Hermes is down — clear it; the analyst can re-request.
+        await db.clear_case_research_request(db_conn, case_id=case["id"])
         log.warning("[research] case %s: hermes run failed (%s)", case["id"], result.error)
         return
 
@@ -197,9 +237,12 @@ async def _research_one(db_conn, case: dict) -> None:
     attribution = data.get("attribution") if isinstance(data.get("attribution"), str) else None
     damaged_party = data.get("damaged_party") if isinstance(data.get("damaged_party"), str) else None
     summary = data.get("summary") if isinstance(data.get("summary"), str) else None
+    iocs = data.get("iocs") if isinstance(data.get("iocs"), list) else []
+    iocs = [str(x) for x in iocs][:50]
 
     await db.apply_research_findings(
         db_conn,
+        iocs=iocs,
         case_id=case["id"],
         status=new_status,
         attribution=attribution,

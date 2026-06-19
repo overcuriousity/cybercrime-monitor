@@ -177,6 +177,8 @@ async def _correlate_one(db_conn, item: dict) -> None:
     cve_ids, in_kev = await _resolve_cve_kev(db_conn, item)
     case_key = _case_key_for(item)
 
+    iocs = item.get("iocs") or []
+
     existing = await db.get_case_by_key(db_conn, case_key)
     if existing is not None:
         await db.merge_item_into_case(
@@ -191,6 +193,7 @@ async def _correlate_one(db_conn, item: dict) -> None:
             attribution_confidence=item.get("confidence"),
             damaged_party_sector=item.get("victim_sector"),
             damaged_party_country=item.get("victim_country"),
+            iocs=iocs,
         )
         return
 
@@ -214,6 +217,7 @@ async def _correlate_one(db_conn, item: dict) -> None:
         cve_ids=cve_ids,
         in_kev=in_kev,
         item_id=item["id"],
+        iocs=iocs,
     )
 
 
@@ -252,6 +256,7 @@ async def _try_fuzzy_merge(db_conn, item: dict, *, cve_ids: list[str], in_kev: b
                 attribution_confidence=item.get("confidence"),
                 damaged_party_sector=item.get("victim_sector"),
                 damaged_party_country=item.get("victim_country"),
+                iocs=item.get("iocs") or [],
             )
             return True
     return False
