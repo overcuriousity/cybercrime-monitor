@@ -452,6 +452,21 @@ async def api_status(request: Request, db=Depends(get_db)):
 # See pipeline/correlate.py — the structured, deduplicated view on top of
 # the raw item feed above.
 
+_DATE_ONLY_LEN = len("YYYY-MM-DD")
+
+
+def _normalize_date_filter(value: str | None, *, end_of_day: bool) -> str | None:
+    """Expand a UI date-only string (YYYY-MM-DD) to a bound that compares
+    correctly against ISO timestamps stored in the DB. `since` gets the
+    start of the day; `until` gets the end of the day so the full day is
+    included rather than excluding timestamps after 00:00:00."""
+    if value is None or len(value) != _DATE_ONLY_LEN:
+        return value
+    if end_of_day:
+        return f"{value}T23:59:59.999999+00:00"
+    return f"{value}T00:00:00+00:00"
+
+
 @router.get("/api/cases")
 async def api_cases(
     db=Depends(get_db),
@@ -472,8 +487,8 @@ async def api_cases(
         crime_type=crime_type,
         in_kev=in_kev,
         search=search,
-        since=since,
-        until=until,
+        since=_normalize_date_filter(since, end_of_day=False),
+        until=_normalize_date_filter(until, end_of_day=True),
     )
     total = await count_cases(db)
     return {"total": total, "cases": cases}
@@ -547,10 +562,13 @@ class FeedbackCreate(BaseModel):
 async def api_feedback_create(body: FeedbackCreate, db=Depends(get_db)):
     from ..db import VALID_FEEDBACK_VERDICTS, add_feedback
 
-    if not body.case_id and not body.item_id:
-        raise HTTPException(status_code=400, detail="case_id or item_id required")
+    if (body.case_id is None) == (body.item_id is None):
+        raise HTTPException(status_code=400, detail="exactly one of case_id or item_id is required")
     if body.verdict not in VALID_FEEDBACK_VERDICTS:
-        raise HTTPException(status_code=400, detail=f"verdict must be one of {sorted(VALID_FEEDBACK_VERDICTS)}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"verdict must be one of {sorted(VALID_FEEDBACK_VERDICTS)}",
+        )
     feedback_id = await add_feedback(
         db, case_id=body.case_id, item_id=body.item_id, verdict=body.verdict, note=body.note
     )

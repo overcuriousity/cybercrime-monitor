@@ -63,9 +63,9 @@ def _atomic_write(path: Path, data: CommentedMap) -> None:
     tmp_path.replace(path)  # atomic on POSIX
 
 
-def _find_source(data: CommentedMap, source_id: str) -> dict | None:
+def _find_source(data: CommentedMap, source_id: str) -> CommentedMap | None:
     for src in data.get("sources", []):
-        if isinstance(src, dict) and src.get("id") == source_id:
+        if isinstance(src, CommentedMap) and src.get("id") == source_id:
             return src
     return None
 
@@ -110,7 +110,10 @@ def remove(source_id: str, *, reason: str) -> dict:
     path = _path()
     data = _load()
     sources = data.get("sources", [])
-    idx = next((i for i, s in enumerate(sources) if isinstance(s, dict) and s.get("id") == source_id), None)
+    idx = next(
+        (i for i, s in enumerate(sources) if isinstance(s, CommentedMap) and s.get("id") == source_id),
+        None,
+    )
     if idx is None:
         raise SourceWriteError(f"source {source_id!r} not found in {path}")
     before = dict(sources[idx])

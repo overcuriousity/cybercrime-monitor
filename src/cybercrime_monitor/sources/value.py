@@ -31,7 +31,6 @@ should_prune()), middle third "marginal" by default. There is no fixed
 numeric cutoff anywhere in this module.
 """
 import logging
-import statistics
 from datetime import datetime, timedelta, timezone
 
 from .. import db
@@ -226,7 +225,16 @@ def should_apply_heal(*, value: dict | None, probe_ok: bool) -> bool:
         return False
     if value is None:
         return True
-    return value["classification"] != "dead"
+    if value.get("classification") == "dead":
+        return False
+    if value.get("classification") == "marginal":
+        components = value.get("components", {})
+        no_contribution = components.get("case_contribution") in (None, 0.0)
+        feedback_score = components.get("feedback")
+        negative_feedback = feedback_score is not None and feedback_score < 0.5
+        if no_contribution and negative_feedback:
+            return False
+    return True
 
 
 def should_prune(*, value: dict | None, min_history: bool) -> bool:

@@ -1868,8 +1868,8 @@ async def add_feedback(
 ) -> int:
     if verdict not in VALID_FEEDBACK_VERDICTS:
         raise ValueError(f"invalid verdict: {verdict!r}")
-    if not case_id and not item_id:
-        raise ValueError("feedback needs a case_id or item_id")
+    if bool(case_id) == bool(item_id):
+        raise ValueError("feedback needs exactly one of case_id or item_id")
     cur = await conn.execute(
         """
         INSERT INTO feedback (case_id, item_id, verdict, note, created_at)
