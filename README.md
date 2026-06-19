@@ -1,4 +1,4 @@
-# Marketplace Monitor
+# Cybercrime-Scene Monitor
 
 A self-hosted cybercrime-intelligence dashboard that scrapes breach/ransomware/marketplace sources, matches them against keyword rules, classifies incidents with an LLM, deduplicates them into cases, and surfaces everything through a live web UI.
 
