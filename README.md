@@ -24,7 +24,7 @@ uv sync
 # Copy example configs and edit them
  cp .env.example .env
  cp config/sources.yaml.example config/sources.yaml
- cp config/keywords.yaml.example config.keywords.yaml
+ cp config/keywords.yaml.example config/keywords.yaml
 
 # Run the server
 uv run python -m cybercrime_monitor.main

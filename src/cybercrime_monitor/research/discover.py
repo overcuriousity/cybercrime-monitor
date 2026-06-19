@@ -111,7 +111,7 @@ _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 def _slugify(name: str) -> str:
     slug = _SLUG_RE.sub("_", name.lower()).strip("_")
-    return f"discovered_{slug[:40]}" or "discovered_source"
+    return f"discovered_{slug[:40]}" if slug else "discovered_source"
 
 
 def _topics() -> str:
