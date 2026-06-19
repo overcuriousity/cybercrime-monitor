@@ -1354,8 +1354,11 @@ function renderCaseDetail(c, items, researchRuns, relatedCases) {
     relatedCases.forEach(r => {
       const rcard = document.createElement('button');
       rcard.className = 'related-case-card';
-      rcard.innerHTML = `${escHtml(r.title)}` +
-        `<div class="related-reasons">${escHtml((r.reasons || []).join(', '))} · score ${(r.score * 100).toFixed(0)}%</div>`;
+      rcard.appendChild(document.createTextNode(r.title));
+      const rreasons = document.createElement('div');
+      rreasons.className = 'related-reasons';
+      rreasons.textContent = `${(r.reasons || []).join(', ')} · score ${(r.score * 100).toFixed(0)}%`;
+      rcard.appendChild(rreasons);
       rcard.addEventListener('click', () => selectCase(r.case_id));
       relList.appendChild(rcard);
     });
