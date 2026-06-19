@@ -16,6 +16,10 @@
       <span id="total-count" class="stat-badge">— items</span>
       <span id="sse-status" class="sse-status disconnected" title="Live feed status">●</span>
     </div>
+    <div class="admin-controls">
+      <input type="password" id="admin-token" class="admin-token-input" placeholder="Admin token" autocomplete="off" title="Unlocks admin-gated features (Keywords editor, research trigger, filtered items)">
+      <span id="admin-token-status" class="admin-token-status hidden"></span>
+    </div>
     <nav class="tabs">
       <button class="tab active" data-tab="feed">Feed</button>
       <button class="tab" data-tab="cases">Cases</button>
@@ -222,10 +226,9 @@
     <div class="settings-pane">
       <h2>Keyword Rules <span class="badge info">keywords.yaml</span></h2>
       <p class="hint">Edit YAML directly. Rules are compiled with Python <code>re</code> — patterns have <code>re.IGNORECASE</code> applied unless you embed <code>(?-i)</code>. Save to hot-reload.</p>
-      <p class="hint">Admin token required — this view can reveal investigation target indicators and writes regex straight to disk.</p>
+      <p class="hint">Admin token required — enter it in the header toolbar. This view can reveal investigation target indicators and writes regex straight to disk.</p>
       <div class="settings-actions">
-        <input type="password" id="kw-token" placeholder="Admin token" autocomplete="off">
-        <button id="kw-token-load" class="btn-primary">Unlock</button>
+        <button id="kw-token-load" class="btn-primary">Load keywords</button>
         <span id="kw-token-status"></span>
       </div>
       <div id="kw-error" class="error-box hidden"></div>

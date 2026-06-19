@@ -21,6 +21,25 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _normalize_published_at(dt: datetime | None) -> str | None:
+    """Collectors hand back published_at in whatever timezone the source
+    used (e.g. RSS feeds commonly carry an explicit "-04:00" offset). Stored
+    naively, that breaks every later string comparison against seen_at/
+    other items' published_at (case first_seen/last_seen MIN/MAX, the
+    since/until date filters) — lexicographic ordering of ISO strings is
+    only chronological when every string shares the same offset. Normalize
+    to UTC at the single point of insertion so every stored timestamp is
+    "+00:00" consistently, same as seen_at via _utcnow(). A naive datetime
+    (no tzinfo — rare, but some date formats omit an offset) is assumed
+    already UTC rather than rejected, since "unknown offset" is a worse
+    failure mode than "off by a few hours in an edge case.\""""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
 log = logging.getLogger(__name__)
 
 _SCHEMA = """
@@ -323,7 +342,6 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
             await conn.execute(ddl)
             log.info("Migrated source_heal_proposals table: added %s column", col)
 
-
 async def insert_item(conn: aiosqlite.Connection, item: Item) -> int | None:
     """Insert item; returns new row id or None if duplicate. Deliberately
     does NOT commit — the caller (collectors/base.py:run) commits once after
@@ -343,7 +361,7 @@ async def insert_item(conn: aiosqlite.Connection, item: Item) -> int | None:
                 item.title,
                 item.url,
                 item.snippet,
-                item.published_at.isoformat() if item.published_at else None,
+                _normalize_published_at(item.published_at),
                 item.dedupe_key,
                 _utcnow().isoformat(),
                 json.dumps(item.source_tags),
@@ -490,12 +508,17 @@ def _build_items_where(
         idx += 1
 
     if since:
-        parts.append(f"i.seen_at >= :p{idx}")
+        # COALESCE to the real event date when the collector captured one
+        # (RSS/Mastodon/HIBP/ransomware.live/dated forum posts) — "items
+        # from last week" should mean the incident happened last week, not
+        # merely that our scraper saw it last week. Falls back to seen_at
+        # for sources that never carry a publish date (paste sites).
+        parts.append(f"COALESCE(i.published_at, i.seen_at) >= :p{idx}")
         params[f"p{idx}"] = since
         idx += 1
 
     if until:
-        parts.append(f"i.seen_at <= :p{idx}")
+        parts.append(f"COALESCE(i.published_at, i.seen_at) <= :p{idx}")
         params[f"p{idx}"] = until
         idx += 1
 
@@ -592,6 +615,13 @@ async def fetch_items(
         LEFT JOIN item_priority ep ON ep.item_id = i.id
         LEFT JOIN extractions e ON e.item_id = i.id
         {named_where}
+        -- Deliberately seen_at, not published_at: this is the live feed's
+        -- pagination/SSE order — a freshly-ingested item must always land at
+        -- the top regardless of its (possibly old) publish date, or live
+        -- prepending and "load more" offsets would desync from what the
+        -- user is actually scrolled through. The *displayed* timestamp on
+        -- each card prefers published_at when known (see api/static/app.js
+        -- buildCard) — only the ordering stays ingest-time.
         ORDER BY i.seen_at DESC
         LIMIT :limit OFFSET :offset
         """,
@@ -1202,7 +1232,7 @@ async def get_uncorrelated_extracted_items(conn: aiosqlite.Connection, *, limit:
     rows = await conn.execute_fetchall(
         """
         SELECT i.id, i.title, i.snippet, i.source_id, i.source_name, i.url,
-               i.seen_at, i.content_key,
+               i.seen_at, i.published_at, i.content_key,
                e.crime_type, e.victim, e.victim_sector, e.victim_country, e.actor,
                e.cve_ids, e.iocs, e.significance, e.confidence
         FROM items i
@@ -1304,11 +1334,18 @@ async def create_case(
     cve_ids: list[str],
     in_kev: bool,
     item_id: int,
+    event_at: str,
     iocs: list[str] | None = None,
 ) -> int:
     """Create a new case and link its founding item in one go. Returns the
-    new case id."""
-    now = _utcnow().isoformat()
+    new case id.
+
+    event_at: the founding item's real-world date — its published_at if the
+    collector captured one (RSS/Mastodon/HIBP/ransomware.live/dated forum
+    posts), else its seen_at. Seeds both first_seen and last_seen so a case's
+    timeline reflects when the incident actually happened/was reported, not
+    merely when our scraper first noticed it — see merge_item_into_case for
+    how subsequent items extend this range."""
     cur = await conn.execute(
         """
         INSERT INTO cases
@@ -1320,7 +1357,7 @@ async def create_case(
             (:case_key, :title, :summary, :crime_type, :attribution, :attribution_confidence,
              :damaged_party, :damaged_party_sector, :damaged_party_country,
              :significance, :significance_score, 'new', :cve_ids, :in_kev,
-             :first_seen, :last_seen, 1, '{}', :iocs)
+             :event_at, :event_at, 1, '{}', :iocs)
         """,
         {
             "case_key": case_key,
@@ -1336,8 +1373,7 @@ async def create_case(
             "significance_score": significance_score,
             "cve_ids": json.dumps(cve_ids),
             "in_kev": 1 if in_kev else 0,
-            "first_seen": now,
-            "last_seen": now,
+            "event_at": event_at,
             "iocs": json.dumps(iocs or []),
         },
     )
@@ -1363,16 +1399,24 @@ async def merge_item_into_case(
     attribution_confidence: float | None,
     damaged_party_sector: str | None,
     damaged_party_country: str | None,
+    event_at: str,
     iocs: list[str] | None = None,
 ) -> None:
     """Link a corroborating item into an existing case and recompute its
     aggregate fields: significance/score (max across all linked items —
     corroboration never lowers significance), cve_ids (union), iocs (union),
-    in_kev (OR), last_seen (extended), source_count (recount of distinct
-    item sources). Sparse fields (crime_type/attribution/sector/country) are
-    only filled in when the case doesn't have a value yet — first reporter's
+    in_kev (OR), first_seen/last_seen (widened to cover this item's real
+    event date — see event_at), source_count (recount of distinct item
+    sources). Sparse fields (crime_type/attribution/sector/country) are only
+    filled in when the case doesn't have a value yet — first reporter's
     structured data wins unless blank, rather than the newest report
-    silently overwriting an established attribution."""
+    silently overwriting an established attribution.
+
+    event_at: the merging item's published_at if known, else its seen_at —
+    same convention as create_case. A corroborating report can be OLDER than
+    the case's current first_seen (e.g. someone finds an earlier mention of
+    the same incident) or simply confirm the same window; MIN/MAX widen the
+    range rather than assuming reports arrive in chronological order."""
     case = await get_case_by_id(conn, case_id)
     if case is None:
         return
@@ -1412,7 +1456,8 @@ async def merge_item_into_case(
             attribution_confidence = COALESCE(attribution_confidence, :attribution_confidence),
             damaged_party_sector = COALESCE(damaged_party_sector, :damaged_party_sector),
             damaged_party_country = COALESCE(damaged_party_country, :damaged_party_country),
-            last_seen = :last_seen,
+            first_seen = MIN(first_seen, :event_at),
+            last_seen = MAX(last_seen, :event_at),
             source_count = :source_count
         WHERE id = :case_id
         """,
@@ -1428,7 +1473,7 @@ async def merge_item_into_case(
             "attribution_confidence": attribution_confidence,
             "damaged_party_sector": damaged_party_sector,
             "damaged_party_country": damaged_party_country,
-            "last_seen": _utcnow().isoformat(),
+            "event_at": event_at,
             "source_count": source_count,
         },
     )
@@ -2040,14 +2085,16 @@ async def get_cases_for_cross_correlation(conn: aiosqlite.Connection, *, since_i
 
 async def get_case_items(conn: aiosqlite.Connection, case_id: int) -> list[dict]:
     """The raw observations linked into a case — the case detail view's
-    corroboration list. Newest first."""
+    corroboration list. Ordered by real-world event date (published_at when
+    known, else seen_at) so the timeline reflects when things happened, not
+    when our scraper picked them up."""
     rows = await conn.execute_fetchall(
         """
         SELECT i.id, i.source_id, i.source_name, i.title, i.url, i.snippet,
                i.published_at, i.seen_at
         FROM case_items ci JOIN items i ON i.id = ci.item_id
         WHERE ci.case_id = :case_id
-        ORDER BY i.seen_at DESC
+        ORDER BY COALESCE(i.published_at, i.seen_at) DESC
         """,
         {"case_id": case_id},
     )

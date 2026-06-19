@@ -56,6 +56,8 @@ const iocInput       = document.getElementById('ioc-input');
 const tagInput       = document.getElementById('tag-input');
 const extraKeyInput  = document.getElementById('extra-key-input');
 const clusterSizeInput = document.getElementById('cluster-size-input');
+const adminTokenInput = document.getElementById('admin-token');
+const adminTokenStatus = document.getElementById('admin-token-status');
 
 // ── Init ───────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
@@ -378,7 +380,7 @@ async function loadMore() {
 }
 
 function itemsFetchOpts() {
-  return state.filters.showFiltered ? { headers: adminHeaders() } : {};
+  return (state.filters.showFiltered && hasAdminToken()) ? { headers: adminHeaders() } : {};
 }
 
 function buildParams(offset, limit) {
@@ -521,11 +523,19 @@ function buildCard(item) {
 
   const time = document.createElement('span');
   time.className = 'item-time';
-  if (item.published_at && item.source_tags && item.source_tags.includes('hibp')) {
-    time.textContent = 'breached ' + fmtTime(item.published_at);
+  // Prefer the source's own publish/event date over ingest time whenever a
+  // collector captured one (RSS, Mastodon, HIBP, ransomware.live, dated
+  // forum posts — see collectors/*.py) — seen_at is "when our scraper saw
+  // this," not "when it happened," and showing it as the headline date was
+  // misleading for anything that isn't brand new. seen_at is always kept in
+  // the tooltip so ingest lag is still visible on hover.
+  if (item.published_at) {
+    const label = item.source_tags && item.source_tags.includes('hibp') ? 'breached ' : '';
+    time.textContent = label + fmtTime(item.published_at);
     time.title = 'ingested ' + fmtTime(item.seen_at);
   } else {
     time.textContent = fmtTime(item.seen_at);
+    time.title = 'no publish date captured for this source — showing ingest time';
   }
   meta.appendChild(time);
 
@@ -694,26 +704,55 @@ function handleLiveItem(item) {
   }
 }
 
-// ── Keywords editor (admin-token gated) ──────────────────────────────────────
-// The editor can reveal investigation TARGET indicators and writes regex
-// straight to disk, so it's never auto-loaded — the operator must supply the
-// ADMIN_TOKEN configured server-side before the textarea is even fetched.
+// ── Admin token (central header input) ───────────────────────────────────────
+// The token unlocks admin-gated features across tabs: keyword editing,
+// filtered-item view, and the case deep-research trigger. It lives in the
+// header toolbar so it is reachable from every tab.
 const ADMIN_TOKEN_KEY = 'mm_admin_token';
+let adminEnabledServerSide = true;
 
 function initKeywordsAuth() {
-  const tokenInput = document.getElementById('kw-token');
-  tokenInput.value = localStorage.getItem(ADMIN_TOKEN_KEY) || '';
+  adminTokenInput.value = localStorage.getItem(ADMIN_TOKEN_KEY) || '';
+  adminTokenInput.addEventListener('input', () => {
+    localStorage.setItem(ADMIN_TOKEN_KEY, adminTokenInput.value);
+    updateAdminUiState();
+  });
   document.getElementById('kw-token-load').addEventListener('click', unlockKeywords);
   document.getElementById('kw-save').addEventListener('click', saveKeywords);
+  updateAdminUiState();
 }
 
 function adminHeaders() {
-  return { 'X-Admin-Token': document.getElementById('kw-token').value };
+  return { 'X-Admin-Token': adminTokenInput.value };
+}
+
+function hasAdminToken() {
+  return adminEnabledServerSide && adminTokenInput.value.trim().length > 0;
+}
+
+function updateAdminUiState() {
+  const token = adminTokenInput.value.trim();
+  if (!adminEnabledServerSide) {
+    adminTokenInput.classList.add('hidden');
+    adminTokenStatus.classList.add('hidden');
+    document.getElementById('show-filtered-row').classList.add('hidden');
+    return;
+  }
+  adminTokenInput.classList.remove('hidden');
+  if (token) {
+    adminTokenStatus.textContent = '🔒 admin';
+    adminTokenStatus.classList.remove('hidden', 'error');
+  } else {
+    adminTokenStatus.textContent = 'Admin token required for research/keywords';
+    adminTokenStatus.classList.remove('hidden');
+    adminTokenStatus.classList.add('error');
+  }
+  document.getElementById('show-filtered-row').classList.toggle('hidden', !token);
 }
 
 async function unlockKeywords() {
   const tokenStatus = document.getElementById('kw-token-status');
-  const token = document.getElementById('kw-token').value;
+  const token = adminTokenInput.value;
   localStorage.setItem(ADMIN_TOKEN_KEY, token);
   tokenStatus.textContent = 'Loading…';
   try {
@@ -726,7 +765,7 @@ async function unlockKeywords() {
     document.getElementById('kw-editor').value = data.yaml || '';
     document.getElementById('kw-editor').disabled = false;
     document.getElementById('kw-save').disabled = false;
-    tokenStatus.textContent = '✓ unlocked';
+    tokenStatus.textContent = '✓ loaded';
   } catch (e) {
     tokenStatus.textContent = String(e);
   }
@@ -768,7 +807,16 @@ async function saveKeywords() {
 // ── Utilities ──────────────────────────────────────────────────────────────
 async function api(path, opts = {}) {
   const resp = await fetch(path, opts);
-  if (!resp.ok) throw new Error(`API ${path}: ${resp.status}`);
+  if (!resp.ok) {
+    const err = new Error(`API ${path}: ${resp.status}`);
+    err.status = resp.status;
+    try {
+      err.body = await resp.json();
+    } catch {
+      err.body = null;
+    }
+    throw err;
+  }
   return resp.json();
 }
 
@@ -1139,6 +1187,7 @@ function buildCaseCard(c) {
   const time = document.createElement('span');
   time.className = 'item-time';
   time.textContent = fmtTime(c.last_seen);
+  time.title = 'last corroborating report';
   meta.appendChild(time);
 
   card.appendChild(meta);
@@ -1244,21 +1293,27 @@ function renderCaseDetail(c, items, researchRuns, relatedCases) {
   }
 
   // ── Research ──
-  const researchHeader = document.createElement('h3');
-  researchHeader.textContent = 'Autonomous research';
-  caseDetailPane.appendChild(researchHeader);
+  const showResearch = hasAdminToken();
+  if (showResearch) {
+    const researchHeader = document.createElement('h3');
+    researchHeader.textContent = 'Autonomous research';
+    caseDetailPane.appendChild(researchHeader);
 
-  const researchRow = document.createElement('div');
-  researchRow.className = 'research-status-row';
-  const btn = document.createElement('button');
-  btn.className = 'btn-deep-research';
-  const pending = !!c.research_requested_at;
-  const running = researchRuns.some(r => r.status === 'running');
-  btn.textContent = pending || running ? 'Research queued…' : (researchRuns.length ? 'Re-research (fill gaps)' : 'Deep research');
-  btn.disabled = pending || running;
-  btn.addEventListener('click', () => requestCaseResearch(c.id, btn));
-  researchRow.appendChild(btn);
-  caseDetailPane.appendChild(researchRow);
+    const researchRow = document.createElement('div');
+    researchRow.className = 'research-status-row';
+    const btn = document.createElement('button');
+    btn.className = 'btn-deep-research';
+    const pending = !!c.research_requested_at;
+    const running = researchRuns.some(r => r.status === 'running');
+    btn.textContent = pending || running ? 'Research queued…' : (researchRuns.length ? 'Re-research (fill gaps)' : 'Deep research');
+    btn.disabled = pending || running;
+    const researchStatus = document.createElement('span');
+    researchStatus.className = 'research-status-msg';
+    btn.addEventListener('click', () => requestCaseResearch(c.id, btn, researchStatus));
+    researchRow.appendChild(btn);
+    researchRow.appendChild(researchStatus);
+    caseDetailPane.appendChild(researchRow);
+  }
 
   if (researchRuns.length) {
     const list = document.createElement('div');
@@ -1325,7 +1380,10 @@ function renderCaseDetail(c, items, researchRuns, relatedCases) {
     row.appendChild(a);
     const meta = document.createElement('div');
     meta.className = 'item-time';
-    meta.textContent = `${it.source_name} · ${fmtTime(it.seen_at)}`;
+    meta.textContent = `${it.source_name} · ${fmtTime(it.published_at || it.seen_at)}`;
+    if (it.published_at) {
+      meta.title = `ingested ${fmtTime(it.seen_at)}`;
+    }
     row.appendChild(meta);
     const fbRow = document.createElement('div');
     fbRow.className = 'feedback-row';
@@ -1343,7 +1401,9 @@ function renderCaseDetail(c, items, researchRuns, relatedCases) {
   caseDetailPane.appendChild(timeline);
 }
 
-async function requestCaseResearch(caseId, btn) {
+async function requestCaseResearch(caseId, btn, statusEl) {
+  statusEl.textContent = '';
+  statusEl.className = 'research-status-msg';
   btn.disabled = true;
   btn.textContent = 'Queuing…';
   try {
@@ -1352,6 +1412,22 @@ async function requestCaseResearch(caseId, btn) {
   } catch (e) {
     btn.textContent = 'Failed — retry';
     btn.disabled = false;
+    let detail = '';
+    if (e && e.status) {
+      if (e.status === 403) {
+        detail = 'Invalid admin token.';
+      } else if (e.status === 404) {
+        detail = 'Case not found.';
+      } else if (e.status === 429) {
+        detail = 'Rate limit exceeded — wait a moment.';
+      } else {
+        detail = `Server error ${e.status}.`;
+      }
+    } else {
+      detail = 'Network or server error.';
+    }
+    statusEl.textContent = detail + ' Check the browser console for details.';
+    statusEl.classList.add('error');
     console.error('Failed to request research', e);
   }
 }
@@ -1390,6 +1466,9 @@ async function updateStatusBar() {
 }
 
 function renderStatusBar(s) {
+  adminEnabledServerSide = !!(s.admin && s.admin.enabled);
+  updateAdminUiState();
+
   const sched = s.scheduler || {};
   setStatusPill('status-scheduler', sched.running ? 'scheduler: running' : 'scheduler: stopped', sched.running ? 'ok' : 'error');
 

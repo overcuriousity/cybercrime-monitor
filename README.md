@@ -27,7 +27,7 @@ uv sync
  cp config/keywords.yaml.example config.keywords.yaml
 
 # Run the server
-uv run python -m marketplace_monitor.main
+uv run python -m cybercrime_monitor.main
 ```
 
 Open `http://127.0.0.1:8000`.
@@ -47,7 +47,7 @@ See `.env.example` and `config/*.yaml.example` for documented templates.
 ## Architecture
 
 ```
-src/marketplace_monitor/
+src/cybercrime_monitor/
 ├── main.py              # uvicorn entry point
 ├── settings.py          # Pydantic settings from .env
 ├── db.py                # SQLite schema and queries
@@ -113,10 +113,10 @@ Admin-token gated:
 
 ## Running under systemd
 
-A unit file is provided in `systemd/marketplace-monitor.service`. Copy/adapt it for your user and enable:
+A unit file is provided in `systemd/cybercrime-monitor.service`. Copy/adapt it for your user and enable:
 
 ```bash
-systemctl --user enable --now marketplace-monitor.service
+systemctl --user enable --now cybercrime-monitor.service
 ```
 
 ## License

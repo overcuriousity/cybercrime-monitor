@@ -50,7 +50,7 @@ async def get_db(request: Request):
 
 
 # ── Liveness/readiness ───────────────────────────────────────────────────────
-# For systemd/uptime checks (see systemd/marketplace-monitor.service) — no
+# For systemd/uptime checks (see systemd/cybercrime-monitor.service) — no
 # auth, no sensitive data, just enough to tell "process is up and the DB/
 # scheduler are functioning" from "process is wedged."
 
@@ -385,6 +385,7 @@ async def api_status(request: Request, db=Depends(get_db)):
             break
 
     return {
+        "admin": {"enabled": bool(settings.admin_token)},
         "scheduler": {"running": scheduler_running, "jobs": jobs},
         "sources": {
             "total": len(enabled_sources),

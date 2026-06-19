@@ -178,6 +178,11 @@ async def _correlate_one(db_conn, item: dict) -> None:
     case_key = _case_key_for(item)
 
     iocs = item.get("iocs") or []
+    # The item's real-world date: published_at when the collector captured
+    # one (RSS/Mastodon/HIBP/ransomware.live/dated forum posts), else
+    # seen_at — see db.create_case/merge_item_into_case's docstrings for why
+    # this drives case first_seen/last_seen instead of "now."
+    event_at = item.get("published_at") or item["seen_at"]
 
     existing = await db.get_case_by_key(db_conn, case_key)
     if existing is not None:
@@ -193,11 +198,12 @@ async def _correlate_one(db_conn, item: dict) -> None:
             attribution_confidence=item.get("confidence"),
             damaged_party_sector=item.get("victim_sector"),
             damaged_party_country=item.get("victim_country"),
+            event_at=event_at,
             iocs=iocs,
         )
         return
 
-    merged = await _try_fuzzy_merge(db_conn, item, cve_ids=cve_ids, in_kev=in_kev)
+    merged = await _try_fuzzy_merge(db_conn, item, cve_ids=cve_ids, in_kev=in_kev, event_at=event_at)
     if merged:
         return
 
@@ -217,11 +223,12 @@ async def _correlate_one(db_conn, item: dict) -> None:
         cve_ids=cve_ids,
         in_kev=in_kev,
         item_id=item["id"],
+        event_at=event_at,
         iocs=iocs,
     )
 
 
-async def _try_fuzzy_merge(db_conn, item: dict, *, cve_ids: list[str], in_kev: bool) -> bool:
+async def _try_fuzzy_merge(db_conn, item: dict, *, cve_ids: list[str], in_kev: bool, event_at: str) -> bool:
     since_iso = (datetime.now(timezone.utc) - timedelta(days=_CANDIDATE_WINDOW_DAYS)).isoformat()
     candidates = await db.find_candidate_cases(
         db_conn,
@@ -256,6 +263,7 @@ async def _try_fuzzy_merge(db_conn, item: dict, *, cve_ids: list[str], in_kev: b
                 attribution_confidence=item.get("confidence"),
                 damaged_party_sector=item.get("victim_sector"),
                 damaged_party_country=item.get("victim_country"),
+                event_at=event_at,
                 iocs=item.get("iocs") or [],
             )
             return True

@@ -24,7 +24,7 @@ class HIBPCollector(BaseCollector):
             async with clearnet_client() as client:
                 resp = await client.get(
                     _HIBP_URL,
-                    headers={"hibp-api-key": "", "User-Agent": "marketplace-monitor/0.1 (security research)"},
+                    headers={"hibp-api-key": "", "User-Agent": "cybercrime-monitor/0.1 (security research)"},
                 )
                 resp.raise_for_status()
                 breaches = resp.json()

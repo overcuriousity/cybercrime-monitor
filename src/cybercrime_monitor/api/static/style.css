@@ -95,6 +95,32 @@ header {
 .sse-status.disconnected { color: var(--prio-critical); }
 .sse-status.connecting   { color: var(--prio-warn); }
 
+.admin-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+.admin-token-input {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 3px 10px;
+  font-size: 0.8rem;
+  color: var(--text);
+  width: 140px;
+}
+.admin-token-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.admin-token-status {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.admin-token-status.error { color: #ff6b6b; }
+
 .tabs { display: flex; gap: 0; margin-left: 8px; }
 .tab {
   background: none;
@@ -636,6 +662,11 @@ mark.prio-critical { background: var(--prio-critical-bg); color: var(--prio-crit
 }
 .btn-deep-research:hover { opacity: 0.9; }
 .btn-deep-research:disabled { opacity: 0.5; cursor: default; }
+.research-status-msg {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+.research-status-msg.error { color: #ff6b6b; }
 .research-run-list { font-size: 0.82rem; }
 .research-run-row { padding: 4px 0; border-bottom: 1px solid var(--border); }
 .research-run-row:last-child { border-bottom: none; }
