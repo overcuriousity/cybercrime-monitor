@@ -207,6 +207,62 @@ async def test_find_candidate_cases_no_match_without_shared_signal(db_conn):
 
 
 @pytest.mark.asyncio
+async def test_find_candidate_cases_fuzzy_victim_bracket_suffix(db_conn):
+    await _make_case(
+        db_conn, days_ago=1, title="v-bank-base",
+        damaged_party="V-Bank",
+    )
+
+    since_iso = _iso(7)
+    candidates = await db_module.find_candidate_cases(
+        db_conn, victim="V-Bank (Munich)", actor=None, cve_ids=[], iocs=None, since_iso=since_iso,
+    )
+    assert [c["title"] for c in candidates] == ["v-bank-base"]
+
+
+@pytest.mark.asyncio
+async def test_find_candidate_cases_fuzzy_victim_no_false_positives(db_conn):
+    await _make_case(
+        db_conn, days_ago=1, title="other-bank",
+        damaged_party="OtherBank",
+    )
+
+    since_iso = _iso(7)
+    candidates = await db_module.find_candidate_cases(
+        db_conn, victim="V-Bank", actor=None, cve_ids=[], iocs=None, since_iso=since_iso,
+    )
+    assert candidates == []
+
+
+@pytest.mark.asyncio
+async def test_merge_cases_moves_items_and_updates_aggregates(db_conn):
+    keep = await _make_case(
+        db_conn, days_ago=2, title="V-Bank",
+        damaged_party="V-Bank", significance="warn",
+        cve_ids=["CVE-2024-1"],
+    )
+    drop = await _make_case(
+        db_conn, days_ago=1, title="V-Bank (Munich)",
+        damaged_party="V-Bank (Munich)", significance="critical",
+        cve_ids=["CVE-2024-2"],
+    )
+
+    merged = await db_module.merge_cases(db_conn, keep_case_id=keep, drop_case_id=drop)
+
+    assert merged["damaged_party"] == "V-Bank (Munich)"
+    assert merged["title"] == "V-Bank (Munich)"
+    assert merged["significance"] == "critical"
+    assert set(json.loads(merged["cve_ids"])) == {"CVE-2024-1", "CVE-2024-2"}
+
+    # drop case is gone
+    assert await db_module.get_case_by_id(db_conn, drop) is None
+
+    # all items now belong to the surviving case
+    keep_items = await db_module.get_case_items(db_conn, keep)
+    assert len(keep_items) == 2
+
+
+@pytest.mark.asyncio
 async def test_stats_trends_actor(db_conn):
     await _make_case(db_conn, days_ago=1, title="cur", attribution="ActorA")
     await _make_case(db_conn, days_ago=1, title="cur2", attribution="ActorA")
@@ -301,3 +357,74 @@ def test_api_activity_route(client):
     data = r.json()
     assert data["total"] >= 1
     assert any(e["summary"] == "test batch" for e in data["events"])
+
+
+ADMIN_TOKEN = "test-admin-token"
+
+
+async def _seed_two_cases(db_path: str):
+    app_settings.db_path = db_path
+    conn = await db_module.open_db()
+    keep_item = await _insert_item(conn)
+    keep = await _create_case(
+        conn, keep_item,
+        case_key="keep-key",
+        title="keep-base",
+        damaged_party="V-Bank",
+        significance="warn",
+        cve_ids=["CVE-2024-1"],
+        event_at=_iso(2),
+    )
+    drop_item = await _insert_item(conn)
+    drop = await _create_case(
+        conn, drop_item,
+        case_key="drop-key",
+        title="drop-specific",
+        damaged_party="V-Bank (Munich)",
+        significance="critical",
+        cve_ids=["CVE-2024-2"],
+        event_at=_iso(1),
+    )
+    await conn.close()
+    return keep, drop
+
+
+def test_api_merge_cases_requires_admin(client, monkeypatch):
+    monkeypatch.setattr(app_settings, "admin_token", ADMIN_TOKEN)
+    keep, drop = asyncio.run(_seed_two_cases(app_settings.db_path))
+
+    with client:
+        r = client.post(f"/api/cases/{keep}/merge/{drop}")
+    assert r.status_code == 403
+
+    with client:
+        r = client.post(
+            f"/api/cases/{keep}/merge/{drop}",
+            headers={"X-Admin-Token": "wrong"},
+        )
+    assert r.status_code == 403
+
+
+def test_api_merge_cases_success(client, monkeypatch):
+    monkeypatch.setattr(app_settings, "admin_token", ADMIN_TOKEN)
+    keep, drop = asyncio.run(_seed_two_cases(app_settings.db_path))
+
+    with client:
+        r = client.post(
+            f"/api/cases/{keep}/merge/{drop}",
+            headers={"X-Admin-Token": ADMIN_TOKEN},
+        )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["merged"] is True
+    assert data["case_id"] == keep
+    assert data["dropped_case_id"] == drop
+
+    # Verify the surviving case via the detail endpoint.
+    with client:
+        r = client.get(f"/api/cases/{keep}")
+    assert r.status_code == 200
+    detail = r.json()
+    assert detail["case"]["damaged_party"] == "V-Bank (Munich)"
+    assert detail["case"]["significance"] == "critical"
+    assert len(detail["items"]) == 2

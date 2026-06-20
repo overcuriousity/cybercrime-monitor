@@ -1744,6 +1744,15 @@ function renderCaseDetail(c, items, researchRuns, relatedCases) {
   exportLink.setAttribute('download', '');
   header.appendChild(exportLink);
 
+  if (hasAdminToken()) {
+    const mergeBtn = document.createElement('button');
+    mergeBtn.type = 'button';
+    mergeBtn.className = 'btn-merge-case';
+    mergeBtn.textContent = 'Merge with case…';
+    mergeBtn.addEventListener('click', () => requestCaseMerge(c.id, mergeBtn));
+    header.appendChild(mergeBtn);
+  }
+
   caseDetailPane.appendChild(header);
 
   // ── Field grid ──
@@ -1960,6 +1969,38 @@ async function requestCaseResearch(caseId, btn, statusEl) {
     statusEl.textContent = detail + ' Check the browser console for details.';
     statusEl.classList.add('error');
     console.error('Failed to request research', e);
+  }
+}
+
+async function requestCaseMerge(caseId, btn) {
+  const otherId = prompt('Enter the ID of the case to merge into this one:');
+  if (!otherId || !otherId.trim()) return;
+  const otherCaseId = parseInt(otherId.trim(), 10);
+  if (!otherCaseId || otherCaseId === caseId) {
+    alert('Please enter a different valid case ID.');
+    return;
+  }
+  const originalText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Merging…';
+  try {
+    await api(`/api/cases/${caseId}/merge/${otherCaseId}`, { method: 'POST', headers: adminHeaders() });
+    btn.textContent = 'Merged';
+    // Refresh the case list and reopen the surviving case.
+    await loadCases();
+    await selectCase(caseId);
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = originalText;
+    let msg = 'Merge failed.';
+    if (e && e.status) {
+      if (e.status === 403) msg = 'Invalid admin token.';
+      else if (e.status === 404) msg = 'Case not found.';
+      else if (e.status === 400) msg = 'Cannot merge a case with itself.';
+      else msg = `Server error ${e.status}.`;
+    }
+    alert(msg);
+    console.error('Failed to merge cases', e);
   }
 }
 
