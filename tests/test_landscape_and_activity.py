@@ -167,6 +167,46 @@ async def test_prune_old_activity(db_conn):
 
 
 @pytest.mark.asyncio
+async def test_find_candidate_cases_matches_shared_ioc(db_conn):
+    """A shared IoC (e.g. a hash/onion address from a technical write-up)
+    should surface a case as a fuzzy-merge candidate even when neither
+    victim nor actor nor any CVE matches — see pipeline/correlate.py's
+    _try_fuzzy_merge, which now passes iocs through to find_candidate_cases."""
+    await _make_case(
+        db_conn, days_ago=1, title="known-incident",
+        damaged_party="UnrelatedVictim", attribution="UnrelatedActor",
+        iocs=["9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"],
+    )
+
+    since_iso = _iso(7)
+    candidates = await db_module.find_candidate_cases(
+        db_conn,
+        victim="SomeoneElse",
+        actor="SomeoneElseActor",
+        cve_ids=[],
+        iocs=["9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08"],
+        since_iso=since_iso,
+    )
+    assert [c["title"] for c in candidates] == ["known-incident"]
+
+
+@pytest.mark.asyncio
+async def test_find_candidate_cases_no_match_without_shared_signal(db_conn):
+    await _make_case(
+        db_conn, days_ago=1, title="known-incident",
+        damaged_party="UnrelatedVictim", attribution="UnrelatedActor",
+        iocs=["somehash"],
+    )
+
+    since_iso = _iso(7)
+    candidates = await db_module.find_candidate_cases(
+        db_conn, victim="SomeoneElse", actor="SomeoneElseActor", cve_ids=[],
+        iocs=["differenthash"], since_iso=since_iso,
+    )
+    assert candidates == []
+
+
+@pytest.mark.asyncio
 async def test_stats_trends_actor(db_conn):
     await _make_case(db_conn, days_ago=1, title="cur", attribution="ActorA")
     await _make_case(db_conn, days_ago=1, title="cur2", attribution="ActorA")

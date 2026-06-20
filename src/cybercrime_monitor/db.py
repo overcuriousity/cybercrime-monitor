@@ -723,8 +723,7 @@ async def fetch_items(
                 "iocs": json.loads(r["iocs"]) if r["iocs"] else [],
                 # >1 means other sources reported the same content_key — a
                 # display/triage aid only, never a filter (see fetch_items
-                # docstring and stats_top_actors for the same don't-hide
-                # principle applied elsewhere).
+                # docstring's don't-hide principle).
                 "cluster_size": r["cluster_size"],
             }
         )
@@ -873,105 +872,6 @@ async def stats_top_keywords(conn: aiosqlite.Connection, *, limit: int = 10) -> 
         {"limit": limit},
     )
     return [dict(r) for r in rows]
-
-
-# Ransomware-tracking accounts/sites name the threat actor in a handful of
-# recurring structural slots — a labeled field, a hashtag, or immediately
-# adjacent to the word "ransomware" — regardless of which group it is. These
-# patterns extract whatever name sits in that slot instead of matching
-# against a fixed, hand-maintained list of group names, so a brand-new group
-# shows up the same way an established one does. Ordered most-specific-first;
-# the first pattern that matches an item wins.
-# Permissive — used right after an explicit, unambiguous label (brackets,
-# "Threat actor:", a hashtag) where the surrounding context already pins
-# down exactly where the name starts and ends, so multi-word names like
-# "Space Bears" or "INC RANSOM" are safe to capture in full.
-_ACTOR_NAME = r"([A-Z][A-Za-z0-9](?:[A-Za-z0-9 .&-]{0,38}[A-Za-z0-9])?)"
-# A single lowercase-led compact token (e.g. "payload", "spacebears") — for
-# labels whose value is consistently a short slug, with no delimiter between
-# this value and a following label when the source's HTML-to-text stripping
-# drops whitespace (observed: "Group name: payloadPost title: SPORTON...").
-_ACTOR_SLUG = r"([A-Za-z][a-z0-9]*)"
-# Strict — used in free prose with no explicit label, where the name is
-# merely "the capitalized word(s) right before 'ransomware'". Requires every
-# word to be capitalized (proper-noun form) so it can't swallow a whole
-# preceding clause like "Breached by Akira" (lowercase "by" stops the chain,
-# leaving "Akira" as the actual match).
-_ACTOR_NAME_STRICT = r"([A-Z][A-Za-z0-9]*(?:\s[A-Z][A-Za-z0-9]*){0,2})"
-_ACTOR_PATTERNS = [
-    re.compile(r"\[" + _ACTOR_NAME + r"\]\s*-\s*Ransomware Victim", re.IGNORECASE),
-    re.compile(r"Threat\s*[Aa]ctor:\s*" + _ACTOR_NAME),
-    # Case-insensitivity scoped to the label only — applying it to the whole
-    # pattern would make the slug's [a-z0-9] class match uppercase too and
-    # erase the camelCase boundary the slug relies on to stop early.
-    re.compile(r"(?i:Group\s*name:)\s*" + _ACTOR_SLUG),
-    re.compile(r"New post from #" + _ACTOR_NAME + r"\s*:"),
-    re.compile(r"fallen victim to (?:the )?" + _ACTOR_NAME_STRICT + r"\s+[Rr]ansomware"),
-    re.compile(_ACTOR_NAME_STRICT + r"\s+[Rr]ansomware(?:\s+group)?\s+(?:has added|claims|group has)"),
-    re.compile(_ACTOR_NAME_STRICT + r"\s+[Rr]ansomware\b"),
-]
-# Generic words that can land in the same grammatical slot but aren't actor
-# names — filtered after extraction, not used to define what *is* a name.
-_ACTOR_STOPWORDS = {
-    "the", "new", "this", "update", "alert", "cyber", "data", "double",
-    "group", "ransomware", "victim", "breaking", "report", "reported",
-}
-
-
-def _extract_actor_name(text: str) -> str | None:
-    for pattern in _ACTOR_PATTERNS:
-        m = pattern.search(text)
-        if m:
-            name = m.group(1).strip()
-            if name and name.lower() not in _ACTOR_STOPWORDS:
-                return name
-    return None
-
-
-async def stats_top_actors(conn: aiosqlite.Connection, *, limit: int = 10) -> list[dict]:
-    """Most-mentioned ransomware threat actors. Prefers the structured
-    extra.actor field (set by collectors/ransomware_live.py from
-    ransomware.live's tracked group name — no free-text guessing involved)
-    when present; falls back to the heuristic _extract_actor_name regex for
-    every other source, so sources without structured data still contribute."""
-    limit = max(1, min(limit, 50))
-    rows = await conn.execute_fetchall(
-        """
-        SELECT i.title, i.snippet, i.extra
-        FROM items i
-        LEFT JOIN item_priority ep ON ep.item_id = i.id
-        WHERE (i.title LIKE '%ansom%' OR i.snippet LIKE '%ansom%' OR i.extra LIKE '%"actor"%')
-          AND ep.false_positive = 0
-        """
-    )
-    # Group by a loosely-normalized key (lowercase, punctuation/whitespace
-    # stripped) so "Space Bears" / "spacebears" / "SPACE BEARS" merge, but
-    # display the most common surface form seen.
-    counts: dict[str, int] = {}
-    display: dict[str, dict[str, int]] = {}
-    for r in rows:
-        name = None
-        try:
-            extra = json.loads(r["extra"] or "{}")
-        except (json.JSONDecodeError, TypeError):
-            extra = {}
-        if isinstance(extra, dict) and extra.get("actor"):
-            name = str(extra["actor"])
-        if not name:
-            name = _extract_actor_name(r["title"] + "\n" + r["snippet"])
-        if not name:
-            continue
-        key = re.sub(r"[^a-z0-9]", "", name.lower())
-        if not key:
-            continue
-        counts[key] = counts.get(key, 0) + 1
-        variants = display.setdefault(key, {})
-        variants[name] = variants.get(name, 0) + 1
-    top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:limit]
-    return [
-        {"actor": max(display[k].items(), key=lambda kv: kv[1])[0], "count": v}
-        for k, v in top
-    ]
 
 
 # ── LLM extraction support ────────────────────────────────────────────────
@@ -1429,14 +1329,17 @@ async def find_candidate_cases(
     victim: str | None,
     actor: str | None,
     cve_ids: list[str],
+    iocs: list[str] | None = None,
     since_iso: str,
 ) -> list[dict]:
     """Fuzzy candidate set for correlate.py's adjudication step: cases last
     updated since `since_iso` (recency bound — an old, long-closed case
     shouldn't silently reopen) that share a normalized victim OR actor OR
-    any CVE id. Exact case_key matches are handled separately by
+    any CVE id OR any IoC. Exact case_key matches are handled separately by
     get_case_by_key — this is only consulted when that misses, so candidates
-    here are "maybe the same incident," not "definitely.\""""
+    here are "maybe the same incident," not "definitely." IoCs are matched
+    case-insensitively since the LLM/regex sources don't agree on casing for
+    hex hashes/addresses."""
     clauses = []
     params: dict = {"since": since_iso}
     if victim:
@@ -1452,6 +1355,13 @@ async def find_candidate_cases(
             cve_clauses.append(f"cve_ids LIKE :{key}")
             params[key] = f'%"{cve}"%'
         clauses.append("(" + " OR ".join(cve_clauses) + ")")
+    if iocs:
+        ioc_clauses = []
+        for i, ioc in enumerate(iocs):
+            key = f"ioc{i}"
+            ioc_clauses.append(f"lower(iocs) LIKE :{key}")
+            params[key] = f'%"{ioc.lower()}"%'
+        clauses.append("(" + " OR ".join(ioc_clauses) + ")")
     if not clauses:
         return []
     rows = await conn.execute_fetchall(
@@ -2582,10 +2492,13 @@ async def get_actor_profile(conn: aiosqlite.Connection, actor: str, *, case_limi
 async def stats_cases_by_actor(
     conn: aiosqlite.Connection, *, since_iso: str | None = None, limit: int = 15
 ) -> list[dict]:
-    """Case-based actor leaderboard — more accurate than the item-based
-    stats_top_actors (db.py, fed from items.extra) since one actor's
-    activity is counted once per incident here, not once per corroborating
-    report. Used by the Landscape tab's actor leaderboard."""
+    """Case-based actor leaderboard — counts each actor's activity once per
+    deduplicated incident (case), not once per corroborating report. This is
+    the canonical actor leaderboard, used by both the Landscape tab and the
+    Feed tab's "Most active ransomware actors" chart — there is no longer a
+    separate item/mention-based variant (that approach over-counted actors
+    proportional to press coverage and relied on a heuristic regex guess at
+    the actor name; see git history if you need the old behavior)."""
     where = "WHERE attribution IS NOT NULL AND attribution != ''"
     params: dict = {"limit": limit}
     if since_iso:

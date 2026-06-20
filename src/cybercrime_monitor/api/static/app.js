@@ -254,6 +254,7 @@ function healthTooltip(src, status) {
   if (src.last_error) parts.push(`last error: ${src.last_error}`);
   if (src.consecutive_errors) parts.push(`consecutive errors: ${src.consecutive_errors}`);
   if (status === 'degraded') parts.push(`${src.consecutive_empty} ticks in a row parsed 0 items`);
+  if (src.value_classification) parts.push(`investigation value: ${src.value_classification}`);
   return parts.join('\n');
 }
 
@@ -987,7 +988,7 @@ function renderActorsBar(actors) {
     type: 'bar',
     data: {
       labels: actors.map(a => a.actor),
-      datasets: [{ label: 'mentions', data: actors.map(a => a.count), backgroundColor: PRIO_COLORS.warn }],
+      datasets: [{ label: 'cases', data: actors.map(a => a.count), backgroundColor: PRIO_COLORS.warn }],
     },
     options: {
       indexAxis: 'y',

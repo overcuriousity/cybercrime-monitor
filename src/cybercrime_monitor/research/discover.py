@@ -4,16 +4,22 @@ Same dispatch pattern as the rest of research/: build a prompt, let Hermes
 drive its own web toolsets, parse a structured result, probe before
 applying.
 
-Scoped to RSS/Atom feeds only — deliberately, not a limitation to lift
-later. sources.yaml.example's own comments note that HTML/Tor-forum
-scraping is fragile (CSS selectors drift, see the disabled-by-default
-entries there) and an LLM guessing selectors for a site it's never run a
-scrape against has no way to validate they're even close to right; an RSS
-feed needs only a URL to be immediately useful and testable by the same
-lightweight probe heal.py already uses. If Hermes finds a promising
-non-RSS source, that goes in the proposal notes for a human to act on
-manually rather than being auto-added — same probe-and-judge contract as
-everything else in this loop, just one type narrower for the auto-add path.
+Fully autonomous, multi-channel discovery — no human-in-the-loop step.
+Hermes is asked to prioritize, in order: (1) darknet forums/marketplaces/
+leak sites (.onion — found via clearnet directories like dark.fail/
+Tor.taxi and CTI write-ups that publish onion addresses, since Hermes
+itself has no guaranteed Tor route), (2) cybersecurity researcher feeds,
+(3) press feeds (heise, KrebsOnSecurity, etc.). RSS/Atom candidates are
+probed and added exactly as before. Forum candidates (tor_forum/
+html_forum — no feed, just an HTML listing page) go through a second,
+local leg: fetch the listing page ourselves (via Tor for .onion), ask
+Hermes (tool-free, given the fetched HTML) to propose CSS selectors, then
+*validate by actually scraping with them* — the same probe-before-apply
+contract as everything else in this loop, just extended to a type that
+needs a generated config instead of a bare URL. A local Tor daemon
+(SOCKS proxy, see settings.tor_socks / README) is required for the onion
+leg; without one, onion candidates simply fail their probe and are logged
+as proposals instead of applied.
 
 Newly added sources are tagged "probationary": sources/value.py treats them
 cautiously (no history yet ⇒ "marginal", not "valuable") until they've
@@ -28,10 +34,12 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from selectolax.parser import HTMLParser
+
 from .. import db
 from ..api.sse import broadcaster
 from ..hermes.runner import run_agent
-from ..http import clearnet_client
+from ..http import clearnet_client, tor_client
 from ..matcher import matcher
 from ..scheduler import load_sources, reschedule_source
 from ..settings import settings
@@ -110,19 +118,77 @@ You are assisting in expanding a cybercrime OSINT monitor's data sources. \
 The monitor currently tracks these topics: {topics}. It already has these \
 sources (do not suggest duplicates of these domains): {existing_domains}.
 
-Search the clearnet web for 1-3 RSS or Atom feeds (NOT general web pages — \
-specifically a feed URL that returns valid RSS/Atom XML) from sites that \
-regularly publish content about: data breaches, ransomware attacks, \
-cybercrime forums/marketplaces, leaked databases, or exploited \
-vulnerabilities. Prefer sites with a track record of being first to report \
-incidents over general security news aggregators.
+Search for new sources, in this priority order:
+1. Darknet forums, marketplaces, or leak sites (.onion addresses) — find \
+   these via clearnet darknet directories/mirror lists (e.g. dark.fail, \
+   Tor.taxi) or via cybersecurity write-ups and CTI reports that publish \
+   onion addresses for ransomware leak sites or cybercrime forums. You do \
+   not need to be able to browse the .onion address yourself — reporting \
+   the address and what it is, as found in clearnet text, is enough.
+2. Cybersecurity researcher feeds/blogs that publish their own incident \
+   analysis or threat intel (vendor blogs, independent researchers).
+3. General press/news feeds that cover data breaches and cybercrime \
+   promptly (e.g. heise, KrebsOnSecurity, and similar outlets).
+
+For each candidate, determine its "kind":
+- "rss": you found a working RSS/Atom feed URL for it (NOT a general web \
+  page — the feed_url must return valid RSS/Atom XML).
+- "tor_forum": a darknet (.onion) forum/marketplace/leak-site with no \
+  feed — give its listing_url (the page that lists threads/posts/leaks).
+- "html_forum": a clearnet forum/leak-site with no feed — give its \
+  listing_url likewise.
+
+Find up to 5 candidates total, prioritized as above (darknet first). \
+Prefer sites with a track record of being first to report incidents over \
+general security news aggregators.
 
 When you are done, respond with ONLY a single-line JSON object as your \
 final message, no markdown fencing, no commentary, exactly these keys:
-{{"candidates": [{{"name": "<short site name>", "feed_url": "<RSS/Atom feed URL>", \
+{{"candidates": [{{"name": "<short site name>", "kind": "rss"|"tor_forum"|"html_forum", \
+"feed_url": <"<RSS/Atom feed URL>"|null>, "listing_url": <"<forum listing page URL>"|null>, \
 "reason": "<why this is a good fit>"}}, ...]}}
 Use an empty "candidates" array if you find nothing suitable.
 """
+
+# Second, tool-free leg for forum candidates: given the actual fetched HTML
+# of a listing page, ask Hermes to propose selectors — same no-tools/JSON
+# contract as llm/backend.py's adjudicate_merge (_NO_TOOLS_TOOLSET="memory"),
+# reused here so selector generation doesn't need its own LLM integration.
+_SELECTOR_PROMPT_TEMPLATE = """\
+You are helping configure a CSS-selector-based scraper for a forum/listing \
+page. Below is the raw HTML of the page (truncated). Identify the repeating \
+row/item that represents one thread, post, or listing, and propose CSS \
+selectors:
+- row_selector: selects each repeating row/item element.
+- title_selector: within a row, selects the element containing the \
+  title/subject text.
+- url_selector: within a row, selects the <a> element whose href points to \
+  the individual thread/post/listing.
+- date_selector: within a row, selects the element containing a \
+  post/listing date, or null if none is reliably present.
+
+URL: {url}
+
+HTML (truncated):
+{html}
+
+Respond with ONLY a single-line JSON object as your final message, no \
+markdown fencing, no commentary, exactly these keys:
+{{"row_selector": "<css>", "title_selector": "<css>", "url_selector": "<css>", \
+"date_selector": <"<css>"|null>}}
+Do not search the web, browse, or use any tools for this task — base your \
+answer ONLY on the HTML given above and respond immediately.
+"""
+
+# A validated selector set must extract at least this many usable rows
+# (title + url both present) from the listing page before it's trusted
+# enough to auto-add — one matching row could be a coincidence (e.g. a
+# single nav link), several in a row is a real repeating structure.
+_MIN_VALID_ROWS = 3
+# Selector-generation HTML is truncated to keep the (tool-free, cheap)
+# Hermes call fast — a listing page's repeating structure is almost always
+# evident well within the page's first chunk of markup.
+_SELECTOR_HTML_CHARS = 12000
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
@@ -148,8 +214,9 @@ def _existing_domains(sources: list[dict]) -> set[str]:
 
 
 async def run_discover_batch(db_conn, scheduler=None, sse_broadcaster=None) -> int:
-    """One tick: ask hermes-agent for new RSS/Atom candidates, probe each,
-    and auto-add the ones that pass. Returns the number of sources added."""
+    """One tick: ask hermes-agent for new source candidates (RSS first, then
+    forum-type), probe/validate each, and auto-add the ones that pass.
+    Returns the number of sources added."""
     if settings.hermes_discover_interval_seconds <= 0:
         return 0
 
@@ -178,7 +245,7 @@ async def run_discover_batch(db_conn, scheduler=None, sse_broadcaster=None) -> i
         existing_domains = _existing_domains(existing)
         existing_ids = {s["id"] for s in existing}
 
-        for cand in candidates[:3]:
+        for cand in candidates[:5]:
             try:
                 if await _try_add_candidate(db_conn, cand, existing_domains, existing_ids, scheduler, sse_broadcaster):
                     added += 1
@@ -192,24 +259,37 @@ async def run_discover_batch(db_conn, scheduler=None, sse_broadcaster=None) -> i
     return added
 
 
+def _candidate_url(cand: dict, kind: str) -> str:
+    if kind == "rss":
+        return str(cand.get("feed_url") or "").strip()
+    return str(cand.get("listing_url") or "").strip()
+
+
 async def _try_add_candidate(
     db_conn, cand: dict, existing_domains: set[str], existing_ids: set[str], scheduler, sse_broadcaster
 ) -> bool:
+    """Dispatch by candidate kind — see _DISCOVER_PROMPT_TEMPLATE's contract.
+    Unrecognized/missing kind defaults to "rss" for backward compatibility
+    with any in-flight proposal shaped by the old prompt."""
     if not isinstance(cand, dict):
         return False
-    name = str(cand.get("name") or "").strip()[:100]
-    feed_url = str(cand.get("feed_url") or "").strip()
-    if not name or not feed_url.startswith(("http://", "https://")):
+    kind = str(cand.get("kind") or "rss").strip().lower()
+    if kind not in ("rss", "tor_forum", "html_forum"):
         return False
 
-    m = re.search(r"://([^/]+)/?", feed_url)
+    name = str(cand.get("name") or "").strip()[:100]
+    url = _candidate_url(cand, kind)
+    if not name or not url.startswith(("http://", "https://")):
+        return False
+
+    m = re.search(r"://([^/]+)/?", url)
     domain = m.group(1).lower() if m else ""
     if not domain or domain in existing_domains:
         if domain:
             await _log_activity(
                 db_conn, action="candidate_skipped", status="skipped",
                 summary=f"Skipped discovered candidate '{name}' — domain already a source",
-                detail={"feed_url": feed_url, "domain": domain},
+                detail={"url": url, "domain": domain, "kind": kind},
             )
         return False
 
@@ -217,6 +297,16 @@ async def _try_add_candidate(
     while source_id in existing_ids:
         source_id += "_2"
 
+    if kind == "rss":
+        return await _try_add_rss_candidate(db_conn, cand, name=name, source_id=source_id, feed_url=url,
+                                             scheduler=scheduler, sse_broadcaster=sse_broadcaster)
+    return await _try_add_forum_candidate(db_conn, cand, name=name, source_id=source_id, listing_url=url,
+                                           kind=kind, scheduler=scheduler, sse_broadcaster=sse_broadcaster)
+
+
+async def _try_add_rss_candidate(
+    db_conn, cand: dict, *, name: str, source_id: str, feed_url: str, scheduler, sse_broadcaster
+) -> bool:
     # Probe: a 2xx response that looks like a feed (XML/RSS content-type or
     # body) — same "reachable and plausible" bar as heal.py's URL probe.
     try:
@@ -261,18 +351,172 @@ async def _try_add_candidate(
         "enabled": True,
         "source_tags": ["discovered", "probationary"],
     }
+    return await _apply_new_source(
+        db_conn, entry=entry, reason="hermes-agent discovery", proposal_id=proposal_id,
+        cand=cand, source_id=source_id, name=name, url=feed_url,
+        scheduler=scheduler, sse_broadcaster=sse_broadcaster,
+    )
+
+
+async def _fetch_listing_html(url: str, *, kind: str) -> str | None:
+    client_cm = tor_client(timeout=90.0) if kind == "tor_forum" else clearnet_client(timeout=30.0)
     try:
-        after = source_writer.add(entry, reason="hermes-agent discovery")
+        async with client_cm as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+        return resp.text
+    except Exception as exc:
+        log.info("[discover] listing fetch failed for %s (%s): %s", url, kind, exc)
+        return None
+
+
+async def _propose_selectors(url: str, html: str) -> dict | None:
+    """Tool-free Hermes leg: given the already-fetched HTML, propose CSS
+    selectors. Uses toolsets="memory" (see llm/backend.py's
+    _NO_TOOLS_TOOLSET) since this is a closed-form text-in/JSON-out task —
+    no need to re-spend a browsing budget on a page we already have."""
+    prompt = _SELECTOR_PROMPT_TEMPLATE.format(url=url, html=html[:_SELECTOR_HTML_CHARS])
+    result = await run_agent(prompt, toolsets="memory", timeout=settings.hermes_timeout_seconds,
+                              model=settings.hermes_model or None)
+    if not result.ok or not isinstance(result.data, dict):
+        return None
+    data = result.data
+    if not data.get("row_selector") or not data.get("title_selector") or not data.get("url_selector"):
+        return None
+    return {
+        "row_selector": str(data["row_selector"]),
+        "title_selector": str(data["title_selector"]),
+        "url_selector": str(data["url_selector"]),
+        "date_selector": str(data["date_selector"]) if data.get("date_selector") else "",
+    }
+
+
+def _count_valid_rows(html: str, selectors: dict) -> int:
+    """Re-parse the already-fetched HTML with the proposed selectors and
+    count rows that yield both a title and an href — the actual validation
+    gate, not just "Hermes said so." Mirrors collectors/html_forum.py and
+    collectors/tor_forum.py's extraction logic without needing a second
+    network round-trip.
+
+    Hermes can propose a syntactically invalid CSS selector (or omit one of
+    the expected keys); that must read as "selectors didn't validate" (0
+    rows, falls through to the normal probe_failed/audit-trail path), not as
+    an unhandled exception that takes the whole discovery tick down with
+    it — same reasoning as every other probe in this loop being wrapped."""
+    try:
+        tree = HTMLParser(html)
+        rows = tree.css(selectors["row_selector"])
+    except Exception as exc:
+        log.info("[discover] selector validation failed to parse: %s", exc)
+        return 0
+    valid = 0
+    for row in rows:
+        try:
+            title_node = row.css_first(selectors["title_selector"])
+            url_node = row.css_first(selectors["url_selector"])
+        except Exception as exc:
+            log.info("[discover] selector validation failed on row: %s", exc)
+            return 0
+        if not title_node or not url_node:
+            continue
+        if not title_node.text(strip=True):
+            continue
+        if not url_node.attributes.get("href"):
+            continue
+        valid += 1
+    return valid
+
+
+async def _try_add_forum_candidate(
+    db_conn, cand: dict, *, name: str, source_id: str, listing_url: str, kind: str, scheduler, sse_broadcaster
+) -> bool:
+    """tor_forum/html_forum candidate: fetch the listing page ourselves,
+    have Hermes propose selectors against the real HTML (tool-free), then
+    validate by actually extracting rows with them — only auto-add if that
+    extraction clears _MIN_VALID_ROWS. No human review step; a failed probe
+    just leaves a logged proposal instead of being applied."""
+    html = await _fetch_listing_html(listing_url, kind=kind)
+    if html is None:
+        proposal_id = await db.create_heal_proposal(
+            db_conn, source_id=source_id, proposal={"name": name, "listing_url": listing_url, "kind": kind},
+            notes=cand.get("reason"), action="discover",
+        )
+        await db.update_heal_proposal_status(db_conn, proposal_id=proposal_id, status="probe_failed",
+                                               error="listing page unreachable")
+        await _log_activity(
+            db_conn, action="probe_failed", status="error",
+            summary=f"Discovered {kind} candidate '{name}' — listing page unreachable ({listing_url})",
+            detail={"listing_url": listing_url, "kind": kind, "reason": cand.get("reason")}, ref_id=source_id,
+        )
+        return False
+
+    selectors = await _propose_selectors(listing_url, html)
+    valid_rows = _count_valid_rows(html, selectors) if selectors else 0
+    probe_ok = valid_rows >= _MIN_VALID_ROWS
+
+    proposal = {
+        "name": name, "listing_url": listing_url, "kind": kind, "selectors": selectors,
+        "valid_rows": valid_rows, "reason": cand.get("reason"), "probe_ok": probe_ok,
+    }
+    proposal_id = await db.create_heal_proposal(
+        db_conn, source_id=source_id, proposal=proposal, notes=cand.get("reason"), action="discover"
+    )
+
+    if not probe_ok:
+        await db.update_heal_proposal_status(db_conn, proposal_id=proposal_id, status="probe_failed")
+        await _log_activity(
+            db_conn, action="probe_failed", status="error",
+            summary=(
+                f"Discovered {kind} candidate '{name}' failed selector validation "
+                f"({valid_rows} usable row(s) extracted, need {_MIN_VALID_ROWS})"
+            ),
+            detail={"listing_url": listing_url, "selectors": selectors, "valid_rows": valid_rows},
+            ref_id=source_id,
+        )
+        return False
+
+    await db.update_heal_proposal_status(db_conn, proposal_id=proposal_id, status="validated")
+
+    if not settings.source_autoapply_enabled:
+        return False
+
+    entry = {
+        "id": source_id,
+        "name": name,
+        "type": kind,
+        "url": listing_url,
+        "interval_seconds": 1800 if kind == "tor_forum" else 900,
+        "jitter": 180,
+        "enabled": True,
+        "row_selector": selectors["row_selector"],
+        "title_selector": selectors["title_selector"],
+        "url_selector": selectors["url_selector"],
+        "date_selector": selectors["date_selector"],
+        "source_tags": ["discovered", "probationary"] + (["dark-web"] if kind == "tor_forum" else []),
+    }
+    return await _apply_new_source(
+        db_conn, entry=entry, reason="hermes-agent discovery (selector-validated)", proposal_id=proposal_id,
+        cand=cand, source_id=source_id, name=name, url=listing_url,
+        scheduler=scheduler, sse_broadcaster=sse_broadcaster,
+    )
+
+
+async def _apply_new_source(
+    db_conn, *, entry: dict, reason: str, proposal_id: int, cand: dict, source_id: str, name: str, url: str,
+    scheduler, sse_broadcaster,
+) -> bool:
+    try:
+        after = source_writer.add(entry, reason=reason)
     except source_writer.SourceWriteError as exc:
         log.error("[discover] add failed for %s: %s", source_id, exc)
         return False
 
     await db.record_applied_change(db_conn, proposal_id=proposal_id, before={}, after=after)
-    log.info("[discover] added new probationary source %s (%s)", source_id, feed_url)
+    log.info("[discover] added new probationary source %s (%s)", source_id, url)
     await _log_activity(
         db_conn, action="source_added",
         summary=f"Discovered and added new source '{source_id}' ({name})",
-        detail={"feed_url": feed_url, "reason": cand.get("reason"), "after": after}, ref_id=source_id,
+        detail={"url": url, "reason": cand.get("reason"), "after": after}, ref_id=source_id,
     )
 
     if scheduler is not None:

@@ -26,6 +26,7 @@ from datetime import timedelta, timezone, datetime
 from .. import db
 from ..api.sse import broadcaster
 from ..enrich import cve as cve_enrich
+from ..enrich import ioc as ioc_enrich
 from ..enrich import kev as kev_enrich
 from ..llm import backend as llm_backend
 from ..settings import settings
@@ -164,6 +165,15 @@ async def _resolve_cve_kev(db_conn, item: dict) -> tuple[list[str], bool]:
     return all_cves, bool(kev_hits)
 
 
+def _resolve_iocs(item: dict) -> list[str]:
+    """LLM-extracted iocs unioned with a deterministic regex backstop over
+    title+snippet — same don't-trust-one-source-alone reasoning as
+    _resolve_cve_kev, scoped to the high-precision indicator types
+    enrich/ioc.py handles (crypto addresses, IPs, onion addresses, hashes)."""
+    regex_iocs = ioc_enrich.extract_iocs(item.get("title", ""), item.get("snippet", ""))
+    return ioc_enrich.merge_iocs(item.get("iocs") or [], regex_iocs)
+
+
 async def run_correlation_batch(db_conn) -> int:
     """One tick: correlate a bounded batch of uncorrelated items. Returns
     the number of items processed (merged or turned into new cases)."""
@@ -197,7 +207,7 @@ async def _correlate_one(db_conn, item: dict) -> None:
     cve_ids, in_kev = await _resolve_cve_kev(db_conn, item)
     case_key = _case_key_for(item)
 
-    iocs = item.get("iocs") or []
+    iocs = _resolve_iocs(item)
     # The item's real-world date: published_at when the collector captured
     # one (RSS/Mastodon/HIBP/ransomware.live/dated forum posts), else
     # seen_at — see db.create_case/merge_item_into_case's docstrings for why
@@ -223,7 +233,7 @@ async def _correlate_one(db_conn, item: dict) -> None:
         )
         return
 
-    merged = await _try_fuzzy_merge(db_conn, item, cve_ids=cve_ids, in_kev=in_kev, event_at=event_at)
+    merged = await _try_fuzzy_merge(db_conn, item, cve_ids=cve_ids, in_kev=in_kev, event_at=event_at, iocs=iocs)
     if merged:
         return
 
@@ -258,13 +268,20 @@ async def _correlate_one(db_conn, item: dict) -> None:
     )
 
 
-async def _try_fuzzy_merge(db_conn, item: dict, *, cve_ids: list[str], in_kev: bool, event_at: str) -> bool:
+async def _try_fuzzy_merge(
+    db_conn, item: dict, *, cve_ids: list[str], in_kev: bool, event_at: str, iocs: list[str]
+) -> bool:
     since_iso = (datetime.now(timezone.utc) - timedelta(days=_CANDIDATE_WINDOW_DAYS)).isoformat()
     candidates = await db.find_candidate_cases(
         db_conn,
         victim=item.get("victim"),
         actor=item.get("actor"),
         cve_ids=cve_ids,
+        # Shared IoCs (a hash, onion address, crypto wallet) are as strong a
+        # same-incident signal as a shared CVE, and let an item merge into
+        # the right case even when victim/actor weren't extracted — e.g. a
+        # technical write-up that names the malware but not the victim.
+        iocs=iocs,
         since_iso=since_iso,
     )
     if not candidates:
@@ -294,7 +311,7 @@ async def _try_fuzzy_merge(db_conn, item: dict, *, cve_ids: list[str], in_kev: b
                 damaged_party_sector=item.get("victim_sector"),
                 damaged_party_country=item.get("victim_country"),
                 event_at=event_at,
-                iocs=item.get("iocs") or [],
+                iocs=iocs,
             )
             await _log_activity(
                 db_conn, action="item_merged",

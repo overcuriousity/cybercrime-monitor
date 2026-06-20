@@ -104,7 +104,10 @@ class Settings(BaseSettings):
     hermes_bin: str = "hermes"
     hermes_model: str = ""  # empty = whatever Hermes' own `hermes model` default is
     hermes_toolsets: str = "web,browser"
-    hermes_timeout_seconds: float = 300.0
+    # Browsing-heavy research/heal/discover runs (multiple searches + page
+    # fetches) routinely take several minutes; 300s was observed timing out
+    # legitimate runs mid-investigation, not just hung ones.
+    hermes_timeout_seconds: float = 900.0
     # 0 disables both agentic jobs entirely (research_runs/source-healing
     # never dispatch) without touching llm_backend.
     hermes_research_interval_seconds: int = 900
@@ -129,8 +132,12 @@ class Settings(BaseSettings):
     source_probation_days: int = 7
     # How long a source stays merely "disabled" before remove() deletes the
     # entry outright — gives a human a window to notice and override an
-    # autonomous disable before it's gone from sources.yaml entirely.
-    source_prune_grace_days: int = 14
+    # autonomous disable before it's gone from sources.yaml entirely. Also
+    # applies to hand-disabled sources once the prune pass starts tracking
+    # them (see research/heal.py's _maybe_remove_source) — kept short so
+    # stale `# needs:` entries don't linger indefinitely, since heal already
+    # gets a recovery attempt every _HEAL_COOLDOWN_HOURS before this elapses.
+    source_prune_grace_days: int = 5
     source_value_refresh_interval_seconds: int = 1800
 
     # CISA KEV (Known Exploited Vulnerabilities) catalog — refreshed daily

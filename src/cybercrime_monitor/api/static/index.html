@@ -21,9 +21,9 @@
       <span id="admin-token-status" class="admin-token-status hidden"></span>
     </div>
     <nav class="tabs">
-      <button class="tab active" data-tab="feed">Feed</button>
+      <button class="tab active" data-tab="landscape">Landscape</button>
+      <button class="tab" data-tab="feed">Feed</button>
       <button class="tab" data-tab="cases">Cases</button>
-      <button class="tab" data-tab="landscape">Landscape</button>
       <button class="tab" data-tab="activity">Activity</button>
       <button class="tab" data-tab="settings">Keywords</button>
     </nav>
@@ -40,7 +40,7 @@
   </div>
 
   <!-- ── Feed tab ─────────────────────────────────────────────────────────── -->
-  <div id="tab-feed" class="tab-content active">
+  <div id="tab-feed" class="tab-content hidden">
     <div class="dashboard-pane">
       <section class="gauge-row">
         <div class="gauge-card">
@@ -61,9 +61,10 @@
         </div>
       </section>
 
+      <p class="hint">These charts reflect raw collection volume — how many reports came in, from where — not deduplicated incident statistics. For incident-level numbers, see the Landscape tab.</p>
       <section class="chart-row">
         <div class="chart-card chart-card-wide">
-          <h3>Activity (last 48h)</h3>
+          <h3>Collection volume (last 48h)</h3>
           <div class="chart-canvas"><canvas id="chart-timeseries"></canvas></div>
         </div>
         <div class="chart-card">
@@ -71,11 +72,11 @@
           <div class="chart-canvas"><canvas id="chart-priority"></canvas></div>
         </div>
         <div class="chart-card">
-          <h3>By source</h3>
+          <h3>Items by source</h3>
           <div class="chart-canvas"><canvas id="chart-sources"></canvas></div>
         </div>
         <div class="chart-card">
-          <h3>Top ransomware groups</h3>
+          <h3>Most active ransomware actors</h3>
           <div class="chart-canvas"><canvas id="chart-actors"></canvas></div>
         </div>
       </section>
@@ -232,7 +233,7 @@
   <!-- Situational-awareness overview built from the *case* layer (deduped
        incidents), not raw items — a victim/sector/country/actor should count
        once per incident, not once per corroborating report. -->
-  <div id="tab-landscape" class="tab-content hidden">
+  <div id="tab-landscape" class="tab-content active">
     <div class="case-toolbar">
       <div class="case-toolbar-filters">
         <label class="filter-label" for="landscape-window-select" style="margin:0;">Window</label>
@@ -246,6 +247,7 @@
         <button id="landscape-export-btn" class="link-button" type="button">Export snapshot (.md)</button>
       </div>
     </div>
+    <p class="hint">Counts are deduplicated incidents (cases) derived from automated extraction of public OSINT — not verified ground-truth statistics.</p>
 
     <div class="dashboard-pane">
       <section class="gauge-row">
