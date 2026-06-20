@@ -117,9 +117,7 @@ You are a triage and structured-extraction analyst for a real-time cybercrime \
 monitoring feed (data breaches, ransomware, fraud, exploitation of \
 vulnerabilities, and related cybercrime). The goal is to turn one noisy \
 scraped item into a structured, specific incident record — or flag it as \
-noise. You will be shown one scraped item (title, snippet, source) plus a \
-regex-derived hint that is NOT authoritative — keyword matching produces \
-many false positives.
+noise. You will be shown one scraped item (title, snippet, source).
 
 Extract these fields:
 - crime_type: a short label such as "data-breach", "ransomware", "data-sale", \
@@ -180,13 +178,8 @@ class Extraction:
     model: str = ""
 
 
-def _build_user_prompt(title: str, snippet: str, source_name: str, regex_priority: str, regex_tags: list[str]) -> str:
-    return (
-        f"Source: {source_name}\n"
-        f"Title: {title}\n"
-        f"Snippet: {snippet[:800]}\n"
-        f"Regex hint (not authoritative): priority={regex_priority or 'none'}, tags={regex_tags}"
-    )
+def _build_user_prompt(title: str, snippet: str, source_name: str) -> str:
+    return f"Source: {source_name}\nTitle: {title}\nSnippet: {snippet[:800]}"
 
 
 _JSON_OBJECT = re.compile(r"\{.*\}", re.DOTALL)
@@ -318,9 +311,7 @@ def _build_batch_user_prompt(items: list[dict]) -> str:
         blocks.append(
             f"[{i}] Source: {it['source_name']}\n"
             f"[{i}] Title: {it['title']}\n"
-            f"[{i}] Snippet: {it['snippet'][:800]}\n"
-            f"[{i}] Regex hint (not authoritative): "
-            f"priority={it.get('regex_priority') or 'none'}, tags={it.get('regex_tags') or []}"
+            f"[{i}] Snippet: {it['snippet'][:800]}"
         )
     return "\n\n".join(blocks)
 
@@ -440,32 +431,28 @@ async def _extract_batch_via_hermes(items: list[dict]) -> list[Extraction | None
     return [extractions_by_idx.get(i) for i in range(len(items))]
 
 
-async def extract_one(
-    *, title: str, snippet: str, source_name: str, regex_priority: str, regex_tags: list[str]
-) -> Extraction | None:
+async def extract_one(*, title: str, snippet: str, source_name: str) -> Extraction | None:
     """Single-item variant of extract_batch — used where batching doesn't
     apply (e.g. ad-hoc re-extraction). Returns None on any failure. Transport
     chosen by settings.llm_backend — see module docstring — with the same
     automatic hermes fallback as extract_batch."""
     if settings.llm_backend == "hermes_cli":
-        return await _extract_one_via_hermes(title, snippet, source_name, regex_priority, regex_tags)
+        return await _extract_one_via_hermes(title, snippet, source_name)
     if not _fallback_eligible():
-        return await _extract_one_via_openai(title, snippet, source_name, regex_priority, regex_tags)
+        return await _extract_one_via_openai(title, snippet, source_name)
 
     if _in_fallback_cooldown():
-        return await _extract_one_via_hermes(title, snippet, source_name, regex_priority, regex_tags)
+        return await _extract_one_via_hermes(title, snippet, source_name)
     try:
-        result = await _extract_one_via_openai(title, snippet, source_name, regex_priority, regex_tags)
+        result = await _extract_one_via_openai(title, snippet, source_name)
     except _BackendUnreachable:
         _enter_fallback_cooldown()
-        return await _extract_one_via_hermes(title, snippet, source_name, regex_priority, regex_tags)
+        return await _extract_one_via_hermes(title, snippet, source_name)
     _maybe_exit_fallback_cooldown()
     return result
 
 
-async def _extract_one_via_openai(
-    title: str, snippet: str, source_name: str, regex_priority: str, regex_tags: list[str]
-) -> Extraction | None:
+async def _extract_one_via_openai(title: str, snippet: str, source_name: str) -> Extraction | None:
     url = settings.llm_base_url.rstrip("/") + "/chat/completions"
     headers = _auth_headers()
 
@@ -473,7 +460,7 @@ async def _extract_one_via_openai(
         "model": settings.llm_model or "local-model",
         "messages": [
             {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": _build_user_prompt(title, snippet, source_name, regex_priority, regex_tags)},
+            {"role": "user", "content": _build_user_prompt(title, snippet, source_name)},
         ],
         "temperature": 0,
         "max_tokens": 400,
@@ -504,12 +491,8 @@ async def _extract_one_via_openai(
         return None
 
 
-async def _extract_one_via_hermes(
-    title: str, snippet: str, source_name: str, regex_priority: str, regex_tags: list[str]
-) -> Extraction | None:
-    prompt = _SYSTEM_PROMPT + "\n\n" + _build_user_prompt(
-        title, snippet, source_name, regex_priority, regex_tags
-    ) + _NO_TOOLS_NOTE
+async def _extract_one_via_hermes(title: str, snippet: str, source_name: str) -> Extraction | None:
+    prompt = _SYSTEM_PROMPT + "\n\n" + _build_user_prompt(title, snippet, source_name) + _NO_TOOLS_NOTE
     result = await run_agent(
         prompt, toolsets=_NO_TOOLS_TOOLSET, timeout=settings.llm_timeout_seconds, model=settings.hermes_model or None
     )

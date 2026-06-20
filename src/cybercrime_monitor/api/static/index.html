@@ -17,7 +17,7 @@
       <span id="sse-status" class="sse-status disconnected" title="Live feed status">●</span>
     </div>
     <div class="admin-controls">
-      <input type="password" id="admin-token" class="admin-token-input" placeholder="Admin token" autocomplete="off" title="Unlocks admin-gated features (Keywords editor, research trigger, filtered items)">
+      <input type="password" id="admin-token" class="admin-token-input" placeholder="Admin token" autocomplete="off" title="Unlocks admin-gated features (targeted investigation, research trigger, filtered items)">
       <span id="admin-token-status" class="admin-token-status hidden"></span>
     </div>
     <nav class="tabs">
@@ -25,7 +25,7 @@
       <button class="tab" data-tab="feed">Feed</button>
       <button class="tab" data-tab="cases">Cases</button>
       <button class="tab" data-tab="activity">Activity</button>
-      <button class="tab" data-tab="settings">Keywords</button>
+      <button class="tab" data-tab="settings">Investigate</button>
     </nav>
   </header>
 
@@ -36,6 +36,7 @@
     <span class="status-pill" id="status-correlation">correlator: —</span>
     <span class="status-pill" id="status-research">research: —</span>
     <span class="status-pill" id="status-heal">heal: —</span>
+    <span class="status-pill" id="status-investigate">investigate: —</span>
     <span class="status-pill" id="status-kev">KEV: —</span>
   </div>
 
@@ -330,6 +331,7 @@
           <option value="classifier">Classifier</option>
           <option value="correlator">Correlator</option>
           <option value="cross_correlator">Cross-correlator</option>
+          <option value="investigate">Investigate</option>
         </select>
         <select id="activity-status-select" title="Status">
           <option value="">All statuses</option>
@@ -350,22 +352,20 @@
     </main>
   </div>
 
-  <!-- ── Settings tab ─────────────────────────────────────────────────────── -->
+  <!-- ── Investigate tab ──────────────────────────────────────────────────── -->
   <div id="tab-settings" class="tab-content hidden">
     <div class="settings-pane">
-      <h2>Keyword Rules <span class="badge info">keywords.yaml</span></h2>
-      <p class="hint">Edit YAML directly. Rules are compiled with Python <code>re</code> — patterns have <code>re.IGNORECASE</code> applied unless you embed <code>(?-i)</code>. Save to hot-reload.</p>
-      <p class="hint">Admin token required — enter it in the header toolbar. This view can reveal investigation target indicators and writes regex straight to disk.</p>
+      <h2>Targeted Investigation</h2>
+      <p class="hint">Describe a case — victim, modus operandi, anything you know — and an agent researches it across existing source feeds and the open web. If it finds a genuine match, the findings are integrated as feed items, a new case, and any valuable new sources discovered along the way.</p>
+      <p class="hint">Admin token required — enter it in the header toolbar. Each submission spends a Hermes run and may take several minutes; runs async, track progress in the Activity tab.</p>
+      <div id="inv-error" class="error-box hidden"></div>
+      <textarea id="inv-brief" spellcheck="true" rows="8" placeholder="e.g. Suspected ransomware breach of [victim], reported around [date], possibly involving [actor/MO]..."></textarea>
       <div class="settings-actions">
-        <button id="kw-token-load" class="btn-primary">Load keywords</button>
-        <span id="kw-token-status"></span>
+        <button id="inv-submit" class="btn-primary">Start investigation</button>
+        <span id="inv-status"></span>
       </div>
-      <div id="kw-error" class="error-box hidden"></div>
-      <textarea id="kw-editor" spellcheck="false" rows="30" disabled></textarea>
-      <div class="settings-actions">
-        <button id="kw-save" class="btn-primary" disabled>Save &amp; Reload</button>
-        <span id="kw-status"></span>
-      </div>
+      <h3>Recent investigations</h3>
+      <div id="inv-list"></div>
     </div>
   </div>
 

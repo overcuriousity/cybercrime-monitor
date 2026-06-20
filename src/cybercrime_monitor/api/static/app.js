@@ -69,7 +69,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   syncFilterControls();
   await applyFilters();
   connectSSE();
-  initKeywordsAuth();
+  initAdminAuth();
   setInterval(loadSources, 30000); // refresh source health dots
 
   initDashboard();
@@ -79,6 +79,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   initStatusBar();
   initActivity();
   initLandscape();
+  initInvestigate();
 
   searchInput.addEventListener('input', debounce(() => {
     state.filters.search = searchInput.value.trim();
@@ -315,10 +316,19 @@ function patchCardWithVerdict(verdict) {
   const stateItem = state.items.find(i => i.id === verdict.id);
   if (stateItem) {
     stateItem.max_priority = verdict.max_priority;
+    stateItem.all_tags = verdict.all_tags || [];
     stateItem.is_false_positive = verdict.is_false_positive;
     stateItem.classified = true;
     stateItem.classifier_confidence = verdict.classifier_confidence;
     stateItem.classifier_reasoning = verdict.classifier_reasoning;
+    // Structured entities (also drive highlightEntities — see buildCard).
+    stateItem.crime_type = verdict.crime_type;
+    stateItem.victim = verdict.victim;
+    stateItem.victim_sector = verdict.victim_sector;
+    stateItem.victim_country = verdict.victim_country;
+    stateItem.actor = verdict.actor;
+    stateItem.cve_ids = verdict.cve_ids || [];
+    stateItem.iocs = verdict.iocs || [];
   }
 
   const card = feedList.querySelector(`[data-item-id="${verdict.id}"]`);
@@ -580,14 +590,14 @@ function buildCard(item) {
   if (!isSafeUrl(item.url)) a.title = 'Unrecognized URL scheme — link disabled';
   a.target = '_blank';
   a.rel = 'noopener noreferrer';
-  a.innerHTML = highlightText(item.title, item.matches, 'title', item.title.length);
+  a.innerHTML = highlightEntities(item.title, item);
   titleDiv.appendChild(a);
   card.appendChild(titleDiv);
 
   if (item.snippet) {
     const snip = document.createElement('div');
     snip.className = 'item-snippet';
-    snip.innerHTML = highlightText(item.snippet, item.matches, 'snippet', item.title.length);
+    snip.innerHTML = highlightEntities(item.snippet, item);
     card.appendChild(snip);
   }
 
@@ -617,31 +627,38 @@ function isSafeUrl(url) {
 }
 
 // ── Highlight ──────────────────────────────────────────────────────────────
-// Spans come from server as offsets into title+'\n'+snippet (matcher.py).
-// titleLen is the length of the *original* title field, so we can translate
-// combined-haystack offsets back into the field actually being rendered:
-// title spans are [0, titleLen); snippet spans start at titleLen+1 (the "\n").
-function highlightText(text, matches, field, titleLen) {
-  if (!matches || matches.length === 0) return escHtml(text);
+// Entity highlighting: marks occurrences of the LLM extraction's structured
+// entities (actor, victim, CVEs, IoCs) directly in the rendered text, found
+// by case-insensitive substring search client-side. Replaces the old
+// server-computed regex-span highlighting now that there's no regex
+// matcher — an item has no entities to highlight until it's classified
+// (see collectors/base.py's "pending" SSE payload), so this degrades
+// gracefully to plain escaped text for unclassified items.
+function highlightEntities(text, item) {
+  if (!text) return escHtml(text);
+  const needles = [];
+  if (item.actor) needles.push(item.actor);
+  if (item.victim) needles.push(item.victim);
+  (item.cve_ids || []).forEach(v => needles.push(v));
+  (item.iocs || []).forEach(v => needles.push(v));
+  const terms = needles.map(n => String(n).trim()).filter(n => n.length >= 3);
+  if (!terms.length) return escHtml(text);
 
-  const sepOffset = titleLen + 1; // length of title + "\n" separator
+  // Longest-first so a longer entity (e.g. a full domain) isn't pre-empted
+  // by a shorter one that happens to be its substring.
+  terms.sort((a, b) => b.length - a.length);
 
-  // Collect spans relevant to this field, translated to field-local offsets
   const spans = [];
-  matches.forEach(m => {
-    m.spans.forEach(([start, end]) => {
-      let s, e;
-      if (field === 'title') {
-        if (start >= titleLen) return; // span is in the snippet, not here
-        s = start;
-        e = Math.min(end, titleLen);
-      } else {
-        if (end <= sepOffset) return; // span is in the title, not here
-        s = Math.max(start - sepOffset, 0);
-        e = end - sepOffset;
-      }
-      spans.push({ start: s, end: e, priority: m.priority });
-    });
+  const lowerText = text.toLowerCase();
+  terms.forEach(term => {
+    const lowerTerm = term.toLowerCase();
+    let from = 0;
+    while (true) {
+      const idx = lowerText.indexOf(lowerTerm, from);
+      if (idx === -1) break;
+      spans.push({ start: idx, end: idx + term.length });
+      from = idx + term.length;
+    }
   });
   if (!spans.length) return escHtml(text);
   spans.sort((a, b) => a.start - b.start);
@@ -649,12 +666,10 @@ function highlightText(text, matches, field, titleLen) {
   let out = '';
   let prev = 0;
   for (const sp of spans) {
-    if (sp.start >= text.length) break;
     if (sp.start < prev) continue; // overlapping — skip
-    const end = Math.min(sp.end, text.length);
     out += escHtml(text.slice(prev, sp.start));
-    out += `<mark class="prio-${sp.priority}">${escHtml(text.slice(sp.start, end))}</mark>`;
-    prev = end;
+    out += `<mark>${escHtml(text.slice(sp.start, sp.end))}</mark>`;
+    prev = sp.end;
   }
   out += escHtml(text.slice(prev));
   return out;
@@ -710,20 +725,18 @@ function handleLiveItem(item) {
 }
 
 // ── Admin token (central header input) ───────────────────────────────────────
-// The token unlocks admin-gated features across tabs: keyword editing,
-// filtered-item view, and the case deep-research trigger. It lives in the
-// header toolbar so it is reachable from every tab.
+// The token unlocks admin-gated features across tabs: the targeted-
+// investigation trigger, filtered-item view, and the case deep-research
+// trigger. It lives in the header toolbar so it is reachable from every tab.
 const ADMIN_TOKEN_KEY = 'mm_admin_token';
 let adminEnabledServerSide = true;
 
-function initKeywordsAuth() {
+function initAdminAuth() {
   adminTokenInput.value = localStorage.getItem(ADMIN_TOKEN_KEY) || '';
   adminTokenInput.addEventListener('input', () => {
     localStorage.setItem(ADMIN_TOKEN_KEY, adminTokenInput.value);
     updateAdminUiState();
   });
-  document.getElementById('kw-token-load').addEventListener('click', unlockKeywords);
-  document.getElementById('kw-save').addEventListener('click', saveKeywords);
   updateAdminUiState();
 }
 
@@ -748,49 +761,47 @@ function updateAdminUiState() {
     adminTokenStatus.textContent = '🔒 admin';
     adminTokenStatus.classList.remove('hidden', 'error');
   } else {
-    adminTokenStatus.textContent = 'Admin token required for research/keywords';
+    adminTokenStatus.textContent = 'Admin token required for research/investigate';
     adminTokenStatus.classList.remove('hidden');
     adminTokenStatus.classList.add('error');
   }
   document.getElementById('show-filtered-row').classList.toggle('hidden', !token);
 }
 
-async function unlockKeywords() {
-  const tokenStatus = document.getElementById('kw-token-status');
-  const token = adminTokenInput.value;
-  localStorage.setItem(ADMIN_TOKEN_KEY, token);
-  tokenStatus.textContent = 'Loading…';
-  try {
-    const resp = await fetch('/api/keywords', { headers: adminHeaders() });
-    if (!resp.ok) {
-      tokenStatus.textContent = resp.status === 403 ? 'Invalid token' : `Error ${resp.status}`;
-      return;
-    }
-    const data = await resp.json();
-    document.getElementById('kw-editor').value = data.yaml || '';
-    document.getElementById('kw-editor').disabled = false;
-    document.getElementById('kw-save').disabled = false;
-    tokenStatus.textContent = '✓ loaded';
-  } catch (e) {
-    tokenStatus.textContent = String(e);
-  }
+// ── Investigate tab ────────────────────────────────────────────────────────
+// Investigator-triggered targeted research (POST /api/investigations) — see
+// research/investigate.py. The investigator describes a case brief; Hermes
+// researches existing source feeds + the open web, and (only if it finds a
+// genuine match) the findings are integrated as feed items + a new case +
+// any newly-discovered sources. Runs async; progress shows up in the
+// Activity tab via subsystem="investigate", and this tab polls the
+// investigation list for terminal status.
+function initInvestigate() {
+  document.getElementById('inv-submit').addEventListener('click', submitInvestigation);
+  loadInvestigations();
+  setInterval(loadInvestigations, 8000);
 }
 
-async function saveKeywords() {
-  const btn = document.getElementById('kw-save');
-  const status = document.getElementById('kw-status');
-  const errBox = document.getElementById('kw-error');
-  const yaml = document.getElementById('kw-editor').value;
+async function submitInvestigation() {
+  const btn = document.getElementById('inv-submit');
+  const status = document.getElementById('inv-status');
+  const errBox = document.getElementById('inv-error');
+  const brief = document.getElementById('inv-brief').value.trim();
+
+  errBox.classList.add('hidden');
+  if (!brief) {
+    errBox.textContent = 'Describe the case before submitting.';
+    errBox.classList.remove('hidden');
+    return;
+  }
 
   btn.disabled = true;
-  status.textContent = 'Saving…';
-  errBox.classList.add('hidden');
-
+  status.textContent = 'Submitting…';
   try {
-    const resp = await fetch('/api/keywords', {
-      method: 'PUT',
+    const resp = await fetch('/api/investigations', {
+      method: 'POST',
       headers: { 'Content-Type': 'application/json', ...adminHeaders() },
-      body: JSON.stringify({ yaml }),
+      body: JSON.stringify({ brief }),
     });
     const data = await resp.json();
     if (!resp.ok) {
@@ -798,8 +809,10 @@ async function saveKeywords() {
       errBox.classList.remove('hidden');
       status.textContent = '';
     } else {
-      status.textContent = '✓ ' + data.message;
-      setTimeout(() => { status.textContent = ''; }, 3000);
+      status.textContent = '✓ queued — see below for progress';
+      document.getElementById('inv-brief').value = '';
+      setTimeout(() => { status.textContent = ''; }, 4000);
+      loadInvestigations();
     }
   } catch (e) {
     errBox.textContent = String(e);
@@ -807,6 +820,59 @@ async function saveKeywords() {
   } finally {
     btn.disabled = false;
   }
+}
+
+async function loadInvestigations() {
+  if (!hasAdminToken()) return;
+  const list = document.getElementById('inv-list');
+  try {
+    const data = await fetch('/api/investigations', { headers: adminHeaders() });
+    if (!data.ok) return;
+    const { investigations } = await data.json();
+    list.innerHTML = '';
+    if (!investigations || !investigations.length) {
+      list.innerHTML = '<div class="empty-state">No investigations submitted yet.</div>';
+      return;
+    }
+    investigations.forEach(inv => list.appendChild(buildInvestigationRow(inv)));
+  } catch (e) {
+    console.error('Failed to load investigations', e);
+  }
+}
+
+function buildInvestigationRow(inv) {
+  const row = document.createElement('div');
+  row.className = 'investigation-row';
+
+  const statusChip = document.createElement('span');
+  statusChip.className = 'tag-chip inv-status-' + inv.status;
+  statusChip.textContent = inv.status;
+  row.appendChild(statusChip);
+
+  const brief = document.createElement('span');
+  brief.className = 'investigation-brief';
+  brief.textContent = inv.brief.slice(0, 140) + (inv.brief.length > 140 ? '…' : '');
+  row.appendChild(brief);
+
+  const time = document.createElement('span');
+  time.className = 'item-time';
+  time.textContent = fmtTime(inv.created_at);
+  row.appendChild(time);
+
+  if (inv.case_id) {
+    const link = document.createElement('button');
+    link.className = 'link-button';
+    link.textContent = 'View case →';
+    link.addEventListener('click', () => openCaseFromInvestigation(inv.case_id));
+    row.appendChild(link);
+  }
+
+  return row;
+}
+
+function openCaseFromInvestigation(caseId) {
+  document.querySelector('.tab[data-tab="cases"]').click();
+  selectCase(caseId);
 }
 
 // ── Utilities ──────────────────────────────────────────────────────────────
@@ -1965,6 +2031,10 @@ function renderStatusBar(s) {
   const pending = (heal.proposals || {}).pending || 0;
   const healText = `heal: ${pending} pending`;
   setStatusPill('status-heal', healText, heal.consecutive_errors >= 3 ? 'error' : (pending > 0 ? 'active' : 'ok'));
+
+  const inv = s.investigate || {};
+  const invText = `investigate: ${inv.queued || 0} queued`;
+  setStatusPill('status-investigate', invText, inv.consecutive_errors >= 3 ? 'error' : (inv.queued > 0 ? 'active' : 'ok'));
 
   const kev = s.kev || {};
   const kevText = `KEV: ${(kev.count || 0).toLocaleString()}`;

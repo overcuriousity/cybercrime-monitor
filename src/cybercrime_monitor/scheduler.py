@@ -279,6 +279,30 @@ def build_scheduler(db_conn, sse_broadcaster) -> AsyncIOScheduler:
     else:
         log.info("hermes-agent research disabled (hermes_research_interval_seconds <= 0)")
 
+    if settings.hermes_investigate_interval_seconds > 0:
+        from .research.investigate import run_investigation_batch
+
+        # scheduler+sse_broadcaster threaded through for the same reason as
+        # "_heal"/"_discover" below: a confirmed investigation can add new
+        # sources (research/discover.py's apply pipeline) that need live
+        # rescheduling, and items/cases should broadcast immediately.
+        scheduler.add_job(
+            run_investigation_batch,
+            trigger=IntervalTrigger(seconds=settings.hermes_investigate_interval_seconds),
+            id="_investigate",
+            name="Targeted investigation (investigator-submitted briefs)",
+            next_run_time=_offset_now(120),
+            misfire_grace_time=settings.hermes_investigate_interval_seconds,
+            # Same reasoning as "_research" — a run can take minutes; never
+            # let two overlap.
+            max_instances=1,
+            coalesce=True,
+            kwargs={"db_conn": db_conn, "scheduler": scheduler, "sse_broadcaster": sse_broadcaster},
+        )
+        log.info("Scheduled targeted investigation job")
+    else:
+        log.info("targeted investigation disabled (hermes_investigate_interval_seconds <= 0)")
+
     if settings.hermes_heal_interval_seconds > 0:
         from .research.heal import run_heal_batch
 

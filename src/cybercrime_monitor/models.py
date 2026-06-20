@@ -26,27 +26,3 @@ class Item:
     source_tags: list[str] = field(default_factory=list)
     # raw extras (json-serialisable dict for future extension)
     extra: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class Match:
-    item_id: int
-    keyword_pattern: str
-    priority: str  # info | warn | critical
-    tags: list[str]
-    # char offsets into item.title + " " + item.snippet
-    spans: list[tuple[int, int]]
-
-
-@dataclass
-class HighlightedItem:
-    """Item enriched with match data, ready for the dashboard."""
-    item: Item
-    matches: list[Match]
-    # highest priority among matches, or "" if none
-    max_priority: str
-    # all unique match tags
-    all_tags: list[str]
-    # title/snippet with match spans annotated for the frontend
-    highlighted_title: str
-    highlighted_snippet: str

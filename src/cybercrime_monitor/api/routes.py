@@ -17,9 +17,11 @@ from ..db import (
     count_heal_proposals_by_status,
     count_items,
     count_kev_catalog,
+    count_queued_investigations,
     count_running_research_runs,
     count_uncorrelated_extracted_items,
     count_unextracted,
+    create_investigation,
     fetch_cases,
     fetch_items,
     get_actor_profile,
@@ -27,9 +29,11 @@ from ..db import (
     get_case_by_id,
     get_case_items,
     get_case_links,
+    get_investigation,
     get_recent_extractions,
     get_research_runs_for_case,
     list_ai_activity,
+    list_investigations,
     stats_cases_by_actor,
     stats_cases_by_country,
     stats_cases_by_sector,
@@ -40,13 +44,12 @@ from ..db import (
     stats_cases_by_crime_type,
     stats_cases_in_kev,
     stats_timeseries,
-    stats_top_keywords,
 )
-from ..matcher import matcher
 from ..pipeline import correlate as correlate_health
 from ..research import agent as research_health
 from ..research import discover as discover_health
 from ..research import heal as heal_health
+from ..research import investigate as investigate_health
 from ..scheduler import load_sources
 from ..settings import settings
 from .sse import TooManySubscribers, broadcaster
@@ -97,9 +100,10 @@ def _is_valid_admin_token(token: str | None) -> bool:
 
 
 async def require_admin(x_admin_token: str | None = Header(default=None)):
-    """Gate for the keyword editor — it can write arbitrary regex to disk.
-    Fails closed: if no ADMIN_TOKEN is configured, the endpoints are
-    unreachable rather than silently public."""
+    """Gate for admin-only actions (forcing a re-research run, viewing
+    classifier-filtered items, submitting a targeted investigation). Fails
+    closed: if no ADMIN_TOKEN is configured, the endpoints are unreachable
+    rather than silently public."""
     if not _is_valid_admin_token(x_admin_token):
         raise HTTPException(status_code=403, detail="Admin token required")
 
@@ -259,25 +263,6 @@ async def api_sources(request: Request, db=Depends(get_db)):
     return result
 
 
-# ── Keywords ──────────────────────────────────────────────────────────────────
-
-@router.get("/api/keywords", dependencies=[Depends(require_admin)])
-async def api_keywords_get():
-    return {"yaml": matcher.rules_raw}
-
-
-class KeywordsUpdate(BaseModel):
-    yaml: str
-
-
-@router.put("/api/keywords", dependencies=[Depends(require_admin)])
-async def api_keywords_put(body: KeywordsUpdate):
-    ok, msg = matcher.reload_from_text(body.yaml)
-    if not ok:
-        raise HTTPException(status_code=400, detail=msg)
-    return {"status": "ok", "message": msg}
-
-
 # ── Stats ─────────────────────────────────────────────────────────────────────
 
 @router.get("/api/stats")
@@ -316,11 +301,6 @@ async def api_stats_by_priority(
     since_hours: int | None = Query(default=None, ge=1, le=24 * 30),
 ):
     return await stats_by_priority(db, since_hours=since_hours)
-
-
-@router.get("/api/stats/top_keywords")
-async def api_stats_top_keywords(db=Depends(get_db), limit: int = Query(default=10, le=50)):
-    return {"keywords": await stats_top_keywords(db, limit=limit)}
 
 
 @router.get("/api/stats/top_actors")
@@ -395,6 +375,7 @@ async def api_status(request: Request, db=Depends(get_db)):
     rh = research_health.get()
     hh = heal_health.get()
     dh = discover_health.get()
+    ih = investigate_health.get()
 
     cooldown_iso = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
 
@@ -467,6 +448,15 @@ async def api_status(request: Request, db=Depends(get_db)):
             "last_error": dh.last_error,
             "last_error_at": dh.last_error_at,
             "consecutive_errors": dh.consecutive_errors,
+        },
+        "investigate": {
+            "last_run_at": ih.last_run_at,
+            "last_success_at": ih.last_success_at,
+            "last_processed_count": ih.last_processed_count,
+            "last_error": ih.last_error,
+            "last_error_at": ih.last_error_at,
+            "consecutive_errors": ih.consecutive_errors,
+            "queued": await count_queued_investigations(db),
         },
     }
 
@@ -668,8 +658,7 @@ async def api_case_request_research(case_id: int, request: Request, db=Depends(g
     """Force a deep-research pass on this case, bypassing the normal
     significance/cooldown gating (see db.get_cases_needing_research) — for
     "re-research this with whatever's missing" from the case detail pane.
-    Admin-gated: each call spends a Hermes run, same cost class as the
-    keyword editor's write access."""
+    Admin-gated: each call spends a Hermes run."""
     from ..db import request_case_research
 
     ok = await request_case_research(db, case_id=case_id)
@@ -832,6 +821,10 @@ class FeedbackCreate(BaseModel):
     note: str | None = None
 
 
+class InvestigationCreate(BaseModel):
+    brief: str
+
+
 @router.post("/api/feedback")
 async def api_feedback_create(body: FeedbackCreate, db=Depends(get_db)):
     from ..db import VALID_FEEDBACK_VERDICTS, add_feedback
@@ -859,6 +852,37 @@ async def api_heal_proposals(db=Depends(get_db), status: str | None = Query(defa
     from ..db import get_heal_proposals
 
     return {"proposals": await get_heal_proposals(db, status=status)}
+
+
+# ── Targeted investigations ──────────────────────────────────────────────────
+# Investigator-submitted briefs that trigger an agentic research pass. Admin-
+# gated because each submission spends a Hermes run. The run is async: this
+# endpoint just queues the investigation and nudges the scheduler job.
+
+@router.post("/api/investigations", dependencies=[Depends(require_admin)])
+async def api_investigation_create(body: InvestigationCreate, request: Request, db=Depends(get_db)):
+    investigation_id = await create_investigation(db, brief=body.brief.strip())
+
+    scheduler = getattr(request.app.state, "scheduler", None)
+    if scheduler is not None:
+        job = scheduler.get_job("_investigate")
+        if job is not None:
+            scheduler.modify_job("_investigate", next_run_time=datetime.now(timezone.utc))
+
+    return {"investigation_id": investigation_id, "status": "queued"}
+
+
+@router.get("/api/investigations", dependencies=[Depends(require_admin)])
+async def api_investigations(db=Depends(get_db), limit: int = Query(default=50, le=200)):
+    return {"investigations": await list_investigations(db, limit=limit)}
+
+
+@router.get("/api/investigations/{investigation_id}", dependencies=[Depends(require_admin)])
+async def api_investigation_detail(investigation_id: int, db=Depends(get_db)):
+    inv = await get_investigation(db, investigation_id=investigation_id)
+    if inv is None:
+        raise HTTPException(status_code=404, detail="Investigation not found")
+    return inv
 
 
 # ── AI activity log ───────────────────────────────────────────────────────────
