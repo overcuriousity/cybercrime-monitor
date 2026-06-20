@@ -452,11 +452,21 @@ async def _maybe_remove_source(db_conn, source: dict, value: dict | None) -> Non
     from — true for every hand-disabled source, and for any source disabled
     before this clock-starting logic existed — start the clock now instead
     of leaving it disabled forever. This is what makes manually-disabled
-    sources eventually get cleaned up at all."""
+    sources eventually get cleaned up at all.
+
+    The clock-start proposal is deliberately NOT marked applied=1: that
+    column means "writer.py actually touched sources.yaml" (see the
+    source_heal_proposals schema comment in db.py) and this step writes
+    nothing — it only observes that the source is already disabled. The
+    proposal payload's removal_clock_started flag is what disabled_at is
+    read from instead, so the audit trail stays honest about what actually
+    happened to the file."""
     proposals = await db.get_heal_proposals(db_conn, status="validated")
     disabled_at = None
     for p in proposals:
-        if p["source_id"] == source["id"] and p.get("action") == "prune" and p.get("applied"):
+        if p["source_id"] != source["id"] or p.get("action") != "prune":
+            continue
+        if p.get("applied") or p.get("proposal", {}).get("removal_clock_started"):
             disabled_at = p["created_at"]
             break
 
@@ -464,11 +474,11 @@ async def _maybe_remove_source(db_conn, source: dict, value: dict | None) -> Non
         classification = value["classification"] if value else "unknown"
         reason = f"already disabled, no prior prune record — starting removal grace clock (value={classification})"
         proposal_id = await db.create_heal_proposal(
-            db_conn, source_id=source["id"], proposal={"classification": classification},
+            db_conn, source_id=source["id"],
+            proposal={"classification": classification, "removal_clock_started": True},
             notes=reason, action="prune",
         )
         await db.update_heal_proposal_status(db_conn, proposal_id=proposal_id, status="validated")
-        await db.record_applied_change(db_conn, proposal_id=proposal_id, before={}, after={})
         log.info("[heal] prune %s: starting removal grace clock for already-disabled source", source["id"])
         await _log_activity(
             db_conn, subsystem="prune", action="removal_clock_started",

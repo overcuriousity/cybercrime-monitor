@@ -52,6 +52,26 @@ def test_extract_iocs_empty_for_clean_text():
     assert ioc_enrich.extract_iocs("", None) == []
 
 
+def test_extract_ipv4_rejects_out_of_range_octets():
+    text = "A version-like string 999.999.999.999 is not a real IP, but 10.0.0.1 is."
+    found = ioc_enrich.extract_iocs(text)
+    assert found == ["10.0.0.1"]
+
+
+def test_extract_ipv6_compressed_form():
+    text = "C2 reachable at 2001:db8::1 over IPv6."
+    found = ioc_enrich.extract_iocs(text)
+    assert "2001:db8::1" in found
+
+
+def test_extract_ipv6_rejects_non_address_hex_colon_runs():
+    # A MAC-address-shaped token (6 groups, no "::" compression) is not a
+    # valid IPv6 address and must not be reported as one.
+    text = "Interface MAC was ff:ff:ff:ff:ff:ff on the host."
+    found = ioc_enrich.extract_iocs(text)
+    assert found == []
+
+
 def test_merge_iocs_unions_and_dedupes_preserving_order():
     merged = ioc_enrich.merge_iocs(["1.2.3.4", "Hash1"], ["hash1", "5.6.7.8"])
     assert merged == ["1.2.3.4", "Hash1", "5.6.7.8"]

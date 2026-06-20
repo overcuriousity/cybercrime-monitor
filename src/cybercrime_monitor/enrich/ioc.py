@@ -13,6 +13,7 @@ Malware write-ups (BleepingComputer, The DFIR Report, vendor threat-intel
 blogs) routinely defang indicators so they aren't clickable/live —
 "1[.]2[.]3[.]4", "1(.)2(.)3(.)4" — so text is refanged before matching.
 """
+import ipaddress
 import re
 
 _DEFANG_DOT = re.compile(r"\[\.\]|\(\.\)")
@@ -22,11 +23,16 @@ def _refang(text: str) -> str:
     return _DEFANG_DOT.sub(".", text)
 
 
-# IPv4 — four dot-separated octets.
+# IPv4/IPv6 — deliberately permissive *candidate* patterns (e.g. the IPv4
+# one accepts any \d{1,3} octet, including out-of-range ones like "999", and
+# the IPv6 one accepts plain hex:colon runs without fully encoding "::"
+# compression rules). Precision is enforced afterwards in extract_iocs via
+# ipaddress.ip_address() — much less error-prone than a hand-rolled regex
+# trying to fully encode RFC 4291, and it rejects both invalid IPv4 octets
+# and IPv6-shaped non-addresses (e.g. a 6-group MAC-like token) in one place.
 _IPV4_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
-# IPv6 — conservative: at least two colon-separated hex groups, so it can't
-# accidentally match e.g. a timestamp "12:34" or a CVE id.
-_IPV6_PATTERN = re.compile(r"\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}\b")
+_IPV6_PATTERN = re.compile(r"\b(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}\b")
+_IP_PATTERNS = {_IPV4_PATTERN, _IPV6_PATTERN}
 # Bitcoin: legacy base58 (1.../3...) and bech32 (bc1...).
 _BTC_PATTERN = re.compile(r"\b(?:[13][a-km-zA-HJ-NP-Z1-9]{25,34}|bc1[a-z0-9]{25,90})\b")
 # Ethereum (and any EVM chain reusing the same address format): 0x + 40 hex.
@@ -70,6 +76,11 @@ def extract_iocs(*texts: str) -> list[str]:
         for pattern in _PATTERNS:
             for match in pattern.finditer(refanged):
                 value = match.group(0)
+                if pattern in _IP_PATTERNS:
+                    try:
+                        ipaddress.ip_address(value)
+                    except ValueError:
+                        continue
                 key = value.lower()
                 if key not in seen_set:
                     seen_set.add(key)

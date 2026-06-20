@@ -396,15 +396,27 @@ def _count_valid_rows(html: str, selectors: dict) -> int:
     count rows that yield both a title and an href — the actual validation
     gate, not just "Hermes said so." Mirrors collectors/html_forum.py and
     collectors/tor_forum.py's extraction logic without needing a second
-    network round-trip."""
+    network round-trip.
+
+    Hermes can propose a syntactically invalid CSS selector (or omit one of
+    the expected keys); that must read as "selectors didn't validate" (0
+    rows, falls through to the normal probe_failed/audit-trail path), not as
+    an unhandled exception that takes the whole discovery tick down with
+    it — same reasoning as every other probe in this loop being wrapped."""
     try:
         tree = HTMLParser(html)
-    except Exception:
+        rows = tree.css(selectors["row_selector"])
+    except Exception as exc:
+        log.info("[discover] selector validation failed to parse: %s", exc)
         return 0
     valid = 0
-    for row in tree.css(selectors["row_selector"]):
-        title_node = row.css_first(selectors["title_selector"])
-        url_node = row.css_first(selectors["url_selector"])
+    for row in rows:
+        try:
+            title_node = row.css_first(selectors["title_selector"])
+            url_node = row.css_first(selectors["url_selector"])
+        except Exception as exc:
+            log.info("[discover] selector validation failed on row: %s", exc)
+            return 0
         if not title_node or not url_node:
             continue
         if not title_node.text(strip=True):

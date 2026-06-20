@@ -60,9 +60,14 @@ async def test_prune_pass_starts_clock_for_hand_disabled_source(db_conn, sources
     proposals = await db_module.get_heal_proposals(db_conn, status="validated")
     clock_proposals = [
         p for p in proposals
-        if p["source_id"] == "manually_disabled_src" and p.get("action") == "prune" and p.get("applied")
+        if p["source_id"] == "manually_disabled_src" and p.get("action") == "prune"
+        and p.get("proposal", {}).get("removal_clock_started")
     ]
     assert len(clock_proposals) == 1
+    # Nothing was actually written to sources.yaml by this step — applied
+    # stays false, since "applied" specifically means writer.py touched the
+    # file (see db.py's source_heal_proposals schema comment).
+    assert clock_proposals[0]["applied"] in (0, False, None)
 
 
 @pytest.mark.asyncio
