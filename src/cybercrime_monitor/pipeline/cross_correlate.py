@@ -99,8 +99,7 @@ async def run_cross_correlation(db_conn) -> int:
         for case_b in cases[i + 1:]:
             score, reasons = _score_pair(case_a, case_b)
             if score >= _MIN_LINK_SCORE:
-                is_new = not await db.case_link_exists(db_conn, case_a=case_a["id"], case_b=case_b["id"])
-                await db.save_case_link(
+                is_new = await db.save_case_link(
                     db_conn, case_a=case_a["id"], case_b=case_b["id"], score=score, reasons=reasons
                 )
                 if is_new:

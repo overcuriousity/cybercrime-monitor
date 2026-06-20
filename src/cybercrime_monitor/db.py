@@ -1221,6 +1221,9 @@ async def log_ai_activity(
     it's reporting on; non-serializable detail is coerced via default=str."""
     ts = _utcnow().isoformat()
     detail_json = json.dumps(detail or {}, default=str)
+    # Return exactly what went into the DB so SSE broadcasts and the stored
+    # row are consistent; json.loads also guarantees the payload is serializable.
+    detail_out = json.loads(detail_json)
     cur = await conn.execute(
         """
         INSERT INTO ai_activity (ts, subsystem, action, summary, detail, status, ref_type, ref_id, model)
@@ -1245,7 +1248,7 @@ async def log_ai_activity(
         "subsystem": subsystem,
         "action": action,
         "summary": summary,
-        "detail": detail or {},
+        "detail": detail_out,
         "status": status,
         "ref_type": ref_type,
         "ref_id": str(ref_id) if ref_id is not None else None,
@@ -1742,21 +1745,19 @@ async def count_cases(
     since: str | None = None,
     until: str | None = None,
 ) -> int:
-    """since_iso (first_seen-based) is Landscape's "cases opened in window"
-    count (db.stats_cases_* siblings); the rest mirror fetch_cases' filters
-    (last_seen-based) so GET /api/cases' "total" stays accurate under
-    filtering instead of always reporting the unfiltered table count — the
-    two filter families are mutually exclusive in practice (no current
-    caller combines them) but not mutually exclusive in the SQL itself."""
-    if since_iso:
-        row = await conn.execute_fetchall(
-            "SELECT COUNT(*) AS n FROM cases WHERE first_seen >= :since", {"since": since_iso}
-        )
-        return row[0]["n"] if row else 0
+    """Landscape's "cases opened in window" count (first_seen-based via
+    since_iso) can be combined with the same last_seen filters used by
+    fetch_cases so callers always get a consistent, filter-aware total."""
     where, params = _build_cases_where(
         min_significance=min_significance, crime_type=crime_type, in_kev=in_kev,
         search=search, cve_id=cve_id, ioc=ioc, since=since, until=until,
     )
+    if since_iso:
+        if where:
+            where = f"{where} AND first_seen >= :since_iso"
+        else:
+            where = "WHERE first_seen >= :since_iso"
+        params["since_iso"] = since_iso
     row = await conn.execute_fetchall(f"SELECT COUNT(*) AS n FROM cases {where}", params)
     return row[0]["n"] if row else 0
 
@@ -2230,36 +2231,46 @@ async def case_contribution_by_source(conn: aiosqlite.Connection, *, since_iso: 
 
 async def save_case_link(
     conn: aiosqlite.Connection, *, case_a: int, case_b: int, score: float, reasons: list[str]
-) -> None:
+) -> bool:
+    """Persist (or refresh) a symmetric case-to-case link. Returns True if
+    this call inserted a new row, False if the pair already existed and was
+    only updated. Callers use the return value to decide whether to emit an
+    audit-log event for a genuinely new correlation."""
     lo, hi = (case_a, case_b) if case_a < case_b else (case_b, case_a)
-    await conn.execute(
+    computed_at = _utcnow().isoformat()
+    reasons_json = json.dumps(reasons)
+    cur = await conn.execute(
         """
-        INSERT INTO case_links (case_a, case_b, score, reasons, computed_at)
+        INSERT OR IGNORE INTO case_links (case_a, case_b, score, reasons, computed_at)
         VALUES (:a, :b, :score, :reasons, :computed_at)
-        ON CONFLICT(case_a, case_b) DO UPDATE SET
-            score = excluded.score, reasons = excluded.reasons, computed_at = excluded.computed_at
         """,
         {
             "a": lo,
             "b": hi,
             "score": score,
-            "reasons": json.dumps(reasons),
-            "computed_at": _utcnow().isoformat(),
+            "reasons": reasons_json,
+            "computed_at": computed_at,
+        },
+    )
+    if cur.rowcount and cur.rowcount > 0:
+        await conn.commit()
+        return True
+    await conn.execute(
+        """
+        UPDATE case_links
+        SET score = :score, reasons = :reasons, computed_at = :computed_at
+        WHERE case_a = :a AND case_b = :b
+        """,
+        {
+            "a": lo,
+            "b": hi,
+            "score": score,
+            "reasons": reasons_json,
+            "computed_at": computed_at,
         },
     )
     await conn.commit()
-
-
-async def case_link_exists(conn: aiosqlite.Connection, *, case_a: int, case_b: int) -> bool:
-    """Pre-check for cross_correlate.py so it can log an ai_activity event
-    only for genuinely *new* links — save_case_link's upsert re-affirms every
-    still-valid pair on every tick, and logging that every 10 minutes for
-    the same pairs would just be noise in the activity feed."""
-    lo, hi = (case_a, case_b) if case_a < case_b else (case_b, case_a)
-    rows = await conn.execute_fetchall(
-        "SELECT 1 FROM case_links WHERE case_a = :a AND case_b = :b", {"a": lo, "b": hi}
-    )
-    return bool(rows)
+    return False
 
 
 async def get_case_links(conn: aiosqlite.Connection, case_id: int) -> list[dict]:

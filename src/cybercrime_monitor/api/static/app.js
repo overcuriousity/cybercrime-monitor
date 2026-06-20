@@ -1026,29 +1026,29 @@ function initLandscape() {
     if (e.target === actorProfileOverlay) closeActorProfile();
   });
   landscapeExportBtn.addEventListener('click', () => {
-    const params = new URLSearchParams();
-    if (landscapeState.windowDays) params.set('since_days', landscapeState.windowDays);
+    const params = landscapeWindowParams();
     params.set('trend_window_days', emergingTrendWindowDays());
     window.location.href = '/api/stats/landscape/export?' + params.toString();
   });
   loadLandscape();
 }
 
-function landscapeSinceDaysParam() {
-  return landscapeState.windowDays ? `since_days=${landscapeState.windowDays}` : '';
+function landscapeWindowParams() {
+  const params = new URLSearchParams();
+  if (landscapeState.windowDays) params.set('since_days', landscapeState.windowDays);
+  else params.set('all_time', '1');
+  return params;
 }
 
 async function loadLandscape() {
   try {
-    const sinceParam = landscapeSinceDaysParam();
     const bucket = (landscapeState.windowDays && landscapeState.windowDays <= 60) ? 'day' : 'month';
-    const tsParams = new URLSearchParams();
-    if (landscapeState.windowDays) tsParams.set('since_days', landscapeState.windowDays);
-    else tsParams.set('since_days', 3650); // "all time" — bounded so the query stays sane
+    const statsParams = landscapeWindowParams();
+    const tsParams = landscapeWindowParams();
     tsParams.set('bucket', bucket);
 
     const [stats, timeseries] = await Promise.all([
-      api('/api/stats/cases' + (sinceParam ? '?' + sinceParam : '')),
+      api('/api/stats/cases' + (statsParams.toString() ? '?' + statsParams.toString() : '')),
       api('/api/stats/cases/timeseries?' + tsParams.toString()),
     ]);
 
@@ -1999,6 +1999,7 @@ const activityState = {
   pendingLive: [],
   filters: { subsystem: '', status: '' },
 };
+const ACTIVITY_MAX_LIVE_ROWS = 200; // prevent an unattended dashboard tab from growing forever
 
 const activityList       = document.getElementById('activity-list');
 const activityEmpty      = document.getElementById('activity-empty');
@@ -2146,6 +2147,10 @@ function handleLiveActivity(ev) {
     row.classList.add('fadeIn');
     activityList.prepend(row);
     activityState.events.unshift(ev);
+    if (activityState.events.length > ACTIVITY_MAX_LIVE_ROWS) {
+      activityState.events.pop();
+      if (activityList.lastElementChild) activityList.lastElementChild.remove();
+    }
   } else {
     activityState.pendingLive.push(ev);
     activityNewBanner.classList.remove('hidden');

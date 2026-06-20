@@ -145,6 +145,11 @@ class Settings(BaseSettings):
     # Effective-critical cases/items are NEVER pruned regardless of age.
     retention_days: int = 90
 
+    # ai_activity rows are retained independently of items because the audit
+    # trail is often wanted longer than the raw feed. Defaults to the item
+    # retention so existing deployments behave the same until configured.
+    activity_retention_days: int = 90
+
     # ── Public-dashboard DoS resistance ─────────────────────────────────────
     # The dashboard is meant for one analyst's own browser tabs but is
     # commonly reachable publicly (see admin_token's docstring above) —

@@ -221,7 +221,7 @@ def build_scheduler(db_conn, sse_broadcaster) -> AsyncIOScheduler:
             except Exception as exc:
                 log.error("[retention] prune failed: %s", exc)
             try:
-                await db_module.prune_old_activity(conn, retention_days=settings.retention_days)
+                await db_module.prune_old_activity(conn, retention_days=settings.activity_retention_days)
             except Exception as exc:
                 log.error("[retention] activity prune failed: %s", exc)
 
