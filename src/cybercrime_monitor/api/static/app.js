@@ -1036,7 +1036,7 @@ function renderSourcesBar(sources) {
       datasets: [{
         label: 'items',
         data: sorted.map(s => s.total),
-        backgroundColor: sorted.map(s => s.consecutive_errors > 0 ? PRIO_COLORS.warn : '#2a9d8f'),
+        backgroundColor: sorted.map(s => s.consecutive_errors > 0 ? PRIO_COLORS.warn : PRIO_COLORS.info),
       }],
     },
     options: {
