@@ -1180,7 +1180,7 @@ function renderLandscapeCountry(byCountry) {
     type: 'bar',
     data: {
       labels: top.map(r => r.country),
-      datasets: [{ label: 'victims', data: top.map(r => r.n), backgroundColor: '#f4a261' }],
+      datasets: [{ label: 'victims', data: top.map(r => r.n), backgroundColor: PRIO_COLORS.warn }],
     },
     options: {
       indexAxis: 'y',
