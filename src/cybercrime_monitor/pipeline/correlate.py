@@ -83,6 +83,26 @@ def record_error(error: str) -> None:
 def get() -> CorrelationHealth:
     return _health
 
+
+async def _log_activity(
+    db_conn, *, action: str, summary: str, detail: dict | None = None,
+    status: str = "ok", ref_id: int | str | None = None, model: str | None = None,
+) -> None:
+    """Write to ai_activity and fan it out over SSE — see db.log_ai_activity's
+    docstring. Swallows its own errors: activity logging must never be the
+    reason a correlation pass fails. Per-item case_created/merged events
+    (not a batch summary) since each one is a meaningfully distinct decision
+    an analyst would want to audit individually — unlike the classifier's
+    high-volume per-item verdicts."""
+    try:
+        event = await db.log_ai_activity(
+            db_conn, subsystem="correlator", action=action, summary=summary,
+            detail=detail, status=status, ref_type="case", ref_id=ref_id, model=model,
+        )
+        await broadcaster.broadcast_activity(event)
+    except Exception as exc:
+        log.error("[correlate] activity log failed: %s", exc)
+
 _OVERFETCH_MULTIPLIER = 5
 _BATCH_SIZE = 10
 # How far back to look for a fuzzy-candidate case to merge into — an old,
@@ -207,10 +227,11 @@ async def _correlate_one(db_conn, item: dict) -> None:
     if merged:
         return
 
-    await db.create_case(
+    title = _case_title(item)
+    case_id = await db.create_case(
         db_conn,
         case_key=case_key,
-        title=_case_title(item),
+        title=title,
         summary=str(item.get("snippet", ""))[:500],
         crime_type=item.get("crime_type") or "other",
         attribution=item.get("actor"),
@@ -225,6 +246,15 @@ async def _correlate_one(db_conn, item: dict) -> None:
         item_id=item["id"],
         event_at=event_at,
         iocs=iocs,
+    )
+    await _log_activity(
+        db_conn, action="case_created",
+        summary=f"New case #{case_id}: {title}",
+        detail={
+            "crime_type": item.get("crime_type"), "victim": item.get("victim"),
+            "actor": item.get("actor"), "significance": item["significance"], "in_kev": in_kev,
+        },
+        ref_id=case_id,
     )
 
 
@@ -265,6 +295,12 @@ async def _try_fuzzy_merge(db_conn, item: dict, *, cve_ids: list[str], in_kev: b
                 damaged_party_country=item.get("victim_country"),
                 event_at=event_at,
                 iocs=item.get("iocs") or [],
+            )
+            await _log_activity(
+                db_conn, action="item_merged",
+                summary=f"Merged item #{item['id']} into case #{case['id']} ({case.get('title', '')})",
+                detail={"confidence": confidence, "item_title": item.get("title")},
+                ref_id=case["id"],
             )
             return True
     return False

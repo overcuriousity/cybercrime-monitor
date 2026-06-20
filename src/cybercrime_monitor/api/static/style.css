@@ -177,6 +177,8 @@ header {
 .tab-content.active { display: flex; height: 100%; overflow: hidden; }
 #tab-feed.active { flex-direction: column; }
 #tab-settings.active { display: block; overflow-y: auto; padding: 24px; height: 100%; }
+#tab-landscape.active,
+#tab-activity.active { flex-direction: column; overflow-y: auto; }
 
 .feed-body { flex: 1; display: flex; min-height: 0; }
 
@@ -627,6 +629,22 @@ mark.prio-critical { background: var(--prio-critical-bg); color: var(--prio-crit
   border-radius: 4px;
   padding: 2px 6px;
 }
+.inline-chip-row { display: inline-flex; }
+.ioc-chip-clickable { color: inherit; cursor: pointer; }
+.ioc-chip-clickable:hover { border-color: var(--accent); color: var(--accent); }
+
+.case-pivot-banner {
+  align-items: center;
+  background: var(--prio-info-bg);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  display: flex;
+  font-size: 0.82rem;
+  gap: 12px;
+  justify-content: space-between;
+  margin: 8px 0;
+  padding: 6px 12px;
+}
 
 .related-case-card {
   display: block;
@@ -741,6 +759,133 @@ mark.prio-critical { background: var(--prio-critical-bg); color: var(--prio-crit
   margin-bottom: 10px;
   padding: 8px 12px;
   white-space: pre-wrap;
+}
+
+/* ── Landscape tab ───────────────────────────────────────────────────────── */
+.landscape-emerging-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 4px;
+}
+
+.emerging-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  flex: 1;
+  min-width: 260px;
+  padding: 12px 14px;
+}
+.emerging-panel h3 { font-size: 0.85rem; margin-bottom: 8px; color: var(--text-muted); }
+.emerging-row {
+  align-items: center;
+  display: flex;
+  font-size: 0.82rem;
+  justify-content: space-between;
+  padding: 4px 0;
+}
+.emerging-row .emerging-label { color: var(--text); }
+.emerging-delta { font-weight: 600; font-size: 0.78rem; }
+.emerging-delta.trend-emerging { color: var(--prio-critical); }
+.emerging-delta.trend-rising   { color: var(--prio-warn); }
+.emerging-delta.trend-flat     { color: var(--text-muted); }
+.emerging-delta.trend-declining { color: #3fb950; }
+
+/* Actor profile overlay — a lightweight modal, not a route; opened from the
+   Landscape actor leaderboard's onClick. */
+.overlay {
+  align-items: center;
+  background: rgba(1, 4, 9, 0.7);
+  display: flex;
+  inset: 0;
+  justify-content: center;
+  position: fixed;
+  z-index: 50;
+}
+.overlay-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  max-height: 85vh;
+  max-width: 700px;
+  overflow-y: auto;
+  padding: 24px;
+  position: relative;
+  width: 90%;
+}
+.overlay-close {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 1.4rem;
+  line-height: 1;
+  position: absolute;
+  right: 14px;
+  top: 10px;
+}
+.overlay-close:hover { color: var(--text); }
+.actor-profile-stats { margin: 14px 0; }
+.actor-profile-cases {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+/* ── Activity tab ────────────────────────────────────────────────────────── */
+/* Public AI activity log — see GET /api/activity. Subsystem chips get
+   distinct hues so the eye can scan "what kind of action was this" at a
+   glance across a fast-scrolling, mixed-subsystem feed. */
+.activity-intro { padding: 0 16px; margin-top: 12px; }
+
+.activity-list-wrap {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 0 16px 24px;
+}
+
+#activity-new-banner { text-align: center; margin-bottom: 8px; }
+#activity-new-banner button {
+  background: var(--accent);
+  border: none;
+  border-radius: 6px;
+  color: #fff;
+  cursor: pointer;
+  font-size: 0.82rem;
+  padding: 6px 14px;
+}
+
+.activity-row.status-error  { border-left: 3px solid var(--prio-critical); background: var(--prio-critical-bg); }
+.activity-row.status-skipped { opacity: 0.75; }
+
+.tag-chip.activity-subsystem-discover         { color: #58a6ff; background: rgba(88, 166, 255, 0.12); }
+.tag-chip.activity-subsystem-heal             { color: #3fb950; background: rgba(63, 185, 80, 0.12); }
+.tag-chip.activity-subsystem-prune            { color: #e3b341; background: rgba(227, 179, 65, 0.12); }
+.tag-chip.activity-subsystem-research         { color: #a371f7; background: rgba(163, 113, 247, 0.12); }
+.tag-chip.activity-subsystem-classifier       { color: #f778ba; background: rgba(247, 120, 186, 0.12); }
+.tag-chip.activity-subsystem-correlator       { color: #56d4dd; background: rgba(86, 212, 221, 0.12); }
+.tag-chip.activity-subsystem-cross_correlator { color: #bc8cff; background: rgba(188, 140, 255, 0.12); }
+
+.activity-detail {
+  margin-top: 8px;
+  font-size: 0.78rem;
+}
+.activity-detail summary {
+  cursor: pointer;
+  color: var(--text-muted);
+}
+.activity-detail summary:hover { color: var(--text); }
+.activity-detail pre {
+  background: var(--surface2);
+  border-radius: 6px;
+  margin-top: 6px;
+  max-height: 240px;
+  overflow: auto;
+  padding: 8px 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 /* ── Utilities ───────────────────────────────────────────────────────────── */

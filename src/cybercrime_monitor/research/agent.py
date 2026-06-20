@@ -72,6 +72,24 @@ def record_error(error: str) -> None:
 def get() -> ResearchHealth:
     return _health
 
+
+async def _log_activity(
+    db_conn, *, action: str, summary: str, detail: dict | None = None,
+    status: str = "ok", ref_id: int | str | None = None,
+) -> None:
+    """Write to ai_activity and fan it out over SSE in one call — see
+    db.log_ai_activity's docstring. Swallows its own errors: activity
+    logging must never be the reason a research run fails."""
+    try:
+        event = await db.log_ai_activity(
+            db_conn, subsystem="research", action=action, summary=summary,
+            detail=detail, status=status, ref_type="case", ref_id=ref_id,
+            model=settings.hermes_model or None,
+        )
+        await broadcaster.broadcast_activity(event)
+    except Exception as exc:
+        log.error("[research] activity log failed: %s", exc)
+
 # A case that yielded nothing new on a research pass isn't re-researched
 # every tick forever — this cooldown bounds how often the same case can be
 # picked up again (see db.get_cases_needing_research).
@@ -212,6 +230,11 @@ async def _research_one(db_conn, case: dict) -> None:
         # Hermes is down — clear it; the analyst can re-request.
         await db.clear_case_research_request(db_conn, case_id=case["id"])
         log.warning("[research] case %s: hermes run failed (%s)", case["id"], result.error)
+        await _log_activity(
+            db_conn, action="research_failed", status="error",
+            summary=f"Research failed on case #{case['id']} ({case.get('title') or 'untitled'})",
+            detail={"error": result.error}, ref_id=case["id"],
+        )
         return
 
     data = result.data
@@ -252,4 +275,17 @@ async def _research_one(db_conn, case: dict) -> None:
     log.info(
         "[research] case %s -> status=%s confirmed=%s confidence=%.2f",
         case["id"], new_status, confirmed, confidence,
+    )
+    await _log_activity(
+        db_conn, action="research_completed",
+        summary=(
+            f"Researched case #{case['id']} ({case.get('title') or 'untitled'}) -> "
+            f"{new_status} (confidence {confidence:.2f})"
+        ),
+        detail={
+            "confirmed": confirmed, "confidence": confidence, "new_status": new_status,
+            "attribution": attribution, "damaged_party": damaged_party,
+            "iocs": iocs, "sources": sources,
+        },
+        ref_id=case["id"],
     )

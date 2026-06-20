@@ -79,7 +79,7 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     _assert_no_data_under_static()
-    app = FastAPI(title="Marketplace Monitor", lifespan=lifespan)
+    app = FastAPI(title="Cybercrime Monitor", lifespan=lifespan)
 
     if settings.rate_limit_per_minute > 0:
         bucket = _TokenBucket(settings.rate_limit_per_minute)

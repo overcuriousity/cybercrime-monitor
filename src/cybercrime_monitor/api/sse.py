@@ -58,6 +58,14 @@ class SSEBroadcaster:
         """Lightweight status event for live dashboard updates."""
         await self.broadcast({"type": "status", "subsystem": subsystem, **payload})
 
+    async def broadcast_activity(self, event: dict) -> None:
+        """One row from ai_activity (db.log_ai_activity's return value),
+        pushed live to the public Activity tab. Separate "type" from
+        broadcast_status so the client can route AI-activity rows straight
+        into the activity log feed without filtering "status" spam out of
+        it (and vice versa)."""
+        await self.broadcast({"type": "activity", **event})
+
     async def stream(self, q: asyncio.Queue) -> AsyncIterator[str]:
         """Yield SSE-formatted strings from the subscriber queue."""
         try:

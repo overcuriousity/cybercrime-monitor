@@ -97,6 +97,25 @@ def record_error(error: str) -> None:
 def get() -> HealHealth:
     return _health
 
+
+async def _log_activity(
+    db_conn, *, subsystem: str, action: str, summary: str, detail: dict | None = None,
+    status: str = "ok", ref_id: str | None = None,
+) -> None:
+    """Write to ai_activity and fan it out over SSE — see db.log_ai_activity's
+    docstring. subsystem is a parameter (not hardcoded "heal") because this
+    module also drives the "prune" subsystem label. Swallows its own errors:
+    activity logging must never be the reason a heal/prune action fails."""
+    try:
+        event = await db.log_ai_activity(
+            db_conn, subsystem=subsystem, action=action, summary=summary,
+            detail=detail, status=status, ref_type="source", ref_id=ref_id,
+            model=settings.hermes_model or None,
+        )
+        await broadcaster.broadcast_activity(event)
+    except Exception as exc:
+        log.error("[%s] activity log failed: %s", subsystem, exc)
+
 # A source that already has a pending/recent proposal isn't re-investigated
 # every tick — same cooldown reasoning as research/agent.py's case cooldown.
 _HEAL_COOLDOWN_HOURS = 24
@@ -250,6 +269,12 @@ async def _heal_one(db_conn, source: dict, *, scheduler, sse_broadcaster) -> Non
     proposed_url = data.get("proposed_url") if isinstance(data, dict) else None
     if not data.get("found_fix") or not proposed_url:
         await db.update_heal_proposal_status(db_conn, proposal_id=proposal_id, status="rejected")
+        await _log_activity(
+            db_conn, subsystem="heal", action="no_fix_found", status="skipped",
+            summary=f"No fix found for source '{source['id']}'",
+            detail={"notes": data.get("proposed_config_notes") if isinstance(data, dict) else None},
+            ref_id=source["id"],
+        )
         return
 
     await _probe_and_apply(
@@ -278,9 +303,19 @@ async def _probe_and_apply(
                 db_conn, proposal_id=proposal_id, status="probe_failed",
                 error=f"HTTP {resp.status_code}",
             )
+            await _log_activity(
+                db_conn, subsystem="heal", action="probe_failed", status="error",
+                summary=f"Proposed fix for '{source['id']}' failed probe (HTTP {resp.status_code})",
+                detail={"url": url}, ref_id=source["id"],
+            )
     except Exception as exc:
         await db.update_heal_proposal_status(
             db_conn, proposal_id=proposal_id, status="probe_failed", error=str(exc) or repr(exc)
+        )
+        await _log_activity(
+            db_conn, subsystem="heal", action="probe_failed", status="error",
+            summary=f"Proposed fix for '{source['id']}' failed probe",
+            detail={"url": url, "error": str(exc) or repr(exc)}, ref_id=source["id"],
         )
         return
 
@@ -294,6 +329,11 @@ async def _probe_and_apply(
         return
     if not source_value.should_apply_heal(value=value, probe_ok=probe_ok):
         log.info("[heal] source %s: not applying — value judgement declined", source["id"])
+        await _log_activity(
+            db_conn, subsystem="heal", action="apply_declined", status="skipped",
+            summary=f"Validated fix for '{source['id']}' not applied — value judgement declined",
+            detail={"url": url, "value": value}, ref_id=source["id"],
+        )
         return
 
     try:
@@ -302,10 +342,20 @@ async def _probe_and_apply(
         )
     except source_writer.SourceWriteError as exc:
         log.error("[heal] source %s: apply failed: %s", source["id"], exc)
+        await _log_activity(
+            db_conn, subsystem="heal", action="apply_failed", status="error",
+            summary=f"Failed to write heal fix for '{source['id']}' to sources.yaml",
+            detail={"url": url, "error": str(exc) or repr(exc)}, ref_id=source["id"],
+        )
         return
 
     await db.record_applied_change(db_conn, proposal_id=proposal_id, before=before, after=after)
     log.info("[heal] source %s: auto-applied fix to sources.yaml", source["id"])
+    await _log_activity(
+        db_conn, subsystem="heal", action="source_fixed",
+        summary=f"Auto-applied fix to source '{source['id']}' ({url})",
+        detail={"before": before, "after": after}, ref_id=source["id"],
+    )
 
     if scheduler is not None:
         fresh = next((s for s in load_sources() if s["id"] == source["id"]), None)
@@ -365,6 +415,11 @@ async def _disable_source(db_conn, source: dict, value: dict, *, scheduler, sse_
     await db.update_heal_proposal_status(db_conn, proposal_id=proposal_id, status="validated")
     await db.record_applied_change(db_conn, proposal_id=proposal_id, before=before, after=after)
     log.info("[heal] auto-disabled low-value source %s (%s)", source["id"], value["classification"])
+    await _log_activity(
+        db_conn, subsystem="prune", action="source_disabled",
+        summary=f"Auto-disabled source '{source['id']}' ({value['classification']})",
+        detail={"before": before, "after": after, "value": value}, ref_id=source["id"],
+    )
     if scheduler is not None:
         unschedule_source(scheduler, source["id"])
 
@@ -399,3 +454,19 @@ async def _maybe_remove_source(db_conn, source: dict, value: dict) -> None:
     await db.update_heal_proposal_status(db_conn, proposal_id=proposal_id, status="validated")
     await db.record_applied_change(db_conn, proposal_id=proposal_id, before=before, after={})
     log.info("[heal] removed pruned source %s after grace period", source["id"])
+    await _log_activity(
+        db_conn, subsystem="prune", action="source_removed",
+        summary=f"Removed source '{source['id']}' after {settings.source_prune_grace_days}d grace period",
+        detail={
+            "before": {
+                "id": before.get("id", source["id"]),
+                "name": before.get("name"),
+                "type": before.get("type"),
+                "url": before.get("url"),
+                "enabled": before.get("enabled"),
+                "interval_seconds": before.get("interval_seconds"),
+                "source_tags": before.get("source_tags"),
+            },
+        },
+        ref_id=source["id"],
+    )

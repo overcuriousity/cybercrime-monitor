@@ -195,9 +195,15 @@ CREATE INDEX IF NOT EXISTS idx_research_runs_case_id ON research_runs(case_id);
 
 -- Self-healing proposals for broken/disabled collectors (see research/heal.py
 -- — hermes-agent investigates a failing source and proposes an updated
--- sources.yaml entry). Never auto-applied to sources.yaml: a human reviews
--- "validated" proposals and edits the config themselves. One row per
--- proposal attempt, not per source, so the history of past attempts is kept.
+-- sources.yaml entry). NOT human-gated: "validated" proposals are applied to
+-- sources.yaml automatically (see should_apply_heal/should_prune in
+-- sources/value.py, and source_autoapply_enabled in settings.py to disable
+-- autoapply entirely). The loop runs fully unattended; this table plus
+-- ai_activity (below) exist for after-the-fact transparency, not approval —
+-- every applied change is backed up by sources/writer.py (.bak-<ts>) and
+-- reversible by restoring that file, but nothing here blocks the write. One
+-- row per proposal attempt, not per source, so the history of past attempts
+-- is kept.
 CREATE TABLE IF NOT EXISTS source_heal_proposals (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     source_id     TEXT NOT NULL,
@@ -211,7 +217,8 @@ CREATE TABLE IF NOT EXISTS source_heal_proposals (
     -- action: heal | prune | discover. applied=1 means writer.py actually
     -- touched sources.yaml for this proposal (and a .bak-<ts> exists to
     -- revert it). before/after are JSON snapshots of the affected source
-    -- entry's mutated fields, for human review without diffing the file.
+    -- entry's mutated fields, for transparency without diffing the file —
+    -- also surfaced live via ai_activity/GET /api/activity.
     -- All columns added via ALTER TABLE migration for pre-existing DBs.
     action        TEXT,
     applied       INTEGER NOT NULL DEFAULT 0,
@@ -275,6 +282,34 @@ CREATE TABLE IF NOT EXISTS source_health (
     source_id TEXT PRIMARY KEY,
     data      TEXT NOT NULL
 );
+
+-- Unified, append-only log of every autonomous AI/agentic action across the
+-- whole system — discover/heal/prune (research/discover.py, research/
+-- heal.py), research (research/agent.py), the LLM classifier (llm/job.py),
+-- and the deterministic+LLM correlators (pipeline/correlate.py,
+-- pipeline/cross_correlate.py). This is the public surface for "what did
+-- the AI do" (see GET /api/activity, no admin token required) — the
+-- detailed per-subsystem tables (source_heal_proposals, research_runs,
+-- extractions) remain the system of record; this table is a denormalized,
+-- human-readable index over all of them plus the two correlators, which
+-- otherwise leave no audit trail at all. Every subsystem here acts fully
+-- autonomously (no approval gate) — this table exists for transparency,
+-- not control.
+CREATE TABLE IF NOT EXISTS ai_activity (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          TEXT NOT NULL,
+    subsystem   TEXT NOT NULL, -- discover | heal | prune | research | classifier | correlator | cross_correlator
+    action      TEXT NOT NULL, -- e.g. source_added, source_removed, case_created, cases_linked, item_classified
+    summary     TEXT NOT NULL,
+    detail      TEXT NOT NULL DEFAULT '{}', -- JSON: before/after, scores, reasons, model output
+    status      TEXT NOT NULL DEFAULT 'ok', -- ok | error | skipped
+    ref_type    TEXT, -- case | source | item | null
+    ref_id      TEXT,
+    model       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_activity_ts ON ai_activity(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_ai_activity_subsystem ON ai_activity(subsystem);
 
 -- Resolves one effective priority rank + false_positive flag per item:
 -- the LLM extraction's significance if one exists, else the regex matcher's
@@ -1150,6 +1185,124 @@ async def prune_old_items(conn: aiosqlite.Connection, *, retention_days: int) ->
     return deleted
 
 
+async def prune_old_activity(conn: aiosqlite.Connection, *, retention_days: int) -> int:
+    """Delete ai_activity rows older than retention_days. Unlike items, every
+    row here is already a summary (no cascading children to worry about), so
+    this is an unconditional age-based prune — no "keep critical" carve-out."""
+    cutoff = (_utcnow() - timedelta(days=retention_days)).isoformat()
+    cur = await conn.execute("DELETE FROM ai_activity WHERE ts < :cutoff", {"cutoff": cutoff})
+    deleted = cur.rowcount or 0
+    await conn.commit()
+    if deleted:
+        log.info("Retention: pruned %d ai_activity row(s) older than %d days", deleted, retention_days)
+    return deleted
+
+
+# ── AI activity log ──────────────────────────────────────────────────────────
+# See _SCHEMA's ai_activity table docstring. log_ai_activity is the single
+# write path every subsystem calls; list_ai_activity backs GET /api/activity.
+
+async def log_ai_activity(
+    conn: aiosqlite.Connection,
+    *,
+    subsystem: str,
+    action: str,
+    summary: str,
+    detail: dict | None = None,
+    status: str = "ok",
+    ref_type: str | None = None,
+    ref_id: int | str | None = None,
+    model: str | None = None,
+) -> dict:
+    """Insert one activity row and commit. Returns the row as a dict (already
+    JSON-decoded) so callers can immediately broadcast it over SSE without a
+    second query. Never raises on a bad `detail` value — activity logging is
+    observability, not a path that should be able to take down the subsystem
+    it's reporting on; non-serializable detail is coerced via default=str."""
+    ts = _utcnow().isoformat()
+    detail_json = json.dumps(detail or {}, default=str)
+    # Return exactly what went into the DB so SSE broadcasts and the stored
+    # row are consistent; json.loads also guarantees the payload is serializable.
+    detail_out = json.loads(detail_json)
+    cur = await conn.execute(
+        """
+        INSERT INTO ai_activity (ts, subsystem, action, summary, detail, status, ref_type, ref_id, model)
+        VALUES (:ts, :subsystem, :action, :summary, :detail, :status, :ref_type, :ref_id, :model)
+        """,
+        {
+            "ts": ts,
+            "subsystem": subsystem,
+            "action": action,
+            "summary": summary,
+            "detail": detail_json,
+            "status": status,
+            "ref_type": ref_type,
+            "ref_id": str(ref_id) if ref_id is not None else None,
+            "model": model,
+        },
+    )
+    await conn.commit()
+    return {
+        "id": cur.lastrowid,
+        "ts": ts,
+        "subsystem": subsystem,
+        "action": action,
+        "summary": summary,
+        "detail": detail_out,
+        "status": status,
+        "ref_type": ref_type,
+        "ref_id": str(ref_id) if ref_id is not None else None,
+        "model": model,
+    }
+
+
+async def list_ai_activity(
+    conn: aiosqlite.Connection,
+    *,
+    subsystem: str | None = None,
+    status: str | None = None,
+    since: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict:
+    """Paginated, newest-first activity feed for the public Activity tab.
+    Mirrors list_items' {total, items}-shaped response (see api/routes.py)."""
+    where = []
+    params: dict = {}
+    if subsystem:
+        where.append("subsystem = :subsystem")
+        params["subsystem"] = subsystem
+    if status:
+        where.append("status = :status")
+        params["status"] = status
+    if since:
+        where.append("ts >= :since")
+        params["since"] = since
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+
+    total_row = await conn.execute_fetchall(f"SELECT COUNT(*) AS n FROM ai_activity {clause}", params)
+    total = total_row[0]["n"] if total_row else 0
+
+    rows = await conn.execute_fetchall(
+        f"""
+        SELECT id, ts, subsystem, action, summary, detail, status, ref_type, ref_id, model
+        FROM ai_activity {clause}
+        ORDER BY ts DESC, id DESC
+        LIMIT :limit OFFSET :offset
+        """,
+        {**params, "limit": limit, "offset": offset},
+    )
+    events = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["detail"] = json.loads(d["detail"]) if d["detail"] else {}
+        except (TypeError, ValueError):
+            d["detail"] = {}
+        events.append(d)
+    return {"total": total, "events": events}
+
+
 # ── Source health persistence ────────────────────────────────────────────────
 # See health.py's module docstring — the live registry stays in-memory/sync;
 # these two functions are just its periodic save/restore boundary.
@@ -1485,23 +1638,17 @@ async def get_case_by_id(conn: aiosqlite.Connection, case_id: int) -> dict | Non
     return dict(rows[0]) if rows else None
 
 
-async def fetch_cases(
-    conn: aiosqlite.Connection,
+def _build_cases_where(
     *,
-    limit: int = 100,
-    offset: int = 0,
     min_significance: str | None = None,
     crime_type: str | None = None,
     in_kev: bool | None = None,
     search: str | None = None,
+    cve_id: str | None = None,
+    ioc: str | None = None,
     since: str | None = None,
     until: str | None = None,
-) -> list[dict]:
-    """Case-centric counterpart to fetch_items — see that function's
-    docstring for the shared filter/pagination shape this mirrors.
-    `search` also matches IoCs (not just title/victim/actor) so an
-    investigator can land on a case from an indicator alone. `since`/`until`
-    bound on last_seen — a timeframe search ("what happened last week")."""
+) -> tuple[str, dict]:
     parts = []
     params: dict = {}
     if min_significance:
@@ -1521,6 +1668,16 @@ async def fetch_cases(
             "OR iocs LIKE :search OR cve_ids LIKE :search)"
         )
         params["search"] = f"%{search}%"
+    if cve_id:
+        # cve_ids/iocs are stored as a JSON array string — quote-wrapped
+        # match avoids "CVE-2024-1" falsely matching "CVE-2024-100" the way
+        # a bare substring LIKE would (mirrors _build_items_where's same
+        # trick for the item-level cve_id/ioc filters).
+        parts.append("cve_ids LIKE :cve_id")
+        params["cve_id"] = f'%"{cve_id.upper()}"%'
+    if ioc:
+        parts.append("iocs LIKE :ioc")
+        params["ioc"] = f'%"{ioc}"%'
     if since:
         parts.append("last_seen >= :since")
         params["since"] = since
@@ -1528,6 +1685,34 @@ async def fetch_cases(
         parts.append("last_seen <= :until")
         params["until"] = until
     where = ("WHERE " + " AND ".join(parts)) if parts else ""
+    return where, params
+
+
+async def fetch_cases(
+    conn: aiosqlite.Connection,
+    *,
+    limit: int = 100,
+    offset: int = 0,
+    min_significance: str | None = None,
+    crime_type: str | None = None,
+    in_kev: bool | None = None,
+    search: str | None = None,
+    cve_id: str | None = None,
+    ioc: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+) -> list[dict]:
+    """Case-centric counterpart to fetch_items — see that function's
+    docstring for the shared filter/pagination shape this mirrors.
+    `search` also matches IoCs (not just title/victim/actor) so an
+    investigator can land on a case from an indicator alone. `since`/`until`
+    bound on last_seen — a timeframe search ("what happened last week").
+    `cve_id`/`ioc` back the case detail pane's indicator-pivot chips (click
+    a CVE/IoC -> every case sharing it)."""
+    where, params = _build_cases_where(
+        min_significance=min_significance, crime_type=crime_type, in_kev=in_kev,
+        search=search, cve_id=cve_id, ioc=ioc, since=since, until=until,
+    )
     rows = await conn.execute_fetchall(
         f"""
         SELECT * FROM cases
@@ -1547,8 +1732,33 @@ async def fetch_cases(
     return out
 
 
-async def count_cases(conn: aiosqlite.Connection) -> int:
-    row = await conn.execute_fetchall("SELECT COUNT(*) AS n FROM cases")
+async def count_cases(
+    conn: aiosqlite.Connection,
+    *,
+    since_iso: str | None = None,
+    min_significance: str | None = None,
+    crime_type: str | None = None,
+    in_kev: bool | None = None,
+    search: str | None = None,
+    cve_id: str | None = None,
+    ioc: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+) -> int:
+    """Landscape's "cases opened in window" count (first_seen-based via
+    since_iso) can be combined with the same last_seen filters used by
+    fetch_cases so callers always get a consistent, filter-aware total."""
+    where, params = _build_cases_where(
+        min_significance=min_significance, crime_type=crime_type, in_kev=in_kev,
+        search=search, cve_id=cve_id, ioc=ioc, since=since, until=until,
+    )
+    if since_iso:
+        if where:
+            where = f"{where} AND first_seen >= :since_iso"
+        else:
+            where = "WHERE first_seen >= :since_iso"
+        params["since_iso"] = since_iso
+    row = await conn.execute_fetchall(f"SELECT COUNT(*) AS n FROM cases {where}", params)
     return row[0]["n"] if row else 0
 
 
@@ -2021,24 +2231,46 @@ async def case_contribution_by_source(conn: aiosqlite.Connection, *, since_iso: 
 
 async def save_case_link(
     conn: aiosqlite.Connection, *, case_a: int, case_b: int, score: float, reasons: list[str]
-) -> None:
+) -> bool:
+    """Persist (or refresh) a symmetric case-to-case link. Returns True if
+    this call inserted a new row, False if the pair already existed and was
+    only updated. Callers use the return value to decide whether to emit an
+    audit-log event for a genuinely new correlation."""
     lo, hi = (case_a, case_b) if case_a < case_b else (case_b, case_a)
-    await conn.execute(
+    computed_at = _utcnow().isoformat()
+    reasons_json = json.dumps(reasons)
+    cur = await conn.execute(
         """
-        INSERT INTO case_links (case_a, case_b, score, reasons, computed_at)
+        INSERT OR IGNORE INTO case_links (case_a, case_b, score, reasons, computed_at)
         VALUES (:a, :b, :score, :reasons, :computed_at)
-        ON CONFLICT(case_a, case_b) DO UPDATE SET
-            score = excluded.score, reasons = excluded.reasons, computed_at = excluded.computed_at
         """,
         {
             "a": lo,
             "b": hi,
             "score": score,
-            "reasons": json.dumps(reasons),
-            "computed_at": _utcnow().isoformat(),
+            "reasons": reasons_json,
+            "computed_at": computed_at,
+        },
+    )
+    if cur.rowcount and cur.rowcount > 0:
+        await conn.commit()
+        return True
+    await conn.execute(
+        """
+        UPDATE case_links
+        SET score = :score, reasons = :reasons, computed_at = :computed_at
+        WHERE case_a = :a AND case_b = :b
+        """,
+        {
+            "a": lo,
+            "b": hi,
+            "score": score,
+            "reasons": reasons_json,
+            "computed_at": computed_at,
         },
     )
     await conn.commit()
+    return False
 
 
 async def get_case_links(conn: aiosqlite.Connection, case_id: int) -> list[dict]:
@@ -2101,13 +2333,270 @@ async def get_case_items(conn: aiosqlite.Connection, case_id: int) -> list[dict]
     return [dict(r) for r in rows]
 
 
-async def stats_cases_by_crime_type(conn: aiosqlite.Connection) -> list[dict]:
+async def stats_cases_by_crime_type(conn: aiosqlite.Connection, *, since_iso: str | None = None) -> list[dict]:
+    where = "WHERE first_seen >= :since" if since_iso else ""
     rows = await conn.execute_fetchall(
-        "SELECT crime_type, COUNT(*) AS n FROM cases GROUP BY crime_type ORDER BY n DESC"
+        f"SELECT crime_type, COUNT(*) AS n FROM cases {where} GROUP BY crime_type ORDER BY n DESC",
+        {"since": since_iso} if since_iso else {},
     )
     return [dict(r) for r in rows]
 
 
-async def stats_cases_in_kev(conn: aiosqlite.Connection) -> int:
-    row = await conn.execute_fetchall("SELECT COUNT(*) AS n FROM cases WHERE in_kev = 1")
+async def stats_cases_in_kev(conn: aiosqlite.Connection, *, since_iso: str | None = None) -> int:
+    where = "WHERE in_kev = 1" + (" AND first_seen >= :since" if since_iso else "")
+    row = await conn.execute_fetchall(
+        f"SELECT COUNT(*) AS n FROM cases {where}", {"since": since_iso} if since_iso else {}
+    )
     return row[0]["n"] if row else 0
+
+
+# ── Trends ────────────────────────────────────────────────────────────────────
+# Week-over-week (or whatever window_days the caller picks) movement per
+# dimension value, driving the Landscape tab's "Emerging this week" panels.
+# Always keyed off cases.first_seen, same reasoning as stats_cases_timeseries
+# above: cases are never pruned, so a real previous-vs-current comparison is
+# possible at any window size, unlike the item-based stats_* functions.
+
+_TREND_DIMENSION_COLUMNS = {
+    "actor": "attribution",
+    "sector": "damaged_party_sector",
+    "crime_type": "crime_type",
+}
+
+
+def _trend_status(current: int, previous: int) -> str:
+    if current > 0 and previous == 0:
+        return "emerging"
+    if current > previous:
+        return "rising"
+    if current < previous:
+        return "declining"
+    return "flat"
+
+
+async def stats_trends(
+    conn: aiosqlite.Connection, *, dimension: str, window_days: int = 7, limit: int = 10
+) -> list[dict]:
+    """Compares case counts per `dimension` value between the current
+    window [now - window_days, now] and the immediately preceding window
+    of the same length [now - 2*window_days, now - window_days]. dimension
+    is one of "actor", "sector", "crime_type", "cve" — the first three are
+    a single grouped-column count; "cve" unpacks each case's cve_ids JSON
+    array in Python since SQLite has no convenient way to GROUP BY a JSON
+    array element inline with the rest of this module's query style.
+    Returns entries sorted by current-window count, descending, dropping
+    the (very common) case where both windows are zero — that's not a
+    trend, just absence."""
+    now = _utcnow()
+    current_since = (now - timedelta(days=window_days)).isoformat()
+    previous_since = (now - timedelta(days=2 * window_days)).isoformat()
+
+    if dimension == "cve":
+        rows = await conn.execute_fetchall(
+            "SELECT first_seen, cve_ids FROM cases WHERE first_seen >= :since",
+            {"since": previous_since},
+        )
+        current_counts: dict[str, int] = {}
+        previous_counts: dict[str, int] = {}
+        for r in rows:
+            cve_ids = json.loads(r["cve_ids"]) if r["cve_ids"] else []
+            bucket = current_counts if r["first_seen"] >= current_since else previous_counts
+            for cve_id in cve_ids:
+                bucket[cve_id] = bucket.get(cve_id, 0) + 1
+        values = list(set(current_counts) | set(previous_counts))
+        kev_set: set[str] = set()
+        chunk_size = 500  # stay well under SQLite's default 999 bound-variable limit
+        for i in range(0, len(values), chunk_size):
+            chunk = values[i : i + chunk_size]
+            placeholders = ",".join(f":k{j}" for j in range(len(chunk)))
+            kev_rows = await conn.execute_fetchall(
+                f"SELECT cve_id FROM kev_catalog WHERE cve_id IN ({placeholders})",
+                {f"k{j}": v for j, v in enumerate(chunk)},
+            )
+            kev_set.update(r["cve_id"] for r in kev_rows)
+    else:
+        kev_set = set()
+        column = _TREND_DIMENSION_COLUMNS.get(dimension)
+        if column is None:
+            raise ValueError(f"unknown trend dimension: {dimension!r}")
+        rows = await conn.execute_fetchall(
+            f"""
+            SELECT {column} AS value, first_seen FROM cases
+            WHERE first_seen >= :since AND {column} IS NOT NULL AND {column} != ''
+            """,
+            {"since": previous_since},
+        )
+        current_counts = {}
+        previous_counts = {}
+        for r in rows:
+            bucket = current_counts if r["first_seen"] >= current_since else previous_counts
+            bucket[r["value"]] = bucket.get(r["value"], 0) + 1
+        values = set(current_counts) | set(previous_counts)
+
+    out = []
+    for v in values:
+        current = current_counts.get(v, 0)
+        previous = previous_counts.get(v, 0)
+        if current == 0 and previous == 0:
+            continue
+        entry = {
+            "value": v,
+            "current": current,
+            "previous": previous,
+            "delta": current - previous,
+            "status": _trend_status(current, previous),
+        }
+        if dimension == "cve":
+            entry["in_kev"] = v in kev_set
+        out.append(entry)
+    out.sort(key=lambda e: e["current"], reverse=True)
+    return out[:limit]
+
+
+# ── Landscape aggregations ───────────────────────────────────────────────────
+# Case-layer (deduplicated incident) aggregations for the Landscape tab — the
+# case is the right unit for a landscape view, vs. raw items which double-
+# count every corroborating report of the same incident. All accept an
+# optional since_iso window (derived from since_days in routes.py) so the
+# tab's 24h/7d/30d/90d/all selector can re-slice the same queries.
+
+async def stats_cases_by_sector(conn: aiosqlite.Connection, *, since_iso: str | None = None) -> list[dict]:
+    where = "WHERE damaged_party_sector IS NOT NULL AND damaged_party_sector != ''"
+    if since_iso:
+        where += " AND first_seen >= :since"
+    rows = await conn.execute_fetchall(
+        f"""
+        SELECT damaged_party_sector AS sector, COUNT(*) AS n
+        FROM cases {where}
+        GROUP BY damaged_party_sector ORDER BY n DESC
+        """,
+        {"since": since_iso} if since_iso else {},
+    )
+    return [dict(r) for r in rows]
+
+
+async def stats_cases_by_country(conn: aiosqlite.Connection, *, since_iso: str | None = None) -> list[dict]:
+    where = "WHERE damaged_party_country IS NOT NULL AND damaged_party_country != ''"
+    if since_iso:
+        where += " AND first_seen >= :since"
+    rows = await conn.execute_fetchall(
+        f"""
+        SELECT damaged_party_country AS country, COUNT(*) AS n
+        FROM cases {where}
+        GROUP BY damaged_party_country ORDER BY n DESC
+        """,
+        {"since": since_iso} if since_iso else {},
+    )
+    return [dict(r) for r in rows]
+
+
+async def stats_cases_timeseries(
+    conn: aiosqlite.Connection, *, bucket: str = "day", since_iso: str | None = None
+) -> list[dict]:
+    """Case-volume-over-time for the Landscape tab's "Incident volume" chart.
+    Deliberately separate from stats_timeseries (items.seen_at, hard-capped
+    at 30 days) — cases are never pruned by retention (see
+    prune_old_items's docstring), so this is the only series that can
+    honestly cover a 90-day or "all time" window. bucket="day" for
+    day-granularity (short windows); anything else buckets by calendar
+    month (long windows, where per-day bars would be unreadable)."""
+    where = "WHERE first_seen >= :since" if since_iso else ""
+    rows = await conn.execute_fetchall(
+        f"SELECT first_seen, significance FROM cases {where}", {"since": since_iso} if since_iso else {}
+    )
+    buckets: dict[str, dict[str, int]] = {}
+    for r in rows:
+        first_seen = r["first_seen"] or ""
+        key = first_seen[:10] if bucket == "day" else first_seen[:7]  # YYYY-MM-DD vs YYYY-MM
+        sig = r["significance"] or "info"
+        if sig not in ("info", "warn", "critical"):
+            sig = "info"
+        b = buckets.setdefault(key, {"info": 0, "warn": 0, "critical": 0})
+        b[sig] += 1
+    return [{"bucket": k, **v} for k, v in sorted(buckets.items())]
+
+
+async def get_actor_profile(conn: aiosqlite.Connection, actor: str, *, case_limit: int = 50) -> dict | None:
+    """Full aggregate profile for one attributed actor — backs the
+    Landscape tab's actor-leaderboard click-through. Unlike computing this
+    client-side from a paginated /api/cases?actor= call (which the frontend
+    did before this existed), the aggregates here are computed over *every*
+    matching case, not just the first page, so victim/sector/CVE counts for
+    a prolific actor aren't silently undercounted; `cases` itself is still
+    capped (case_limit) since the UI only needs a browsable list, not every
+    row in memory."""
+    all_rows = await conn.execute_fetchall(
+        """
+        SELECT id, title, damaged_party, damaged_party_sector, damaged_party_country,
+               cve_ids, first_seen, last_seen, significance
+        FROM cases WHERE attribution = :actor
+        """,
+        {"actor": actor},
+    )
+    if not all_rows:
+        return None
+
+    victims, sectors, countries, cve_ids = set(), set(), set(), set()
+    first_seen = last_seen = None
+    monthly: dict[str, int] = {}
+    for r in all_rows:
+        if r["damaged_party"]:
+            victims.add(r["damaged_party"])
+        if r["damaged_party_sector"]:
+            sectors.add(r["damaged_party_sector"])
+        if r["damaged_party_country"]:
+            countries.add(r["damaged_party_country"])
+        for cve_id in (json.loads(r["cve_ids"]) if r["cve_ids"] else []):
+            cve_ids.add(cve_id)
+        if first_seen is None or r["first_seen"] < first_seen:
+            first_seen = r["first_seen"]
+        if last_seen is None or r["last_seen"] > last_seen:
+            last_seen = r["last_seen"]
+        month_key = (r["first_seen"] or "")[:7]
+        monthly[month_key] = monthly.get(month_key, 0) + 1
+
+    cases_rows = await conn.execute_fetchall(
+        """
+        SELECT id, title, damaged_party, damaged_party_sector, damaged_party_country,
+               significance, first_seen, last_seen
+        FROM cases WHERE attribution = :actor
+        ORDER BY last_seen DESC LIMIT :limit
+        """,
+        {"actor": actor, "limit": case_limit},
+    )
+
+    return {
+        "actor": actor,
+        "case_count": len(all_rows),
+        "victim_count": len(victims),
+        "sectors": sorted(sectors),
+        "countries": sorted(countries),
+        "cve_ids": sorted(cve_ids),
+        "first_seen": first_seen,
+        "last_seen": last_seen,
+        "activity": [{"bucket": k, "n": v} for k, v in sorted(monthly.items())],
+        "cases": [dict(r) for r in cases_rows],
+    }
+
+
+async def stats_cases_by_actor(
+    conn: aiosqlite.Connection, *, since_iso: str | None = None, limit: int = 15
+) -> list[dict]:
+    """Case-based actor leaderboard — more accurate than the item-based
+    stats_top_actors (db.py, fed from items.extra) since one actor's
+    activity is counted once per incident here, not once per corroborating
+    report. Used by the Landscape tab's actor leaderboard."""
+    where = "WHERE attribution IS NOT NULL AND attribution != ''"
+    params: dict = {"limit": limit}
+    if since_iso:
+        where += " AND first_seen >= :since"
+        params["since"] = since_iso
+    rows = await conn.execute_fetchall(
+        f"""
+        SELECT attribution AS actor, COUNT(*) AS n
+        FROM cases {where}
+        GROUP BY attribution ORDER BY n DESC LIMIT :limit
+        """,
+        params,
+    )
+    return [dict(r) for r in rows]

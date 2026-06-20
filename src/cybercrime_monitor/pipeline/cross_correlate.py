@@ -16,6 +16,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from .. import db
+from ..api.sse import broadcaster
 from .correlate import _normalize
 
 log = logging.getLogger(__name__)
@@ -63,6 +64,27 @@ def _score_pair(case_a: dict, case_b: dict) -> tuple[float, list[str]]:
     return min(1.0, score), reasons
 
 
+async def _log_link(db_conn, *, case_a: dict, case_b: dict, score: float, reasons: list[str]) -> None:
+    """Write to ai_activity and fan it out over SSE — see db.log_ai_activity's
+    docstring. Only called for genuinely new links (see case_link_exists),
+    so this doesn't fire every tick for the same already-known pair.
+    Swallows its own errors: activity logging must never be the reason a
+    cross-correlation pass fails."""
+    try:
+        event = await db.log_ai_activity(
+            db_conn, subsystem="cross_correlator", action="cases_linked",
+            summary=(
+                f"Linked case #{case_a['id']} ({case_a.get('title', '')}) <-> "
+                f"#{case_b['id']} ({case_b.get('title', '')}) — {', '.join(reasons)}"
+            ),
+            detail={"score": score, "reasons": reasons, "case_a": case_a["id"], "case_b": case_b["id"]},
+            ref_type="case", ref_id=case_a["id"],
+        )
+        await broadcaster.broadcast_activity(event)
+    except Exception as exc:
+        log.error("[cross_correlate] activity log failed: %s", exc)
+
+
 async def run_cross_correlation(db_conn) -> int:
     """One tick: pairwise-score all cases active within the window and
     persist links above the threshold. O(n^2) in the window's case count —
@@ -77,9 +99,11 @@ async def run_cross_correlation(db_conn) -> int:
         for case_b in cases[i + 1:]:
             score, reasons = _score_pair(case_a, case_b)
             if score >= _MIN_LINK_SCORE:
-                await db.save_case_link(
+                is_new = await db.save_case_link(
                     db_conn, case_a=case_a["id"], case_b=case_b["id"], score=score, reasons=reasons
                 )
+                if is_new:
+                    await _log_link(db_conn, case_a=case_a, case_b=case_b, score=score, reasons=reasons)
                 linked += 1
     if linked:
         log.info("[cross_correlate] recorded/updated %d case link(s)", linked)

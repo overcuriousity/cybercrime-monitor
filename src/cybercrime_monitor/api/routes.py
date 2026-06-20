@@ -2,10 +2,11 @@ import asyncio
 import hmac
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .. import health
@@ -21,9 +22,18 @@ from ..db import (
     count_unextracted,
     fetch_cases,
     fetch_items,
+    get_actor_profile,
     get_case_by_id,
     get_case_items,
+    get_case_links,
     get_recent_extractions,
+    get_research_runs_for_case,
+    list_ai_activity,
+    stats_cases_by_actor,
+    stats_cases_by_country,
+    stats_cases_by_sector,
+    stats_cases_timeseries,
+    stats_trends,
     stats_by_priority,
     stats_by_source,
     stats_cases_by_crime_type,
@@ -476,9 +486,13 @@ async def api_cases(
     crime_type: str | None = Query(default=None),
     in_kev: bool | None = Query(default=None),
     search: str | None = Query(default=None),
+    cve_id: str | None = Query(default=None),
+    ioc: str | None = Query(default=None),
     since: str | None = Query(default=None),
     until: str | None = Query(default=None),
 ):
+    since_norm = _normalize_date_filter(since, end_of_day=False)
+    until_norm = _normalize_date_filter(until, end_of_day=True)
     cases = await fetch_cases(
         db,
         limit=limit,
@@ -487,17 +501,29 @@ async def api_cases(
         crime_type=crime_type,
         in_kev=in_kev,
         search=search,
-        since=_normalize_date_filter(since, end_of_day=False),
-        until=_normalize_date_filter(until, end_of_day=True),
+        cve_id=cve_id,
+        ioc=ioc,
+        since=since_norm,
+        until=until_norm,
     )
-    total = await count_cases(db)
+    total = await count_cases(
+        db,
+        min_significance=min_significance,
+        crime_type=crime_type,
+        in_kev=in_kev,
+        search=search,
+        cve_id=cve_id,
+        ioc=ioc,
+        since=since_norm,
+        until=until_norm,
+    )
     return {"total": total, "cases": cases}
 
 
-@router.get("/api/cases/{case_id}")
-async def api_case_detail(case_id: int, db=Depends(get_db)):
-    from ..db import get_case_links, get_research_runs_for_case
-
+async def _load_case_bundle(db, case_id: int) -> tuple[dict, list[dict], list[dict], list[dict]]:
+    """Shared data fetch for the case detail pane and Markdown/JSON export.
+    Returns (case, items, research_runs, related_cases) with JSON fields already
+    decoded and booleans normalised. Raises 404 if the case does not exist."""
     case = await get_case_by_id(db, case_id)
     if case is None:
         raise HTTPException(status_code=404, detail="Case not found")
@@ -507,7 +533,121 @@ async def api_case_detail(case_id: int, db=Depends(get_db)):
     items = await get_case_items(db, case_id)
     research_runs = await get_research_runs_for_case(db, case_id)
     related = await get_case_links(db, case_id)
+    return case, items, research_runs, related
+
+
+@router.get("/api/cases/{case_id}")
+async def api_case_detail(case_id: int, db=Depends(get_db)):
+    case, items, research_runs, related = await _load_case_bundle(db, case_id)
     return {"case": case, "items": items, "research_runs": research_runs, "related_cases": related}
+
+
+_MD_ESCAPE_RE = re.compile(r"([*_`\[\]|#])")
+
+
+def _escape_markdown(text: str) -> str:
+    """Escape characters that have Markdown meaning so user-controlled case
+    fields (titles, summaries, IoCs) render literally in exported reports."""
+    return _MD_ESCAPE_RE.sub(r"\\\1", str(text))
+
+
+def _case_to_markdown(case: dict, items: list[dict], research_runs: list[dict], related: list[dict]) -> str:
+    lines = [f"# {_escape_markdown(case['title'])}", ""]
+    lines.append(f"- **Significance:** {case.get('significance', 'unknown')}")
+    lines.append(f"- **Crime type:** {case.get('crime_type', 'unknown')}")
+    if case.get("damaged_party"):
+        lines.append(f"- **Victim:** {_escape_markdown(case['damaged_party'])}")
+    if case.get("damaged_party_sector"):
+        lines.append(f"- **Sector:** {_escape_markdown(case['damaged_party_sector'])}")
+    if case.get("damaged_party_country"):
+        lines.append(f"- **Country:** {_escape_markdown(case['damaged_party_country'])}")
+    if case.get("attribution"):
+        lines.append(f"- **Attribution:** {_escape_markdown(case['attribution'])}")
+    lines.append(f"- **Status:** {case.get('status', 'unknown')}")
+    lines.append(f"- **In CISA KEV:** {'yes' if case.get('in_kev') else 'no'}")
+    lines.append(f"- **First seen:** {case.get('first_seen') or ''}")
+    lines.append(f"- **Last seen:** {case.get('last_seen') or ''}")
+    lines.append(f"- **Sources:** {case.get('source_count', 0)}")
+    if case.get("cve_ids"):
+        lines.append(f"- **CVEs:** {', '.join(_escape_markdown(c) for c in case['cve_ids'])}")
+    lines.append("")
+
+    if case.get("summary"):
+        lines += ["## Summary", "", _escape_markdown(case["summary"]), ""]
+
+    if case.get("iocs"):
+        lines += ["## Indicators of compromise", ""]
+        lines += [f"- `{_escape_markdown(ioc)}`" for ioc in case["iocs"]]
+        lines.append("")
+
+    if items:
+        lines += ["## Corroborating reports", ""]
+        for it in items:
+            ts = it.get("published_at") or it.get("seen_at") or ""
+            source = _escape_markdown(it.get("source_name") or it.get("source_id") or "?")
+            title = _escape_markdown(it.get("title") or "")
+            url = str(it.get("url") or "")
+            if url:
+                lines.append(f"- [{source}](<{url}>) — {title} ({ts})")
+            else:
+                lines.append(f"- {source} — {title} ({ts})")
+        lines.append("")
+
+    if research_runs:
+        lines += ["## Autonomous research", ""]
+        for r in research_runs[:5]:
+            findings = (r.get("findings") or {}).get("summary") if isinstance(r.get("findings"), dict) else None
+            status = _escape_markdown(r.get("status") or "")
+            started = r.get("started_at") or ""
+            findings_part = f": {_escape_markdown(findings)}" if findings else ""
+            lines.append(f"- **{status}** ({started}){findings_part}")
+        lines.append("")
+
+    if related:
+        lines += ["## Related cases", ""]
+        for r in related:
+            reasons = ", ".join(r.get("reasons") or [])
+            title = _escape_markdown(r.get("title") or "")
+            lines.append(
+                f"- Case #{r['case_id']}: {title} — {_escape_markdown(reasons)} "
+                f"(score {r.get('score', 0):.2f})"
+            )
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+@router.get("/api/cases/{case_id}/export")
+async def api_case_export(case_id: int, db=Depends(get_db), format: str = Query(default="md")):
+    """Markdown/JSON case report for sharing intel out of this single-
+    analyst console — same underlying data as GET /api/cases/{id}, just
+    rendered for a human reading it outside the dashboard rather than the
+    UI's detail pane."""
+    if format not in ("md", "json"):
+        raise HTTPException(status_code=400, detail="format must be 'md' or 'json'")
+
+    case, items, research_runs, related = await _load_case_bundle(db, case_id)
+
+    if format == "json":
+        return {"case": case, "items": items, "research_runs": research_runs, "related_cases": related}
+
+    markdown = _case_to_markdown(case, items, research_runs, related)
+    filename = f"case-{case_id}.md"
+    return PlainTextResponse(
+        markdown, media_type="text/markdown",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/api/actors/{actor}")
+async def api_actor_profile(actor: str, db=Depends(get_db)):
+    """Full aggregate profile for one attributed actor — see
+    db.get_actor_profile's docstring. Backs the Landscape tab's actor
+    leaderboard click-through and the case detail pane's actor pivot."""
+    profile = await get_actor_profile(db, actor)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="No cases attributed to this actor")
+    return profile
 
 
 @router.post("/api/cases/{case_id}/research", dependencies=[Depends(require_admin)])
@@ -536,13 +676,134 @@ async def api_case_request_research(case_id: int, request: Request, db=Depends(g
     return {"status": "queued"}
 
 
+def _since_iso(since_days: int | None, *, all_time: bool = False) -> str | None:
+    """Convert a Landscape window selector to a first_seen cutoff. When
+    `all_time` is true (or no window is given), return None so the query is
+    genuinely unbounded."""
+    if all_time or since_days is None:
+        return None
+    return (datetime.now(timezone.utc) - timedelta(days=since_days)).isoformat()
+
+
 @router.get("/api/stats/cases")
-async def api_stats_cases(db=Depends(get_db)):
+async def api_stats_cases(
+    db=Depends(get_db),
+    since_days: int | None = Query(default=None, ge=1, le=3650),
+    all_time: bool = Query(default=False),
+):
+    # since_days/all_time power the Landscape tab's 24h/7d/30d/90d/all window
+    # selector — cases are never pruned by retention (see db.prune_old_items,
+    # which only ages out non-critical *items*), so "all" genuinely means
+    # the whole case history, not just what's left after retention.
+    since_iso = _since_iso(since_days, all_time=all_time)
     return {
-        "total": await count_cases(db),
-        "by_crime_type": await stats_cases_by_crime_type(db),
-        "in_kev": await stats_cases_in_kev(db),
+        "total": await count_cases(db, since_iso=since_iso),
+        "by_crime_type": await stats_cases_by_crime_type(db, since_iso=since_iso),
+        "by_sector": await stats_cases_by_sector(db, since_iso=since_iso),
+        "by_country": await stats_cases_by_country(db, since_iso=since_iso),
+        "by_actor": await stats_cases_by_actor(db, since_iso=since_iso),
+        "in_kev": await stats_cases_in_kev(db, since_iso=since_iso),
     }
+
+
+@router.get("/api/stats/cases/timeseries")
+async def api_stats_cases_timeseries(
+    db=Depends(get_db),
+    since_days: int | None = Query(default=30, ge=1, le=3650),
+    bucket: str = Query(default="day"),
+    all_time: bool = Query(default=False),
+):
+    since_iso = _since_iso(since_days, all_time=all_time)
+    return {"buckets": await stats_cases_timeseries(db, bucket=bucket, since_iso=since_iso)}
+
+
+@router.get("/api/stats/trends")
+async def api_stats_trends(
+    db=Depends(get_db),
+    dimension: str = Query(default="actor"),
+    window_days: int = Query(default=7, ge=1, le=180),
+    limit: int = Query(default=10, le=50),
+):
+    if dimension not in ("actor", "sector", "crime_type", "cve"):
+        raise HTTPException(status_code=400, detail="dimension must be one of actor, sector, crime_type, cve")
+    return {"trends": await stats_trends(db, dimension=dimension, window_days=window_days, limit=limit)}
+
+
+def _landscape_snapshot_markdown(
+    *, since_iso: str | None, since_days: int | None, stats: dict, actor_trends: list[dict],
+    sector_trends: list[dict], cve_trends: list[dict],
+) -> str:
+    window_label = f"last {since_days} day(s)" if since_iso else "all time"
+    lines = [f"# Cybercrime Landscape Snapshot — {window_label}", "", f"Generated: {datetime.now(timezone.utc).isoformat()}", ""]
+
+    lines.append(f"- **Cases:** {stats['total']}")
+    lines.append(f"- **In CISA KEV:** {stats['in_kev']}")
+    lines.append("")
+
+    def _bullet_section(title: str, rows: list[dict], key: str) -> None:
+        lines.append(f"## {title}")
+        lines.append("")
+        if not rows:
+            lines.append("_None._")
+        for r in rows[:15]:
+            lines.append(f"- {_escape_markdown(r[key])}: {r['n']}")
+        lines.append("")
+
+    _bullet_section("Crime types", stats["by_crime_type"], "crime_type")
+    _bullet_section("Top sectors", stats["by_sector"], "sector")
+    _bullet_section("Top countries", stats["by_country"], "country")
+    _bullet_section("Most active actors", stats["by_actor"], "actor")
+
+    def _trend_section(title: str, rows: list[dict]) -> None:
+        lines.append(f"## {title}")
+        lines.append("")
+        if not rows:
+            lines.append("_No movement this window._")
+        for r in rows[:10]:
+            kev = " ⚠ KEV" if r.get("in_kev") else ""
+            lines.append(f"- {_escape_markdown(r['value'])}{kev}: {r['status']} ({r['current']}, Δ{r['delta']:+d})")
+        lines.append("")
+
+    _trend_section("Emerging/rising actors", [r for r in actor_trends if r["status"] in ("emerging", "rising")])
+    _trend_section("Emerging/rising sectors", [r for r in sector_trends if r["status"] in ("emerging", "rising")])
+    _trend_section("Emerging/rising CVEs", [r for r in cve_trends if r["status"] in ("emerging", "rising")])
+
+    return "\n".join(lines)
+
+
+@router.get("/api/stats/landscape/export")
+async def api_landscape_export(
+    db=Depends(get_db),
+    since_days: int | None = Query(default=None, ge=1, le=3650),
+    trend_window_days: int = Query(default=7, ge=1, le=180),
+    all_time: bool = Query(default=False),
+):
+    """Markdown snapshot of the Landscape tab's current window — top actors/
+    sectors/countries/crime-types plus week-over-week (trend_window_days)
+    movement — for sharing a point-in-time read of the landscape outside
+    the dashboard. Built from the same db.stats_cases_*/stats_trends calls
+    the Landscape tab itself uses."""
+    since_iso = _since_iso(since_days, all_time=all_time)
+    stats = {
+        "total": await count_cases(db, since_iso=since_iso),
+        "by_crime_type": await stats_cases_by_crime_type(db, since_iso=since_iso),
+        "by_sector": await stats_cases_by_sector(db, since_iso=since_iso),
+        "by_country": await stats_cases_by_country(db, since_iso=since_iso),
+        "by_actor": await stats_cases_by_actor(db, since_iso=since_iso),
+        "in_kev": await stats_cases_in_kev(db, since_iso=since_iso),
+    }
+    actor_trends = await stats_trends(db, dimension="actor", window_days=trend_window_days, limit=15)
+    sector_trends = await stats_trends(db, dimension="sector", window_days=trend_window_days, limit=15)
+    cve_trends = await stats_trends(db, dimension="cve", window_days=trend_window_days, limit=15)
+
+    markdown = _landscape_snapshot_markdown(
+        since_iso=since_iso, since_days=since_days, stats=stats,
+        actor_trends=actor_trends, sector_trends=sector_trends, cve_trends=cve_trends,
+    )
+    return PlainTextResponse(
+        markdown, media_type="text/markdown",
+        headers={"Content-Disposition": 'attachment; filename="landscape-snapshot.md"'},
+    )
 
 
 # ── Analyst feedback ─────────────────────────────────────────────────────────
@@ -585,3 +846,24 @@ async def api_heal_proposals(db=Depends(get_db), status: str | None = Query(defa
     from ..db import get_heal_proposals
 
     return {"proposals": await get_heal_proposals(db, status=status)}
+
+
+# ── AI activity log ───────────────────────────────────────────────────────────
+# Deliberately public, no admin token — every subsystem here (discover/heal/
+# prune/research/classifier/correlator/cross_correlator) already acts fully
+# autonomously with no human approval gate; this is the transparency
+# counterpart, not an admin control surface. See db.py's ai_activity table
+# docstring and db.log_ai_activity.
+
+@router.get("/api/activity")
+async def api_activity(
+    db=Depends(get_db),
+    subsystem: str | None = Query(default=None),
+    status: str | None = Query(default=None),
+    since: str | None = Query(default=None),
+    limit: int = Query(default=50, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    return await list_ai_activity(
+        db, subsystem=subsystem, status=status, since=since, limit=limit, offset=offset
+    )

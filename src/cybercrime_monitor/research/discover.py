@@ -87,6 +87,24 @@ def get() -> DiscoverHealth:
     return _health
 
 
+async def _log_activity(
+    db_conn, *, action: str, summary: str, detail: dict | None = None,
+    status: str = "ok", ref_id: str | None = None,
+) -> None:
+    """Write to ai_activity and fan it out over SSE — see db.log_ai_activity's
+    docstring. Swallows its own errors: activity logging must never be the
+    reason a discover tick fails."""
+    try:
+        event = await db.log_ai_activity(
+            db_conn, subsystem="discover", action=action, summary=summary,
+            detail=detail, status=status, ref_type="source", ref_id=ref_id,
+            model=settings.hermes_model or None,
+        )
+        await broadcaster.broadcast_activity(event)
+    except Exception as exc:
+        log.error("[discover] activity log failed: %s", exc)
+
+
 _DISCOVER_PROMPT_TEMPLATE = """\
 You are assisting in expanding a cybercrime OSINT monitor's data sources. \
 The monitor currently tracks these topics: {topics}. It already has these \
@@ -187,6 +205,12 @@ async def _try_add_candidate(
     m = re.search(r"://([^/]+)/?", feed_url)
     domain = m.group(1).lower() if m else ""
     if not domain or domain in existing_domains:
+        if domain:
+            await _log_activity(
+                db_conn, action="candidate_skipped", status="skipped",
+                summary=f"Skipped discovered candidate '{name}' — domain already a source",
+                detail={"feed_url": feed_url, "domain": domain},
+            )
         return False
 
     source_id = _slugify(name)
@@ -215,6 +239,11 @@ async def _try_add_candidate(
 
     if not probe_ok:
         await db.update_heal_proposal_status(db_conn, proposal_id=proposal_id, status="probe_failed")
+        await _log_activity(
+            db_conn, action="probe_failed", status="error",
+            summary=f"Discovered candidate '{name}' failed feed probe ({feed_url})",
+            detail={"feed_url": feed_url, "reason": cand.get("reason")}, ref_id=source_id,
+        )
         return False
 
     await db.update_heal_proposal_status(db_conn, proposal_id=proposal_id, status="validated")
@@ -240,6 +269,11 @@ async def _try_add_candidate(
 
     await db.record_applied_change(db_conn, proposal_id=proposal_id, before={}, after=after)
     log.info("[discover] added new probationary source %s (%s)", source_id, feed_url)
+    await _log_activity(
+        db_conn, action="source_added",
+        summary=f"Discovered and added new source '{source_id}' ({name})",
+        detail={"feed_url": feed_url, "reason": cand.get("reason"), "after": after}, ref_id=source_id,
+    )
 
     if scheduler is not None:
         fresh = next((s for s in load_sources() if s["id"] == source_id), None)
