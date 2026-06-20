@@ -569,7 +569,7 @@ def _case_to_markdown(case: dict, items: list[dict], research_runs: list[dict], 
     lines.append(f"- **Last seen:** {case.get('last_seen') or ''}")
     lines.append(f"- **Sources:** {case.get('source_count', 0)}")
     if case.get("cve_ids"):
-        lines.append(f"- **CVEs:** {', '.join(case['cve_ids'])}")
+        lines.append(f"- **CVEs:** {', '.join(_escape_markdown(c) for c in case['cve_ids'])}")
     lines.append("")
 
     if case.get("summary"):
@@ -586,7 +586,11 @@ def _case_to_markdown(case: dict, items: list[dict], research_runs: list[dict], 
             ts = it.get("published_at") or it.get("seen_at") or ""
             source = _escape_markdown(it.get("source_name") or it.get("source_id") or "?")
             title = _escape_markdown(it.get("title") or "")
-            lines.append(f"- [{source}]({it['url']}) — {title} ({ts})")
+            url = str(it.get("url") or "")
+            if url:
+                lines.append(f"- [{source}](<{url}>) — {title} ({ts})")
+            else:
+                lines.append(f"- {source} — {title} ({ts})")
         lines.append("")
 
     if research_runs:
@@ -742,7 +746,7 @@ def _landscape_snapshot_markdown(
         if not rows:
             lines.append("_None._")
         for r in rows[:15]:
-            lines.append(f"- {r[key]}: {r['n']}")
+            lines.append(f"- {_escape_markdown(r[key])}: {r['n']}")
         lines.append("")
 
     _bullet_section("Crime types", stats["by_crime_type"], "crime_type")
@@ -757,7 +761,7 @@ def _landscape_snapshot_markdown(
             lines.append("_No movement this window._")
         for r in rows[:10]:
             kev = " ⚠ KEV" if r.get("in_kev") else ""
-            lines.append(f"- {r['value']}{kev}: {r['status']} ({r['current']}, Δ{r['delta']:+d})")
+            lines.append(f"- {_escape_markdown(r['value'])}{kev}: {r['status']} ({r['current']}, Δ{r['delta']:+d})")
         lines.append("")
 
     _trend_section("Emerging/rising actors", [r for r in actor_trends if r["status"] in ("emerging", "rising")])

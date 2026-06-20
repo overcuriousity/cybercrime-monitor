@@ -457,5 +457,16 @@ async def _maybe_remove_source(db_conn, source: dict, value: dict) -> None:
     await _log_activity(
         db_conn, subsystem="prune", action="source_removed",
         summary=f"Removed source '{source['id']}' after {settings.source_prune_grace_days}d grace period",
-        detail={"before": before}, ref_id=source["id"],
+        detail={
+            "before": {
+                "id": before.get("id", source["id"]),
+                "name": before.get("name"),
+                "type": before.get("type"),
+                "url": before.get("url"),
+                "enabled": before.get("enabled"),
+                "interval_seconds": before.get("interval_seconds"),
+                "source_tags": before.get("source_tags"),
+            },
+        },
+        ref_id=source["id"],
     )
