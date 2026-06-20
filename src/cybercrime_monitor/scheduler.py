@@ -220,6 +220,10 @@ def build_scheduler(db_conn, sse_broadcaster) -> AsyncIOScheduler:
                 await db_module.prune_old_items(conn, retention_days=settings.retention_days)
             except Exception as exc:
                 log.error("[retention] prune failed: %s", exc)
+            try:
+                await db_module.prune_old_activity(conn, retention_days=settings.retention_days)
+            except Exception as exc:
+                log.error("[retention] activity prune failed: %s", exc)
 
         scheduler.add_job(
             _run_retention,

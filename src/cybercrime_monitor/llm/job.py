@@ -17,12 +17,18 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from .. import db
+from ..api.sse import broadcaster
 from ..notifier import push_gotify
 from ..settings import settings
 from . import backend
 from . import health as llm_health
 
 log = logging.getLogger(__name__)
+
+# Item-level extraction would flood ai_activity (every classified item, all
+# day) — so the classifier logs one summary row per batch tick, plus an
+# item-level row only for the verdicts an analyst actually wants surfaced
+# individually (critical, or a flagged false positive).
 
 # A model that systematically fails on certain items (wrong chat template,
 # JSON mode misconfigured, etc.) must never get a fabricated/regex-derived
@@ -71,6 +77,24 @@ def _is_low_confidence(extraction) -> bool:
     )
 
 
+async def _log_activity(
+    db_conn, *, action: str, summary: str, detail: dict | None = None,
+    status: str = "ok", ref_type: str | None = None, ref_id: int | str | None = None,
+    model: str | None = None,
+) -> None:
+    """Write to ai_activity and fan it out over SSE — see db.log_ai_activity's
+    docstring. Swallows its own errors: activity logging must never be the
+    reason an extraction batch fails."""
+    try:
+        event = await db.log_ai_activity(
+            db_conn, subsystem="classifier", action=action, summary=summary,
+            detail=detail, status=status, ref_type=ref_type, ref_id=ref_id, model=model,
+        )
+        await broadcaster.broadcast_activity(event)
+    except Exception as exc:
+        log.error("[llm] activity log failed: %s", exc)
+
+
 async def run_extraction_batch(db_conn) -> None:
     if settings.llm_backend == "none":
         return
@@ -108,6 +132,10 @@ async def _extract_batch(db_conn) -> int:
     # serves LIFO: a slow per-item loop is exactly what lets a sustained
     # ingest burst starve older items indefinitely.
     extractions = await backend.extract_batch(batch)
+
+    critical_count = 0
+    false_positive_count = 0
+    model_used = None
 
     for item, extraction in zip(batch, extractions):
         if extraction is None:
@@ -153,10 +181,45 @@ async def _extract_batch(db_conn) -> int:
             model=extraction.model,
         )
         extracted_count += 1
+        model_used = extraction.model or model_used
+        if effective_false_positive:
+            false_positive_count += 1
 
         if extraction.significance == "critical" and not effective_false_positive:
+            critical_count += 1
             title, message = _gotify_payload(item, low_confidence=low_confidence)
             await push_gotify(title=title, message=message, priority=8)
+            await _log_activity(
+                db_conn, action="item_classified_critical",
+                summary=f"Critical: {item['source_name']} — {item['title'][:80]}",
+                detail={
+                    "crime_type": extraction.crime_type, "victim": extraction.victim,
+                    "actor": extraction.actor, "confidence": extraction.confidence,
+                    "low_confidence": low_confidence, "url": item["url"],
+                },
+                ref_type="item", ref_id=item["id"], model=extraction.model,
+            )
+        elif effective_false_positive:
+            await _log_activity(
+                db_conn, action="item_classified_false_positive", status="skipped",
+                summary=f"Flagged as false positive: {item['source_name']} — {item['title'][:80]}",
+                detail={"reasoning": extraction.reasoning, "confidence": extraction.confidence, "url": item["url"]},
+                ref_type="item", ref_id=item["id"], model=extraction.model,
+            )
+
+    if extracted_count:
+        await _log_activity(
+            db_conn, action="batch_classified",
+            summary=(
+                f"Classified {extracted_count} item(s) — {critical_count} critical, "
+                f"{false_positive_count} false positive"
+            ),
+            detail={
+                "extracted_count": extracted_count, "critical_count": critical_count,
+                "false_positive_count": false_positive_count,
+            },
+            model=model_used,
+        )
 
     return extracted_count
 
@@ -191,4 +254,10 @@ async def _run_fallback_sweep(db_conn) -> None:
             "(backend unreachable?)",
             item["id"],
             settings.llm_fallback_alert_minutes,
+        )
+        await _log_activity(
+            db_conn, action="fallback_alerted", status="error",
+            summary=f"LLM backend unreachable — regex-fallback alerted item #{item['id']}",
+            detail={"url": item["url"], "title": item["title"]},
+            ref_type="item", ref_id=item["id"], model="fallback-timeout",
         )

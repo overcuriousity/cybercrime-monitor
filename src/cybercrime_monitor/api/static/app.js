@@ -77,6 +77,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   initCases();
   initStatusBar();
+  initActivity();
+  initLandscape();
 
   searchInput.addEventListener('input', debounce(() => {
     state.filters.search = searchInput.value.trim();
@@ -676,6 +678,8 @@ function connectSSE() {
     try { payload = JSON.parse(ev.data); } catch { return; }
     if (payload && payload.type === 'status') {
       handleStatusEvent(payload);
+    } else if (payload && payload.type === 'activity') {
+      handleLiveActivity(payload);
     } else {
       handleLiveItem(payload);
     }
@@ -849,6 +853,14 @@ const PRIO_COLORS = {
   none: '#30363d',
 };
 
+// Cycled for Landscape's crime-type doughnut, which has an open-ended
+// number of categories (unlike priority's fixed 4) — distinct enough hues
+// to stay readable up to a dozen-ish slices.
+const CHART_PALETTE = [
+  '#388bfd', '#3fb950', '#e3b341', '#f85149', '#bc8cff',
+  '#56d4dd', '#f778ba', '#ffa657', '#79c0ff', '#7ee787',
+];
+
 function initDashboard() {
   Chart.defaults.color = '#8b949e';
   Chart.defaults.borderColor = '#30363d';
@@ -990,6 +1002,383 @@ function renderActorsBar(actors) {
 // expose for banner button
 window.applyFilters = applyFilters;
 
+// ── Landscape ──────────────────────────────────────────────────────────────
+// Case-layer (deduplicated incident) situational-awareness view — see
+// GET /api/stats/cases and /api/stats/cases/timeseries. Reuses dashCharts/
+// upsertChart/PRIO_COLORS from the Feed tab's dashboard above.
+
+const landscapeState = { windowDays: 30 };
+const ACTOR_BAR_COLOR = '#bc8cff';
+
+const landscapeWindowSelect = document.getElementById('landscape-window-select');
+const landscapeExportBtn = document.getElementById('landscape-export-btn');
+const actorProfileOverlay = document.getElementById('actor-profile-overlay');
+const actorProfileContent = document.getElementById('actor-profile-content');
+const actorProfileClose = document.getElementById('actor-profile-close');
+
+function initLandscape() {
+  landscapeWindowSelect.addEventListener('change', () => {
+    landscapeState.windowDays = landscapeWindowSelect.value ? parseInt(landscapeWindowSelect.value, 10) : null;
+    loadLandscape();
+  });
+  actorProfileClose.addEventListener('click', closeActorProfile);
+  actorProfileOverlay.addEventListener('click', (e) => {
+    if (e.target === actorProfileOverlay) closeActorProfile();
+  });
+  landscapeExportBtn.addEventListener('click', () => {
+    const params = new URLSearchParams();
+    if (landscapeState.windowDays) params.set('since_days', landscapeState.windowDays);
+    params.set('trend_window_days', emergingTrendWindowDays());
+    window.location.href = '/api/stats/landscape/export?' + params.toString();
+  });
+  loadLandscape();
+}
+
+function landscapeSinceDaysParam() {
+  return landscapeState.windowDays ? `since_days=${landscapeState.windowDays}` : '';
+}
+
+async function loadLandscape() {
+  try {
+    const sinceParam = landscapeSinceDaysParam();
+    const bucket = (landscapeState.windowDays && landscapeState.windowDays <= 60) ? 'day' : 'month';
+    const tsParams = new URLSearchParams();
+    if (landscapeState.windowDays) tsParams.set('since_days', landscapeState.windowDays);
+    else tsParams.set('since_days', 3650); // "all time" — bounded so the query stays sane
+    tsParams.set('bucket', bucket);
+
+    const [stats, timeseries] = await Promise.all([
+      api('/api/stats/cases' + (sinceParam ? '?' + sinceParam : '')),
+      api('/api/stats/cases/timeseries?' + tsParams.toString()),
+    ]);
+
+    document.getElementById('landscape-gauge-total').textContent = stats.total.toLocaleString();
+    document.getElementById('landscape-gauge-kev').textContent = stats.in_kev.toLocaleString();
+    document.getElementById('landscape-gauge-sectors').textContent = stats.by_sector.length.toLocaleString();
+    document.getElementById('landscape-gauge-actors').textContent = stats.by_actor.length.toLocaleString();
+
+    renderLandscapeVolume(timeseries.buckets, bucket);
+    renderLandscapeCrimeType(stats.by_crime_type);
+    renderLandscapeCountry(stats.by_country);
+    renderLandscapeSector(stats.by_sector);
+    renderLandscapeActors(stats.by_actor);
+    renderEmergingPanels();
+  } catch (e) {
+    console.error('Failed to load landscape', e);
+  }
+}
+
+function renderLandscapeVolume(buckets, bucketType) {
+  upsertChart('chart-landscape-volume', {
+    type: 'bar',
+    data: {
+      labels: buckets.map(b => b.bucket),
+      datasets: ['info', 'warn', 'critical'].map(p => ({
+        label: p,
+        data: buckets.map(b => b[p] || 0),
+        backgroundColor: PRIO_COLORS[p],
+        stack: 'a',
+      })),
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: { x: { stacked: true, ticks: { maxTicksLimit: 16 } }, y: { stacked: true, beginAtZero: true } },
+      plugins: { legend: { display: true, position: 'bottom' } },
+    },
+  });
+}
+
+function renderLandscapeCrimeType(byCrimeType) {
+  upsertChart('chart-landscape-crimetype', {
+    type: 'doughnut',
+    data: {
+      labels: byCrimeType.map(r => r.crime_type),
+      datasets: [{
+        data: byCrimeType.map(r => r.n),
+        backgroundColor: byCrimeType.map((_, i) => CHART_PALETTE[i % CHART_PALETTE.length]),
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: true, position: 'bottom' } },
+    },
+  });
+}
+
+function renderLandscapeCountry(byCountry) {
+  const top = byCountry.slice(0, 12);
+  upsertChart('chart-landscape-country', {
+    type: 'bar',
+    data: {
+      labels: top.map(r => r.country),
+      datasets: [{ label: 'victims', data: top.map(r => r.n), backgroundColor: '#388bfd' }],
+    },
+    options: {
+      indexAxis: 'y',
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { x: { beginAtZero: true } },
+    },
+  });
+}
+
+function renderLandscapeSector(bySector) {
+  const top = bySector.slice(0, 12);
+  upsertChart('chart-landscape-sector', {
+    type: 'bar',
+    data: {
+      labels: top.map(r => r.sector),
+      datasets: [{ label: 'cases', data: top.map(r => r.n), backgroundColor: '#3fb950' }],
+    },
+    options: {
+      indexAxis: 'y',
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { x: { beginAtZero: true } },
+    },
+  });
+}
+
+function renderLandscapeActors(byActor) {
+  const top = byActor.slice(0, 12);
+  const chart = upsertChart('chart-landscape-actors', {
+    type: 'bar',
+    data: {
+      labels: top.map(r => r.actor),
+      datasets: [{ label: 'cases', data: top.map(r => r.n), backgroundColor: ACTOR_BAR_COLOR }],
+    },
+    options: {
+      indexAxis: 'y',
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { x: { beginAtZero: true } },
+      onClick: (evt, elements) => {
+        if (!elements.length) return;
+        const actor = top[elements[0].index]?.actor;
+        if (actor) openActorProfile(actor);
+      },
+      onHover: (evt, elements) => {
+        evt.native.target.style.cursor = elements.length ? 'pointer' : 'default';
+      },
+    },
+  });
+  return chart;
+}
+
+// ── Emerging-trends panels ──────────────────────────────────────────────────
+// Week-over-week (or whatever window the Landscape selector implies) actor/
+// sector/CVE movement — see GET /api/stats/trends. Trend window is distinct
+// from the Landscape volume/breakdown window above: those show "what's in
+// this window," this shows "what's *changing* between this window and the
+// one before it," which only makes sense at a bounded, comparable size (capped
+// at 30 days — "all time vs. the all time before that" isn't meaningful).
+const TREND_STATUS_LABEL = { emerging: 'NEW', rising: '▲', flat: '–', declining: '▼' };
+
+function emergingTrendWindowDays() {
+  const w = landscapeState.windowDays;
+  if (!w || w > 30) return 7;
+  return w;
+}
+
+async function renderEmergingPanels() {
+  const windowDays = emergingTrendWindowDays();
+  const row = document.getElementById('landscape-emerging-row');
+  try {
+    const [actorTrends, sectorTrends, cveTrends] = await Promise.all([
+      api(`/api/stats/trends?dimension=actor&window_days=${windowDays}&limit=8`),
+      api(`/api/stats/trends?dimension=sector&window_days=${windowDays}&limit=8`),
+      api(`/api/stats/trends?dimension=cve&window_days=${windowDays}&limit=8`),
+    ]);
+    row.innerHTML = '';
+    row.appendChild(buildEmergingPanel(`Actors (${windowDays}d vs prior)`, actorTrends.trends));
+    row.appendChild(buildEmergingPanel(`Sectors (${windowDays}d vs prior)`, sectorTrends.trends));
+    row.appendChild(buildEmergingPanel(`CVEs (${windowDays}d vs prior)`, cveTrends.trends, true));
+  } catch (e) {
+    console.error('Failed to load trends', e);
+  }
+}
+
+function buildEmergingPanel(title, trends, showKev = false) {
+  const panel = document.createElement('div');
+  panel.className = 'emerging-panel';
+  const h = document.createElement('h3');
+  h.textContent = title;
+  panel.appendChild(h);
+
+  if (!trends.length) {
+    const empty = document.createElement('p');
+    empty.className = 'hint';
+    empty.textContent = 'No activity in this window.';
+    panel.appendChild(empty);
+    return panel;
+  }
+
+  trends.forEach(t => {
+    const row = document.createElement('div');
+    row.className = 'emerging-row';
+
+    const label = document.createElement('span');
+    label.className = 'emerging-label';
+    label.textContent = t.value + (showKev && t.in_kev ? ' ⚠ KEV' : '');
+    row.appendChild(label);
+
+    const delta = document.createElement('span');
+    delta.className = 'emerging-delta trend-' + t.status;
+    const deltaSign = t.delta > 0 ? '+' : '';
+    delta.textContent = `${TREND_STATUS_LABEL[t.status] || ''} ${t.current} (${deltaSign}${t.delta})`;
+    row.appendChild(delta);
+
+    panel.appendChild(row);
+  });
+  return panel;
+}
+
+// ── Actor profile overlay ──────────────────────────────────────────────────
+function closeActorProfile() {
+  actorProfileOverlay.classList.add('hidden');
+  // The sparkline's canvas is destroyed along with this innerHTML wipe —
+  // drop its Chart.js instance too, or the next openActorProfile's
+  // upsertChart('chart-actor-sparkline', ...) would try to .update() a
+  // chart bound to a now-detached canvas instead of building a fresh one.
+  if (dashCharts['chart-actor-sparkline']) {
+    dashCharts['chart-actor-sparkline'].destroy();
+    delete dashCharts['chart-actor-sparkline'];
+  }
+  actorProfileContent.innerHTML = '';
+}
+
+async function openActorProfile(actor) {
+  actorProfileOverlay.classList.remove('hidden');
+  if (dashCharts['chart-actor-sparkline']) {
+    dashCharts['chart-actor-sparkline'].destroy();
+    delete dashCharts['chart-actor-sparkline'];
+  }
+  actorProfileContent.innerHTML = '';
+  const loading = document.createElement('p');
+  loading.className = 'hint';
+  loading.textContent = `Loading profile for ${actor}…`;
+  actorProfileContent.appendChild(loading);
+
+  try {
+    const profile = await api(`/api/actors/${encodeURIComponent(actor)}`);
+    renderActorProfile(profile);
+  } catch (e) {
+    actorProfileContent.innerHTML = '';
+    const err = document.createElement('p');
+    err.className = 'hint';
+    err.textContent = `Failed to load profile: ${e}`;
+    actorProfileContent.appendChild(err);
+  }
+}
+
+function renderActorProfile(profile) {
+  actorProfileContent.innerHTML = '';
+
+  const h = document.createElement('h2');
+  h.textContent = profile.actor;
+  actorProfileContent.appendChild(h);
+
+  const summary = document.createElement('div');
+  summary.className = 'gauge-row actor-profile-stats';
+  [
+    ['Cases', profile.case_count],
+    ['Victims', profile.victim_count],
+    ['Sectors', profile.sectors.length],
+    ['Countries', profile.countries.length],
+    ['CVEs used', profile.cve_ids.length],
+  ].forEach(([label, value]) => {
+    const card = document.createElement('div');
+    card.className = 'gauge-card';
+    const v = document.createElement('div');
+    v.className = 'gauge-value';
+    v.textContent = value;
+    const l = document.createElement('div');
+    l.className = 'gauge-label';
+    l.textContent = label;
+    card.appendChild(v);
+    card.appendChild(l);
+    summary.appendChild(card);
+  });
+  actorProfileContent.appendChild(summary);
+
+  if (profile.first_seen || profile.last_seen) {
+    const range = document.createElement('p');
+    range.className = 'hint';
+    range.textContent = `Active ${fmtTime(profile.first_seen)} → ${fmtTime(profile.last_seen)}`;
+    actorProfileContent.appendChild(range);
+  }
+
+  if (profile.sectors.length || profile.countries.length) {
+    const chipsWrap = document.createElement('div');
+    chipsWrap.className = 'item-meta';
+    profile.sectors.forEach(s => {
+      const chip = document.createElement('span');
+      chip.className = 'tag-chip';
+      chip.textContent = s;
+      chipsWrap.appendChild(chip);
+    });
+    profile.countries.forEach(c => {
+      const chip = document.createElement('span');
+      chip.className = 'tag-chip cluster-chip';
+      chip.textContent = c;
+      chipsWrap.appendChild(chip);
+    });
+    actorProfileContent.appendChild(chipsWrap);
+  }
+
+  if (profile.activity && profile.activity.length) {
+    const sparklineWrap = document.createElement('div');
+    sparklineWrap.className = 'chart-canvas';
+    sparklineWrap.style.height = '120px';
+    sparklineWrap.style.marginTop = '14px';
+    const canvas = document.createElement('canvas');
+    canvas.id = 'chart-actor-sparkline';
+    sparklineWrap.appendChild(canvas);
+    actorProfileContent.appendChild(sparklineWrap);
+    // Deferred one tick so the canvas is attached to the DOM (Chart.js needs
+    // a laid-out element) before Chart.js measures it.
+    setTimeout(() => {
+      upsertChart('chart-actor-sparkline', {
+        type: 'line',
+        data: {
+          labels: profile.activity.map(a => a.bucket),
+          datasets: [{ data: profile.activity.map(a => a.n), borderColor: ACTOR_BAR_COLOR, tension: 0.3 }],
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: { y: { beginAtZero: true, ticks: { precision: 0 } } },
+        },
+      });
+    }, 0);
+  }
+
+  const list = document.createElement('div');
+  list.className = 'actor-profile-cases';
+  profile.cases.forEach(c => {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'related-case-card';
+    row.textContent = `${c.title} — ${c.damaged_party_sector || 'unknown sector'}, ${c.damaged_party_country || 'unknown country'}`;
+    row.addEventListener('click', () => {
+      closeActorProfile();
+      document.querySelector('.tab[data-tab="cases"]').click();
+      selectCase(c.id);
+    });
+    list.appendChild(row);
+  });
+  actorProfileContent.appendChild(list);
+}
+
+// expose for the actor leaderboard's onClick
+window.openActorProfile = openActorProfile;
+
 // ── Cases ──────────────────────────────────────────────────────────────────
 // Case-centric view on top of pipeline/correlate.py's deduplicated incidents
 // — distinct from the raw Feed tab above. See /api/cases* (api/routes.py).
@@ -1002,8 +1391,9 @@ const casesState = {
   pageSize: 50,
   hasMore: false,
   selectedId: null,
-  filters: { search: '', significance: '', kevOnly: false, crimeType: '', since: '', until: '' },
+  filters: { search: '', significance: '', kevOnly: false, crimeType: '', since: '', until: '', cveId: '', ioc: '' },
 };
+const CASE_FILTERS_DEFAULT = { ...casesState.filters };
 
 const casesList        = document.getElementById('cases-list');
 const casesEmpty       = document.getElementById('cases-empty');
@@ -1044,13 +1434,20 @@ function initCases() {
     applyCaseFilters();
   });
   caseFiltersClear.addEventListener('click', () => {
-    casesState.filters = { search: '', significance: '', kevOnly: false, crimeType: '', since: '', until: '' };
+    casesState.filters = { ...CASE_FILTERS_DEFAULT };
     caseSearchInput.value = '';
     caseKevOnlyCb.checked = false;
     caseSignificanceSelect.value = '';
     caseCrimeTypeSelect.value = '';
     caseSinceInput.value = '';
     caseUntilInput.value = '';
+    updateIndicatorPivotBanner();
+    applyCaseFilters();
+  });
+  document.getElementById('case-pivot-clear').addEventListener('click', () => {
+    casesState.filters.cveId = '';
+    casesState.filters.ioc = '';
+    updateIndicatorPivotBanner();
     applyCaseFilters();
   });
   casesLoadMoreBtn.addEventListener('click', loadMoreCases);
@@ -1068,8 +1465,39 @@ function caseQueryParams(extra = {}) {
   if (casesState.filters.crimeType) params.set('crime_type', casesState.filters.crimeType);
   if (casesState.filters.since) params.set('since', casesState.filters.since);
   if (casesState.filters.until) params.set('until', casesState.filters.until);
+  if (casesState.filters.cveId) params.set('cve_id', casesState.filters.cveId);
+  if (casesState.filters.ioc) params.set('ioc', casesState.filters.ioc);
   Object.entries(extra).forEach(([k, v]) => params.set(k, v));
   return params.toString();
+}
+
+// ── Indicator pivot (CVE/IoC chips in the case detail pane) ────────────────
+// "Click a CVE/IoC -> every other case sharing it" — see GET /api/cases'
+// cve_id/ioc filters (db._build_cases_where). Resets the other case filters
+// so the pivot shows the complete picture rather than a stale, narrowed one.
+function pivotCasesByIndicator(kind, value) {
+  casesState.filters = { ...CASE_FILTERS_DEFAULT, [kind]: value };
+  caseSearchInput.value = '';
+  caseKevOnlyCb.checked = false;
+  caseSignificanceSelect.value = '';
+  caseCrimeTypeSelect.value = '';
+  caseSinceInput.value = '';
+  caseUntilInput.value = '';
+  updateIndicatorPivotBanner();
+  document.querySelector('.tab[data-tab="cases"]').click();
+  applyCaseFilters();
+}
+
+function updateIndicatorPivotBanner() {
+  const banner = document.getElementById('case-pivot-banner');
+  const label = document.getElementById('case-pivot-label');
+  const value = casesState.filters.cveId || casesState.filters.ioc;
+  if (!value) {
+    banner.classList.add('hidden');
+    return;
+  }
+  label.textContent = `Showing cases sharing ${casesState.filters.cveId ? 'CVE' : 'IoC'}: ${value}`;
+  banner.classList.remove('hidden');
 }
 
 async function applyCaseFilters() {
@@ -1242,6 +1670,13 @@ function renderCaseDetail(c, items, researchRuns, relatedCases) {
     chip.textContent = c.significance.toUpperCase();
     header.appendChild(chip);
   }
+  const exportLink = document.createElement('a');
+  exportLink.className = 'link-button';
+  exportLink.href = `/api/cases/${c.id}/export?format=md`;
+  exportLink.textContent = 'Export (.md)';
+  exportLink.setAttribute('download', '');
+  header.appendChild(exportLink);
+
   caseDetailPane.appendChild(header);
 
   // ── Field grid ──
@@ -1254,7 +1689,6 @@ function renderCaseDetail(c, items, researchRuns, relatedCases) {
     ['Country', c.damaged_party_country],
     ['Attribution', c.attribution],
     ['Status', c.status],
-    ['CVEs', (c.cve_ids || []).join(', ') || null],
     ['In KEV', c.in_kev ? 'yes' : 'no'],
     ['First seen', fmtTime(c.first_seen)],
     ['Last seen', fmtTime(c.last_seen)],
@@ -1267,6 +1701,30 @@ function renderCaseDetail(c, items, researchRuns, relatedCases) {
     row.innerHTML = `<b>${escHtml(label)}:</b> ${escHtml(String(value))}`;
     grid.appendChild(row);
   });
+
+  // CVEs get their own pivotable-chip row instead of a plain joined string —
+  // each one is a click-through to every other case citing the same CVE.
+  if (c.cve_ids && c.cve_ids.length) {
+    const cveRow = document.createElement('div');
+    cveRow.className = 'hint';
+    const label = document.createElement('b');
+    label.textContent = 'CVEs: ';
+    cveRow.appendChild(label);
+    const chipWrap = document.createElement('span');
+    chipWrap.className = 'ioc-chip-row inline-chip-row';
+    c.cve_ids.forEach(cveId => {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'ioc-chip ioc-chip-clickable';
+      chip.textContent = cveId;
+      chip.title = `Show every case citing ${cveId}`;
+      chip.addEventListener('click', () => pivotCasesByIndicator('cveId', cveId));
+      chipWrap.appendChild(chip);
+    });
+    cveRow.appendChild(chipWrap);
+    grid.appendChild(cveRow);
+  }
+
   caseDetailPane.appendChild(grid);
 
   if (c.summary) {
@@ -1284,9 +1742,12 @@ function renderCaseDetail(c, items, researchRuns, relatedCases) {
     const row = document.createElement('div');
     row.className = 'ioc-chip-row';
     c.iocs.forEach(ioc => {
-      const chip = document.createElement('span');
-      chip.className = 'ioc-chip';
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'ioc-chip ioc-chip-clickable';
       chip.textContent = ioc;
+      chip.title = `Show every case sharing this indicator`;
+      chip.addEventListener('click', () => pivotCasesByIndicator('ioc', ioc));
       row.appendChild(chip);
     });
     caseDetailPane.appendChild(row);
@@ -1522,4 +1983,171 @@ function handleStatusEvent(payload) {
   // individual subsystems. Refresh the bar from the server to keep it simple
   // and consistent.
   updateStatusBar();
+}
+
+// ── AI Activity log ───────────────────────────────────────────────────────
+// Public, no admin token — see GET /api/activity and db.py's ai_activity
+// table docstring. Every row here is something an AI subsystem did fully
+// autonomously; this tab is the transparency record, not a control surface
+// (there is deliberately no approve/revert action here).
+
+const activityState = {
+  events: [],
+  offset: 0,
+  pageSize: 50,
+  hasMore: false,
+  pendingLive: [],
+  filters: { subsystem: '', status: '' },
+};
+
+const activityList       = document.getElementById('activity-list');
+const activityEmpty      = document.getElementById('activity-empty');
+const activityLoadMoreBtn = document.getElementById('activity-load-more');
+const activityNewBanner  = document.getElementById('activity-new-banner');
+const activitySubsystemSelect = document.getElementById('activity-subsystem-select');
+const activityStatusSelect    = document.getElementById('activity-status-select');
+const activityFiltersClear    = document.getElementById('activity-filters-clear');
+
+function initActivity() {
+  activitySubsystemSelect.addEventListener('change', () => {
+    activityState.filters.subsystem = activitySubsystemSelect.value;
+    applyActivityFilters();
+  });
+  activityStatusSelect.addEventListener('change', () => {
+    activityState.filters.status = activityStatusSelect.value;
+    applyActivityFilters();
+  });
+  activityFiltersClear.addEventListener('click', () => {
+    activityState.filters = { subsystem: '', status: '' };
+    activitySubsystemSelect.value = '';
+    activityStatusSelect.value = '';
+    applyActivityFilters();
+  });
+  activityLoadMoreBtn.addEventListener('click', loadMoreActivity);
+  applyActivityFilters();
+}
+
+function activityQueryParams(extra = {}) {
+  const params = new URLSearchParams();
+  if (activityState.filters.subsystem) params.set('subsystem', activityState.filters.subsystem);
+  if (activityState.filters.status) params.set('status', activityState.filters.status);
+  Object.entries(extra).forEach(([k, v]) => params.set(k, v));
+  return params.toString();
+}
+
+async function applyActivityFilters() {
+  activityState.offset = 0;
+  activityNewBanner.classList.add('hidden');
+  activityState.pendingLive = [];
+  try {
+    const data = await api('/api/activity?' + activityQueryParams({ limit: activityState.pageSize, offset: 0 }));
+    activityState.events = data.events;
+    activityState.hasMore = data.events.length === activityState.pageSize && data.total > activityState.pageSize;
+    renderActivityList();
+  } catch (e) {
+    console.error('Failed to load activity', e);
+  }
+}
+
+async function loadMoreActivity() {
+  activityState.offset += activityState.pageSize;
+  try {
+    const data = await api(
+      '/api/activity?' + activityQueryParams({ limit: activityState.pageSize, offset: activityState.offset })
+    );
+    activityState.events = activityState.events.concat(data.events);
+    activityState.hasMore = data.events.length === activityState.pageSize;
+    renderActivityList();
+  } catch (e) {
+    console.error('Failed to load more activity', e);
+  }
+}
+
+function renderActivityList() {
+  activityList.innerHTML = '';
+  activityEmpty.classList.toggle('hidden', activityState.events.length > 0);
+  activityState.events.forEach(ev => activityList.appendChild(buildActivityRow(ev)));
+  activityLoadMoreBtn.classList.toggle('hidden', !activityState.hasMore);
+}
+
+function buildActivityRow(ev) {
+  const row = document.createElement('div');
+  row.className = 'item-card activity-row status-' + (ev.status || 'ok');
+
+  const meta = document.createElement('div');
+  meta.className = 'item-meta';
+
+  const time = document.createElement('span');
+  time.className = 'item-time';
+  time.textContent = fmtTime(ev.ts);
+  meta.appendChild(time);
+
+  const subsystemChip = document.createElement('span');
+  subsystemChip.className = 'tag-chip activity-subsystem-' + ev.subsystem;
+  subsystemChip.textContent = ev.subsystem;
+  meta.appendChild(subsystemChip);
+
+  if (ev.status && ev.status !== 'ok') {
+    const statusChip = document.createElement('span');
+    statusChip.className = 'tag-chip prio-' + (ev.status === 'error' ? 'critical' : 'warn');
+    statusChip.textContent = ev.status;
+    meta.appendChild(statusChip);
+  }
+
+  if (ev.model) {
+    const modelChip = document.createElement('span');
+    modelChip.className = 'tag-chip';
+    modelChip.textContent = ev.model;
+    meta.appendChild(modelChip);
+  }
+
+  row.appendChild(meta);
+
+  const summary = document.createElement('div');
+  summary.className = 'item-title';
+  summary.textContent = ev.summary;
+  row.appendChild(summary);
+
+  if (ev.ref_type === 'case' && ev.ref_id) {
+    const link = document.createElement('button');
+    link.className = 'link-button';
+    link.type = 'button';
+    link.textContent = `→ Open case #${ev.ref_id}`;
+    link.addEventListener('click', () => {
+      document.querySelector('.tab[data-tab="cases"]').click();
+      selectCase(Number(ev.ref_id));
+    });
+    row.appendChild(link);
+  }
+
+  if (ev.detail && Object.keys(ev.detail).length > 0) {
+    const details = document.createElement('details');
+    details.className = 'activity-detail';
+    const summaryEl = document.createElement('summary');
+    summaryEl.textContent = 'Detail';
+    details.appendChild(summaryEl);
+    const pre = document.createElement('pre');
+    pre.textContent = JSON.stringify(ev.detail, null, 2);
+    details.appendChild(pre);
+    row.appendChild(details);
+  }
+
+  return row;
+}
+
+function handleLiveActivity(ev) {
+  const matchesSubsystem = !activityState.filters.subsystem || ev.subsystem === activityState.filters.subsystem;
+  const matchesStatus = !activityState.filters.status || ev.status === activityState.filters.status;
+  if (!matchesSubsystem || !matchesStatus) return;
+
+  const atTop = activityList.scrollTop < 50;
+  if (atTop) {
+    const row = buildActivityRow(ev);
+    row.classList.add('fadeIn');
+    activityList.prepend(row);
+    activityState.events.unshift(ev);
+  } else {
+    activityState.pendingLive.push(ev);
+    activityNewBanner.classList.remove('hidden');
+  }
 }

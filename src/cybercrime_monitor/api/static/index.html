@@ -3,14 +3,14 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Marketplace Monitor</title>
+  <title>Cybercrime Monitor</title>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
   <header>
     <div class="logo">
       <span class="logo-icon">⬡</span>
-      <span class="logo-text">Marketplace Monitor</span>
+      <span class="logo-text">Cybercrime Monitor</span>
     </div>
     <div class="header-stats">
       <span id="total-count" class="stat-badge">— items</span>
@@ -23,6 +23,8 @@
     <nav class="tabs">
       <button class="tab active" data-tab="feed">Feed</button>
       <button class="tab" data-tab="cases">Cases</button>
+      <button class="tab" data-tab="landscape">Landscape</button>
+      <button class="tab" data-tab="activity">Activity</button>
       <button class="tab" data-tab="settings">Keywords</button>
     </nav>
   </header>
@@ -207,6 +209,11 @@
       </div>
     </div>
 
+    <div id="case-pivot-banner" class="case-pivot-banner hidden">
+      <span id="case-pivot-label"></span>
+      <button id="case-pivot-clear" class="link-button" type="button">✕ clear pivot</button>
+    </div>
+
     <div class="case-body">
       <nav class="case-rail">
         <div id="cases-list"></div>
@@ -219,6 +226,126 @@
         <div id="case-detail" class="hidden"></div>
       </main>
     </div>
+  </div>
+
+  <!-- ── Landscape tab ────────────────────────────────────────────────────── -->
+  <!-- Situational-awareness overview built from the *case* layer (deduped
+       incidents), not raw items — a victim/sector/country/actor should count
+       once per incident, not once per corroborating report. -->
+  <div id="tab-landscape" class="tab-content hidden">
+    <div class="case-toolbar">
+      <div class="case-toolbar-filters">
+        <label class="filter-label" for="landscape-window-select" style="margin:0;">Window</label>
+        <select id="landscape-window-select" title="Time window">
+          <option value="1">Last 24h</option>
+          <option value="7">Last 7 days</option>
+          <option value="30" selected>Last 30 days</option>
+          <option value="90">Last 90 days</option>
+          <option value="">All time</option>
+        </select>
+        <button id="landscape-export-btn" class="link-button" type="button">Export snapshot (.md)</button>
+      </div>
+    </div>
+
+    <div class="dashboard-pane">
+      <section class="gauge-row">
+        <div class="gauge-card">
+          <div class="gauge-value" id="landscape-gauge-total">—</div>
+          <div class="gauge-label">Cases in window</div>
+        </div>
+        <div class="gauge-card">
+          <div class="gauge-value" id="landscape-gauge-kev">—</div>
+          <div class="gauge-label">In CISA KEV</div>
+        </div>
+        <div class="gauge-card">
+          <div class="gauge-value" id="landscape-gauge-sectors">—</div>
+          <div class="gauge-label">Sectors hit</div>
+        </div>
+        <div class="gauge-card">
+          <div class="gauge-value" id="landscape-gauge-actors">—</div>
+          <div class="gauge-label">Active actors</div>
+        </div>
+      </section>
+
+      <section class="chart-row">
+        <div class="chart-card chart-card-wide">
+          <h3>Incident volume</h3>
+          <div class="chart-canvas"><canvas id="chart-landscape-volume"></canvas></div>
+        </div>
+        <div class="chart-card">
+          <h3>Crime type</h3>
+          <div class="chart-canvas"><canvas id="chart-landscape-crimetype"></canvas></div>
+        </div>
+      </section>
+
+      <section class="chart-row">
+        <div class="chart-card">
+          <h3>Victims by country</h3>
+          <div class="chart-canvas"><canvas id="chart-landscape-country"></canvas></div>
+        </div>
+        <div class="chart-card">
+          <h3>Sectors under attack</h3>
+          <div class="chart-canvas"><canvas id="chart-landscape-sector"></canvas></div>
+        </div>
+        <div class="chart-card">
+          <h3>Most active actors <span class="hint" style="margin:0;">(click to open profile)</span></h3>
+          <div class="chart-canvas"><canvas id="chart-landscape-actors"></canvas></div>
+        </div>
+      </section>
+
+      <section class="landscape-emerging-row" id="landscape-emerging-row">
+        <!-- populated by renderEmergingPanels (Phase 3) -->
+      </section>
+    </div>
+
+    <!-- Actor profile overlay — hidden until an actor bar is clicked -->
+    <div id="actor-profile-overlay" class="overlay hidden">
+      <div class="overlay-panel">
+        <button id="actor-profile-close" class="overlay-close" type="button" aria-label="Close">&times;</button>
+        <div id="actor-profile-content"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Activity tab ─────────────────────────────────────────────────────── -->
+  <!-- Public, no admin token: every autonomous AI action across discover/
+       heal/prune/research/classifier/correlator/cross_correlator logs here.
+       See GET /api/activity and db.py's ai_activity table docstring. -->
+  <div id="tab-activity" class="tab-content hidden">
+    <p class="hint activity-intro">
+      Everything the AI subsystems have done, automatically, with no approval gate — source
+      discovery/healing/pruning, OSINT research, classification, and case correlation. This log
+      is the transparency record for that autonomy, not a control panel.
+    </p>
+    <div class="case-toolbar">
+      <div class="case-toolbar-filters">
+        <select id="activity-subsystem-select" title="Subsystem">
+          <option value="">All subsystems</option>
+          <option value="discover">Discover</option>
+          <option value="heal">Heal</option>
+          <option value="prune">Prune</option>
+          <option value="research">Research</option>
+          <option value="classifier">Classifier</option>
+          <option value="correlator">Correlator</option>
+          <option value="cross_correlator">Cross-correlator</option>
+        </select>
+        <select id="activity-status-select" title="Status">
+          <option value="">All statuses</option>
+          <option value="ok">OK</option>
+          <option value="error">Error</option>
+          <option value="skipped">Skipped</option>
+        </select>
+        <button id="activity-filters-clear" class="link-button" type="button">Clear</button>
+      </div>
+    </div>
+    <main class="activity-list-wrap">
+      <div id="activity-new-banner" class="hidden">
+        <button onclick="applyActivityFilters()">▲ Load new activity</button>
+      </div>
+      <div id="activity-list"></div>
+      <div id="activity-empty" class="empty-state hidden">No activity recorded yet.</div>
+      <button id="activity-load-more" class="load-more hidden">Load more</button>
+    </main>
   </div>
 
   <!-- ── Settings tab ─────────────────────────────────────────────────────── -->

@@ -92,11 +92,15 @@ Public/read-only endpoints (no auth):
 - `GET /api/stream` — SSE live feed.
 - `GET /api/sources` — source health and schedule status.
 - `GET /api/status` — unified subsystem status (scheduler, sources, classifier, correlator, KEV, research, heal).
-- `GET /api/stats/*` — timeseries, priority, source, keyword, actor, case statistics.
+- `GET /api/stats/*` — timeseries, priority, source, keyword, actor, case statistics; `/api/stats/cases` (windowed via `since_days`, now also returns `by_sector`/`by_country`/`by_actor`), `/api/stats/cases/timeseries` (case-volume-over-time, unbounded by item retention), `/api/stats/trends` (week-over-week — or any `window_days` — movement per actor/sector/crime_type/cve, vs. the immediately preceding window).
 - `GET /api/cases` — deduplicated incidents with filtering (victim/actor/CVE/IoC search, significance, crime type, KEV, timeframe).
 - `GET /api/cases/{id}` — full case file: fields, IoCs, corroborating items, research run history, related cases.
+- `GET /api/cases/{id}/export?format=md|json` — case report for sharing outside the dashboard.
+- `GET /api/actors/{actor}` — aggregate profile for one attributed actor (case count, victims/sectors/countries/CVEs, monthly activity, recent cases) — backs the Landscape tab's actor leaderboard click-through.
+- `GET /api/stats/landscape/export?since_days=&trend_window_days=` — Markdown snapshot of the Landscape tab's current window (top actors/sectors/countries/crime-types + emerging trends) for sharing a point-in-time read of the landscape.
 - `GET /api/classifier/health` and `/api/classifier/recent`.
 - `POST /api/feedback` — record a `useful`/`not_useful`/`noise`/`wrong_attribution` verdict on a case or item.
+- `GET /api/activity` — unified AI activity log: every autonomous action across discover/heal/prune/research/classifier/correlator/cross_correlator, newest first, filterable by subsystem/status/since. Deliberately public — see "Autonomous self-improvement loop" above; this is the transparency surface for it, not an admin control.
 
 Admin-token gated:
 
@@ -107,7 +111,9 @@ Admin-token gated:
 ## UI usage
 
 - **Feed tab**: advanced filter sidebar, infinite-scroll item cards, live SSE updates, priority/classifier badges.
-- **Cases tab**: top search/filter toolbar (victim, actor, CVE, IoC, timeframe) over a two-pane case rail + case-file detail view — IoCs, timeline, research status with a "Deep research" trigger, related cases, and feedback controls.
+- **Cases tab**: top search/filter toolbar (victim, actor, CVE, IoC, timeframe) over a two-pane case rail + case-file detail view — IoCs, timeline, research status with a "Deep research" trigger, related cases, and feedback controls. CVE/IoC chips pivot to every other case sharing that indicator; each case can be exported as Markdown.
+- **Landscape tab**: situational-awareness overview of the case layer — incident volume, crime-type/sector/country/actor breakdowns over a selectable window (24h/7d/30d/90d/all), "emerging this week" actor/sector/CVE trend panels (KEV-flagged CVEs highlighted), an actor profile overlay (click any actor bar), and a one-click Markdown snapshot export.
+- **Activity tab**: public, no admin token — live log of every autonomous AI action (source discover/heal/prune, research, classification, case correlation/cross-correlation), filterable by subsystem/status. See "Autonomous self-improvement loop" above.
 - **Keywords tab**: edit `keywords.yaml` directly (requires `ADMIN_TOKEN`).
 - **Status bar**: real-time view of every background subsystem (including source self-healing and discovery); refreshes every 10 s and also reacts to SSE status events.
 
