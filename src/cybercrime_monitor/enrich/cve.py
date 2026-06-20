@@ -1,9 +1,7 @@
 """CVE identifier extraction — a cheap, deterministic backstop alongside the
 LLM extraction layer's cve_ids field (see llm/backend.py). Regex catches CVE
 mentions the model might drop or that show up in items processed before the
-LLM layer existed (e.g. via a future backfill), and the matcher's "cve" tag
-(config/keywords.yaml) already surfaces these at the regex layer for the
-zero-config fallback path.
+LLM layer existed (e.g. via a future backfill).
 """
 import re
 

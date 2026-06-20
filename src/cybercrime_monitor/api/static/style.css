@@ -437,9 +437,10 @@ header {
   border-top: 1px dashed var(--border);
 }
 
-mark.prio-info     { background: var(--prio-info-bg);     color: var(--prio-info);     border-radius: 2px; padding: 0 2px; }
-mark.prio-warn     { background: var(--prio-warn-bg);     color: var(--prio-warn);     border-radius: 2px; padding: 0 2px; }
-mark.prio-critical { background: var(--prio-critical-bg); color: var(--prio-critical); border-radius: 2px; padding: 0 2px; font-weight: 600; }
+/* Entity highlighting (actor/victim/CVE/IoC mentions — see app.js
+   highlightEntities). No longer priority-colored since there's no regex
+   matcher priority to key off; one neutral style for any matched entity. */
+mark { background: var(--prio-warn-bg); color: var(--prio-warn); border-radius: 2px; padding: 0 2px; }
 
 .load-more {
   display: block;
@@ -521,6 +522,23 @@ mark.prio-critical { background: var(--prio-critical-bg); color: var(--prio-crit
 .badge.info { color: var(--prio-info); border-color: var(--prio-info); }
 .hint { color: var(--text-muted); font-size: 0.85rem; margin-bottom: 12px; line-height: 1.5; }
 .hint code { background: var(--surface2); border-radius: 4px; padding: 1px 5px; font-family: monospace; }
+
+/* ── Investigate tab ────────────────────────────────────────────────────── */
+#inv-brief { width: 100%; resize: vertical; }
+.investigation-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.85rem;
+}
+.investigation-brief { flex: 1; color: var(--text-muted); }
+.inv-status-queued    { color: var(--prio-info); border-color: var(--prio-info); }
+.inv-status-running   { color: var(--prio-warn); border-color: var(--prio-warn); }
+.inv-status-completed { color: var(--prio-critical); border-color: var(--prio-critical); }
+.inv-status-no_match  { color: var(--text-muted); }
+.inv-status-failed    { color: var(--prio-critical); border-color: var(--prio-critical); }
 
 /* ── Cases tab — top toolbar + two-pane (rail | detail) ───────────────────
    Replaces the old three-column filter-sidebar/list/detail-sidebar split,
@@ -867,6 +885,7 @@ mark.prio-critical { background: var(--prio-critical-bg); color: var(--prio-crit
 .tag-chip.activity-subsystem-classifier       { color: #f778ba; background: rgba(247, 120, 186, 0.12); }
 .tag-chip.activity-subsystem-correlator       { color: #56d4dd; background: rgba(86, 212, 221, 0.12); }
 .tag-chip.activity-subsystem-cross_correlator { color: #bc8cff; background: rgba(188, 140, 255, 0.12); }
+.tag-chip.activity-subsystem-investigate      { color: #f778ba; background: rgba(247, 120, 186, 0.12); }
 
 .activity-detail {
   margin-top: 8px;

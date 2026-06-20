@@ -8,24 +8,23 @@ class Settings(BaseSettings):
     db_path: Path = Path("data/items.db")
     bind_host: str = "127.0.0.1"
     bind_port: int = 8000
-    # Required to view/edit config/keywords.yaml via the API (GET/PUT /api/keywords).
-    # Set via .env so the admin UI keeps working while everything else stays open
-    # to the public dashboard.
+    # Required for admin-gated API routes (force re-research, view filtered
+    # items, the targeted-investigation trigger). Set via .env so the admin
+    # UI keeps working while everything else stays open to the public
+    # dashboard.
     admin_token: str = ""
     tor_socks: str = "socks5h://127.0.0.1:9050"
     gotify_url: str = ""
     gotify_token: str = ""
     log_level: str = "INFO"
     sources_config: Path = Path("config/sources.yaml")
-    keywords_config: Path = Path("config/keywords.yaml")
     # max items returned by /api/items
     items_page_size: int = 200
 
     # ── LLM extraction layer ────────────────────────────────────────────────
     # Structured-field extraction (crime type, victim, attribution, CVEs,
     # significance) per item — see llm/ package. "none" disables it entirely
-    # and restores pre-extraction behavior (instant Gotify on regex
-    # 'critical', no extractions table writes) with zero other config
+    # (no extractions table writes, no alerting) with zero other config
     # required.
     #
     # "hermes_cli" routes extraction/dedup through the locally-installed
@@ -64,14 +63,8 @@ class Settings(BaseSettings):
     llm_fallback_cooldown_seconds: int = 300
     # Generous: local CPU-bound inference can legitimately take a while
     # (prompt processing + generation), and a slow extract call has no
-    # downside here — the job is already decoupled from ingest, and the
-    # fallback sweep (below) backstops real critical alerts regardless.
+    # downside here — the job is already decoupled from ingest.
     llm_timeout_seconds: float = 90.0
-    # If a regex-'critical' item is still unextracted after this many
-    # minutes (LLM backend down/unreachable), alert on it anyway via the
-    # fallback sweep — a downstream LLM outage must never silently suppress
-    # a real critical alert.
-    llm_fallback_alert_minutes: int = 10
     # A false_positive=true verdict below this confidence is NOT trusted to
     # suppress the item — it stays visible (priority still applied) rather
     # than silently dropping out of the feed on a guess. A low-confidence
@@ -112,6 +105,16 @@ class Settings(BaseSettings):
     # never dispatch) without touching llm_backend.
     hermes_research_interval_seconds: int = 900
     hermes_heal_interval_seconds: int = 3600
+    # Investigator-triggered targeted research (POST /api/investigations,
+    # research/investigate.py) — drains queued investigations. The interval
+    # is just a safety net: the endpoint nudges the job to run immediately on
+    # submit, same pattern as the case-research force-trigger. 0 disables the
+    # job (investigations stay queued and are never picked up).
+    hermes_investigate_interval_seconds: int = 900
+    # An investigation's findings are only integrated (case + items + source
+    # candidates) when Hermes reports found=true AND at least this much
+    # confidence — "only if it DID really find something" per design intent.
+    investigate_min_confidence: float = 0.5
     # A source must accumulate this many consecutive collector errors before
     # the self-healing job will spend a Hermes run investigating it.
     hermes_heal_error_threshold: int = 5

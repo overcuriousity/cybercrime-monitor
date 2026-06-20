@@ -40,7 +40,6 @@ from .. import db
 from ..api.sse import broadcaster
 from ..hermes.runner import run_agent
 from ..http import clearnet_client, tor_client
-from ..matcher import matcher
 from ..scheduler import load_sources, reschedule_source
 from ..settings import settings
 from ..sources import writer as source_writer
@@ -198,9 +197,13 @@ def _slugify(name: str) -> str:
     return f"discovered_{slug[:40]}" if slug else "discovered_source"
 
 
-def _topics() -> str:
-    tags = matcher.all_tags
-    return ", ".join(tags) if tags else "data breaches, ransomware, cybercrime"
+async def _topics(db_conn) -> str:
+    """What this monitor cares about, derived from recent LLM extractions
+    (crime types + top mentioned actors) — replaces the old static regex-tag
+    list now that the keyword matcher is gone. Falls back to a generic
+    description when there's no extraction history yet (fresh install)."""
+    topics = await db.get_recent_topics(db_conn)
+    return ", ".join(topics) if topics else "data breaches, ransomware, cybercrime"
 
 
 def _existing_domains(sources: list[dict]) -> set[str]:
@@ -225,7 +228,7 @@ async def run_discover_batch(db_conn, scheduler=None, sse_broadcaster=None) -> i
     try:
         existing = load_sources()
         prompt = _DISCOVER_PROMPT_TEMPLATE.format(
-            topics=_topics(),
+            topics=await _topics(db_conn),
             existing_domains=", ".join(sorted(_existing_domains(existing))) or "none",
         )
         result = await run_agent(

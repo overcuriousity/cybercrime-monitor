@@ -7,7 +7,7 @@ from typing import AsyncIterator
 
 import aiosqlite
 
-from .models import Item, Match
+from .models import Item
 from .settings import settings
 
 
@@ -71,18 +71,6 @@ CREATE INDEX IF NOT EXISTS idx_items_source_id   ON items(source_id);
 -- pre-existing DB this executescript runs BEFORE the ALTER TABLE that adds
 -- the content_key column, and CREATE INDEX on a not-yet-existing column
 -- fails outright (verified: sqlite3.OperationalError: no such column).
-
-CREATE TABLE IF NOT EXISTS matches (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    item_id         INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
-    keyword_pattern TEXT NOT NULL,
-    priority        TEXT NOT NULL,
-    tags            TEXT NOT NULL DEFAULT '[]',
-    spans           TEXT NOT NULL DEFAULT '[]'
-);
-
-CREATE INDEX IF NOT EXISTS idx_matches_item_id  ON matches(item_id);
-CREATE INDEX IF NOT EXISTS idx_matches_priority ON matches(priority);
 
 -- One structured-extraction record per item from the LLM extraction layer
 -- (see llm/ package) — supersedes the old triage-only "classifications"
@@ -311,24 +299,34 @@ CREATE TABLE IF NOT EXISTS ai_activity (
 CREATE INDEX IF NOT EXISTS idx_ai_activity_ts ON ai_activity(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_ai_activity_subsystem ON ai_activity(subsystem);
 
--- Resolves one effective priority rank + false_positive flag per item:
--- the LLM extraction's significance if one exists, else the regex matcher's
--- max priority (mirrors the CASE/MAX logic every query used to repeat
--- independently). NOTE: CREATE VIEW IF NOT EXISTS is frozen at creation —
--- if this formula ever changes, existing DBs need a manual `DROP VIEW
--- item_priority` before restart, since IF NOT EXISTS won't redefine it.
-CREATE VIEW IF NOT EXISTS item_priority AS
+-- Investigator-submitted targeted-research briefs (POST /api/investigations,
+-- see research/investigate.py). One row per submission. case_id is set only
+-- if Hermes reported a confident match and findings were integrated — most
+-- of the heavy lifting (items, case, sources) is NOT tracked here directly;
+-- it's tracked the same way as any other ingest (items/cases/
+-- source_heal_proposals/ai_activity), this table just remembers what brief
+-- led to it and lets the UI poll for completion.
+CREATE TABLE IF NOT EXISTS investigations (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    brief        TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'queued', -- queued | running | completed | no_match | failed
+    created_at   TEXT NOT NULL,
+    finished_at  TEXT,
+    case_id      INTEGER REFERENCES cases(id) ON DELETE SET NULL,
+    findings     TEXT NOT NULL DEFAULT '{}',
+    error        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_investigations_status ON investigations(status);
+
+-- Resolves one effective priority rank + false_positive flag per item, from
+-- the LLM extraction's significance — the sole classification signal (the
+-- old regex-matcher fallback was removed; an item simply has no priority
+-- until the extraction job reaches it).
+DROP VIEW IF EXISTS item_priority;
+CREATE VIEW item_priority AS
 SELECT i.id AS item_id,
-       CASE
-         WHEN e.significance IS NOT NULL THEN
-           CASE e.significance WHEN 'critical' THEN 3 WHEN 'warn' THEN 2 WHEN 'info' THEN 1 ELSE 0 END
-         ELSE
-           COALESCE(
-             (SELECT MAX(CASE m.priority WHEN 'critical' THEN 3 WHEN 'warn' THEN 2 WHEN 'info' THEN 1 ELSE 0 END)
-              FROM matches m WHERE m.item_id = i.id),
-             0
-           )
-       END AS prio_rank,
+       CASE e.significance WHEN 'critical' THEN 3 WHEN 'warn' THEN 2 WHEN 'info' THEN 1 ELSE 0 END AS prio_rank,
        COALESCE(e.false_positive, 0) AS false_positive
 FROM items i
 LEFT JOIN extractions e ON e.item_id = i.id;
@@ -379,11 +377,9 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
 
 async def insert_item(conn: aiosqlite.Connection, item: Item) -> int | None:
     """Insert item; returns new row id or None if duplicate. Deliberately
-    does NOT commit — the caller (collectors/base.py:run) commits once after
-    insert_matches also succeeds, so an item and the regex matches against it
-    land atomically. Without this, a crash between the two separate commits
-    could leave an item permanently with zero matches even though the regex
-    rules did match it at ingest time."""
+    does NOT commit — the caller (collectors/base.py:run) commits once the
+    insert succeeds, so the row is only ever durable in one atomic step
+    before being broadcast/alerted on."""
     try:
         async with conn.execute(
             """INSERT INTO items
@@ -414,23 +410,23 @@ async def insert_item(conn: aiosqlite.Connection, item: Item) -> int | None:
         return None
 
 
-async def insert_matches(conn: aiosqlite.Connection, matches: list[Match]) -> None:
-    """Deliberately does NOT commit — see insert_item's docstring; the
-    caller commits both inserts together in one transaction."""
-    if not matches:
-        return
-    await conn.executemany(
-        """INSERT INTO matches (item_id, keyword_pattern, priority, tags, spans)
-           VALUES (?,?,?,?,?)""",
-        [
-            (m.item_id, m.keyword_pattern, m.priority, json.dumps(m.tags), json.dumps(m.spans))
-            for m in matches
-        ],
-    )
-
-
 _RANK_TO_PRIORITY_STR = {0: "", 1: "info", 2: "warn", 3: "critical"}
 _PRIORITY_RANK = {"info": 1, "warn": 2, "critical": 3}
+
+
+def extraction_tags(*, crime_type: str | None, cve_ids: list, iocs: list) -> list[str]:
+    """Per-item display tags derived from the LLM extraction (replaces the
+    old regex-matcher tags) — used by both fetch_items and
+    get_recent_extractions so a live-patched card and a freshly-loaded one
+    compute the same chips."""
+    tags: set[str] = set()
+    if crime_type and crime_type != "other":
+        tags.add(crime_type)
+    if cve_ids:
+        tags.add("cve")
+    if iocs:
+        tags.add("ioc")
+    return sorted(tags)
 
 
 def _build_items_where(
@@ -598,10 +594,10 @@ async def fetch_items(
     until: str | None = None,
     extra_key: str | None = None,
 ) -> list[dict]:
-    """Return items enriched with match + classifier data as JSON-serialisable
-    dicts. Priority filtering/ordering reads the `item_priority` view (the
-    classifier's verdict if present, else the regex matcher's max priority);
-    false-positive items are excluded unless show_filtered=True.
+    """Return items enriched with classifier data as JSON-serialisable dicts.
+    Priority filtering/ordering reads the `item_priority` view (the
+    classifier's verdict — the sole significance signal); false-positive
+    items are excluded unless show_filtered=True.
 
     source_id accepts either a single id (back-compat) or a list — the
     dashboard's source checkboxes send a list so multi-source filtering
@@ -666,32 +662,10 @@ async def fetch_items(
     if not rows:
         return []
 
-    item_ids = [r["id"] for r in rows]
-    placeholders = ",".join("?" * len(item_ids))
-    match_rows = await conn.execute_fetchall(
-        f"SELECT * FROM matches WHERE item_id IN ({placeholders}) ORDER BY item_id",
-        item_ids,
-    )
-
-    matches_by_item: dict[int, list] = {}
-    for mr in match_rows:
-        matches_by_item.setdefault(mr["item_id"], []).append(mr)
-
     result = []
     for r in rows:
-        item_matches = matches_by_item.get(r["id"], [])
-        all_tags: set[str] = set()
-        serialised_matches = []
-        for m in item_matches:
-            all_tags.update(json.loads(m["tags"]))
-            serialised_matches.append(
-                {
-                    "pattern": m["keyword_pattern"],
-                    "priority": m["priority"],
-                    "tags": json.loads(m["tags"]),
-                    "spans": json.loads(m["spans"]),
-                }
-            )
+        cve_ids = json.loads(r["cve_ids"]) if r["cve_ids"] else []
+        iocs = json.loads(r["iocs"]) if r["iocs"] else []
         result.append(
             {
                 "id": r["id"],
@@ -703,24 +677,26 @@ async def fetch_items(
                 "published_at": r["published_at"],
                 "seen_at": r["seen_at"],
                 "source_tags": json.loads(r["source_tags"]),
-                # effective priority: classifier verdict if present, else regex max
+                # effective priority: the classifier's verdict, "" until classified
                 "max_priority": _RANK_TO_PRIORITY_STR.get(r["prio_rank"] or 0, ""),
-                "all_tags": sorted(all_tags),
-                "matches": serialised_matches,
+                "all_tags": extraction_tags(crime_type=r["crime_type"], cve_ids=cve_ids, iocs=iocs),
                 "is_false_positive": bool(r["false_positive"]),
                 "classified": r["classified_at"] is not None,
                 "classifier_confidence": r["classifier_confidence"],
                 "classifier_reasoning": r["classifier_reasoning"],
                 # Structured extraction fields (see llm/backend.py's
                 # Extraction dataclass) — null/empty until the item has been
-                # through the extraction job.
+                # through the extraction job. Also doubles as the source of
+                # entity highlighting in the frontend (see app.js
+                # highlightEntities), which replaced the old regex-span
+                # highlighting now that there's no regex matcher.
                 "crime_type": r["crime_type"],
                 "victim": r["victim"],
                 "victim_sector": r["victim_sector"],
                 "victim_country": r["victim_country"],
                 "actor": r["actor"],
-                "cve_ids": json.loads(r["cve_ids"]) if r["cve_ids"] else [],
-                "iocs": json.loads(r["iocs"]) if r["iocs"] else [],
+                "cve_ids": cve_ids,
+                "iocs": iocs,
                 # >1 means other sources reported the same content_key — a
                 # display/triage aid only, never a filter (see fetch_items
                 # docstring's don't-hide principle).
@@ -798,8 +774,8 @@ _RANK_TO_PRIORITY = {0: "none", 1: "info", 2: "warn", 3: "critical"}
 async def stats_timeseries(
     conn: aiosqlite.Connection, *, bucket: str = "hour", since_hours: int = 48
 ) -> list[dict]:
-    """Item counts per time bucket, stacked by effective priority (classifier
-    verdict if present, else regex max). Excludes false positives."""
+    """Item counts per time bucket, stacked by effective priority (the
+    classifier's verdict). Excludes false positives."""
     since_hours = max(1, min(since_hours, 24 * 30))
     since = (_utcnow() - timedelta(hours=since_hours)).isoformat()
     rows = await conn.execute_fetchall(
@@ -834,8 +810,8 @@ async def stats_by_source(conn: aiosqlite.Connection) -> list[dict]:
 
 
 async def stats_by_priority(conn: aiosqlite.Connection, *, since_hours: int | None = None) -> dict:
-    """Effective-priority breakdown (classifier verdict if present, else
-    regex max). Excludes false positives."""
+    """Effective-priority breakdown (the classifier's verdict). Excludes
+    false positives."""
     where = "WHERE ep.false_positive = 0"
     params: dict = {}
     if since_hours is not None:
@@ -857,23 +833,6 @@ async def stats_by_priority(conn: aiosqlite.Connection, *, since_hours: int | No
     return counts
 
 
-async def stats_top_keywords(conn: aiosqlite.Connection, *, limit: int = 10) -> list[dict]:
-    limit = max(1, min(limit, 50))
-    rows = await conn.execute_fetchall(
-        """
-        SELECT m.keyword_pattern, m.priority, COUNT(*) AS n
-        FROM matches m
-        JOIN item_priority ep ON ep.item_id = m.item_id
-        WHERE ep.false_positive = 0
-        GROUP BY m.keyword_pattern, m.priority
-        ORDER BY n DESC
-        LIMIT :limit
-        """,
-        {"limit": limit},
-    )
-    return [dict(r) for r in rows]
-
-
 # ── LLM extraction support ────────────────────────────────────────────────
 # Used by the llm/ background job and the /api/classifier/* routes.
 
@@ -883,10 +842,8 @@ async def get_unextracted_items(conn: aiosqlite.Connection, *, limit: int) -> li
     feed: under sustained backlog, freshness matters more than chronological
     completeness, so the extraction job always works the front of the queue
     instead of grinding through old history while new items pile up
-    unextracted. The fallback-alert sweep (get_unextracted_critical_older_
-    than) is what guarantees old regex-critical items still can't be
-    silently starved forever — everything else degrades gracefully to its
-    regex-derived priority if it's never reached."""
+    unextracted. An item simply has no priority/tags until it's reached —
+    there is no regex-derived fallback signal anymore."""
     rows = await conn.execute_fetchall(
         """
         SELECT i.id, i.title, i.snippet, i.source_name, i.url
@@ -896,52 +853,6 @@ async def get_unextracted_items(conn: aiosqlite.Connection, *, limit: int) -> li
         LIMIT :limit
         """,
         {"limit": limit},
-    )
-    items = [dict(r) for r in rows]
-    if not items:
-        return items
-
-    # Attach the regex-derived priority/tags as a prompt hint (not
-    # authoritative — see classifier/backend.py's system prompt).
-    priority_rank = {"info": 1, "warn": 2, "critical": 3}
-    item_ids = [it["id"] for it in items]
-    placeholders = ",".join("?" * len(item_ids))
-    match_rows = await conn.execute_fetchall(
-        f"SELECT item_id, priority, tags FROM matches WHERE item_id IN ({placeholders})",
-        item_ids,
-    )
-    by_item: dict[int, list] = {}
-    for mr in match_rows:
-        by_item.setdefault(mr["item_id"], []).append(mr)
-    for it in items:
-        item_matches = by_item.get(it["id"], [])
-        max_prio = ""
-        tags: set[str] = set()
-        for m in item_matches:
-            if priority_rank.get(m["priority"], 0) > priority_rank.get(max_prio, 0):
-                max_prio = m["priority"]
-            tags.update(json.loads(m["tags"]))
-        it["regex_priority"] = max_prio
-        it["regex_tags"] = sorted(tags)
-    return items
-
-
-async def get_unextracted_critical_older_than(
-    conn: aiosqlite.Connection, *, cutoff_iso: str
-) -> list[dict]:
-    """Items with a regex 'critical' match, still unextracted, ingested
-    before cutoff_iso — the fallback-alert sweep's candidate set."""
-    rows = await conn.execute_fetchall(
-        """
-        SELECT i.id, i.title, i.snippet, i.source_name, i.url
-        FROM items i
-        JOIN matches m ON m.item_id = i.id
-        WHERE m.priority = 'critical'
-          AND i.seen_at <= :cutoff
-          AND NOT EXISTS (SELECT 1 FROM extractions e WHERE e.item_id = i.id)
-        GROUP BY i.id
-        """,
-        {"cutoff": cutoff_iso},
     )
     return [dict(r) for r in rows]
 
@@ -1017,6 +928,33 @@ async def count_unextracted(conn: aiosqlite.Connection) -> int:
     return row[0]["n"] if row else 0
 
 
+async def get_recent_topics(conn: aiosqlite.Connection, *, since_days: int = 30, limit: int = 10) -> list[str]:
+    """Distinct crime types + most-mentioned actors from recent extractions —
+    feeds research/discover.py's prompt with "what this monitor cares about"
+    now that there's no regex matcher tag list to read instead. Excludes
+    false positives and the generic 'other' crime_type bucket."""
+    since = (_utcnow() - timedelta(days=since_days)).isoformat()
+    crime_rows = await conn.execute_fetchall(
+        """
+        SELECT DISTINCT e.crime_type FROM extractions e
+        WHERE e.extracted_at >= :since AND e.false_positive = 0 AND e.crime_type != 'other'
+        ORDER BY e.crime_type ASC
+        LIMIT :limit
+        """,
+        {"since": since, "limit": limit},
+    )
+    actor_rows = await conn.execute_fetchall(
+        """
+        SELECT e.actor, COUNT(*) AS n FROM extractions e
+        WHERE e.extracted_at >= :since AND e.false_positive = 0 AND e.actor IS NOT NULL
+        GROUP BY e.actor ORDER BY n DESC LIMIT :limit
+        """,
+        {"since": since, "limit": limit},
+    )
+    topics = [r["crime_type"] for r in crime_rows] + [r["actor"] for r in actor_rows]
+    return topics[:limit]
+
+
 async def get_recent_extractions(conn: aiosqlite.Connection, *, since_iso: str) -> list[dict]:
     """Items extracted after since_iso — powers the frontend's incremental
     poll (GET /api/classifier/recent) so live cards can be patched in place
@@ -1034,32 +972,36 @@ async def get_recent_extractions(conn: aiosqlite.Connection, *, since_iso: str) 
         """,
         {"since": since_iso},
     )
-    return [
-        {
-            "id": r["id"],
-            "max_priority": r["classifier_priority"],
-            "is_false_positive": bool(r["is_false_positive"]),
-            "classifier_confidence": r["classifier_confidence"],
-            "classifier_reasoning": r["classifier_reasoning"],
-            "classified_at": r["classified_at"],
-            "crime_type": r["crime_type"],
-            "victim": r["victim"],
-            "victim_sector": r["victim_sector"],
-            "victim_country": r["victim_country"],
-            "actor": r["actor"],
-            "cve_ids": json.loads(r["cve_ids"]) if r["cve_ids"] else [],
-            "iocs": json.loads(r["iocs"]) if r["iocs"] else [],
-        }
-        for r in rows
-    ]
+    result = []
+    for r in rows:
+        cve_ids = json.loads(r["cve_ids"]) if r["cve_ids"] else []
+        iocs = json.loads(r["iocs"]) if r["iocs"] else []
+        result.append(
+            {
+                "id": r["id"],
+                "max_priority": r["classifier_priority"],
+                "all_tags": extraction_tags(crime_type=r["crime_type"], cve_ids=cve_ids, iocs=iocs),
+                "is_false_positive": bool(r["is_false_positive"]),
+                "classifier_confidence": r["classifier_confidence"],
+                "classifier_reasoning": r["classifier_reasoning"],
+                "classified_at": r["classified_at"],
+                "crime_type": r["crime_type"],
+                "victim": r["victim"],
+                "victim_sector": r["victim_sector"],
+                "victim_country": r["victim_country"],
+                "actor": r["actor"],
+                "cve_ids": cve_ids,
+                "iocs": iocs,
+            }
+        )
+    return result
 
 
 # ── Retention ─────────────────────────────────────────────────────────────────
 
 async def prune_old_items(conn: aiosqlite.Connection, *, retention_days: int) -> int:
     """Delete items older than retention_days, EXCEPT effective-critical
-    items (LLM extraction verdict if present, else regex max — same
-    precedence as item_priority everywhere else). matches/extractions/
+    items (the LLM extraction's verdict — see item_priority). extractions/
     case_items rows cascade via ON DELETE CASCADE (see _SCHEMA's
     foreign_keys=ON pragma). Returns the number of rows deleted. Runs a WAL
     checkpoint afterward (not VACUUM — VACUUM rewrites the whole file and can
@@ -1321,6 +1263,19 @@ async def count_uncorrelated_extracted_items(conn: aiosqlite.Connection) -> int:
 async def get_case_by_key(conn: aiosqlite.Connection, case_key: str) -> dict | None:
     rows = await conn.execute_fetchall("SELECT * FROM cases WHERE case_key = :k", {"k": case_key})
     return dict(rows[0]) if rows else None
+
+
+async def get_case_id_for_item(conn: aiosqlite.Connection, item_id: int) -> int | None:
+    """Which case (if any) an item ended up linked into — used by
+    research/investigate.py after delegating to pipeline/correlate.py's
+    create-or-merge logic, since that path can land an item in a
+    pre-existing case (exact key or fuzzy LLM merge) as easily as a brand
+    new one; case_items is the one place that's true regardless of which
+    branch fired."""
+    rows = await conn.execute_fetchall(
+        "SELECT case_id FROM case_items WHERE item_id = :item_id LIMIT 1", {"item_id": item_id}
+    )
+    return rows[0]["case_id"] if rows else None
 
 
 async def find_candidate_cases(
@@ -1858,6 +1813,94 @@ async def get_research_runs_for_case(conn: aiosqlite.Connection, case_id: int) -
         d["sources"] = json.loads(d["sources"]) if d["sources"] else []
         out.append(d)
     return out
+
+
+# ── Targeted investigation (research/investigate.py) ────────────────────────
+
+async def create_investigation(conn: aiosqlite.Connection, *, brief: str) -> int:
+    cur = await conn.execute(
+        "INSERT INTO investigations (brief, status, created_at) VALUES (:brief, 'queued', :created_at)",
+        {"brief": brief, "created_at": _utcnow().isoformat()},
+    )
+    await conn.commit()
+    return cur.lastrowid
+
+
+async def get_queued_investigations(conn: aiosqlite.Connection, *, limit: int) -> list[dict]:
+    """Drain investigations that need work. Includes 'running' rows so a
+    crash/restart mid-run doesn't leave an investigation stuck forever
+    (the scheduler is single-worker, so a stale 'running' row is safe to
+    resume rather than duplicate)."""
+    rows = await conn.execute_fetchall(
+        "SELECT * FROM investigations WHERE status IN ('queued', 'running') ORDER BY id ASC LIMIT :limit",
+        {"limit": limit},
+    )
+    return [dict(r) for r in rows]
+
+
+async def count_queued_investigations(conn: aiosqlite.Connection) -> int:
+    """Backlog depth — surfaced via /api/status."""
+    row = await conn.execute_fetchall("SELECT COUNT(*) AS n FROM investigations WHERE status = 'queued'")
+    return row[0]["n"] if row else 0
+
+
+async def mark_investigation_running(conn: aiosqlite.Connection, *, investigation_id: int) -> None:
+    await conn.execute(
+        "UPDATE investigations SET status = 'running' WHERE id = :id",
+        {"id": investigation_id},
+    )
+    await conn.commit()
+
+
+async def finish_investigation(
+    conn: aiosqlite.Connection,
+    *,
+    investigation_id: int,
+    status: str,
+    findings: dict,
+    case_id: int | None = None,
+    error: str | None = None,
+) -> None:
+    await conn.execute(
+        """
+        UPDATE investigations SET
+            status = :status, findings = :findings, case_id = :case_id,
+            error = :error, finished_at = :finished_at
+        WHERE id = :id
+        """,
+        {
+            "id": investigation_id,
+            "status": status,
+            "findings": json.dumps(findings),
+            "case_id": case_id,
+            "error": error,
+            "finished_at": _utcnow().isoformat(),
+        },
+    )
+    await conn.commit()
+
+
+async def list_investigations(conn: aiosqlite.Connection, *, limit: int = 50) -> list[dict]:
+    rows = await conn.execute_fetchall(
+        "SELECT * FROM investigations ORDER BY id DESC LIMIT :limit", {"limit": limit}
+    )
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["findings"] = json.loads(d["findings"]) if d["findings"] else {}
+        out.append(d)
+    return out
+
+
+async def get_investigation(conn: aiosqlite.Connection, investigation_id: int) -> dict | None:
+    rows = await conn.execute_fetchall(
+        "SELECT * FROM investigations WHERE id = :id", {"id": investigation_id}
+    )
+    if not rows:
+        return None
+    d = dict(rows[0])
+    d["findings"] = json.loads(d["findings"]) if d["findings"] else {}
+    return d
 
 
 # ── Self-healing source proposals (research/heal.py) ────────────────────────

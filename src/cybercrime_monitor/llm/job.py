@@ -8,13 +8,9 @@ Each tick:
   1. Extract structured fields for a LIFO batch of newest-unextracted items
      (db.get_unextracted_items).
   2. Fire Gotify for any newly-confirmed critical (not false_positive).
-  3. Sweep for regex-critical items that have sat unextracted past
-     llm_fallback_alert_minutes and alert on those too — an LLM backend
-     outage must never silently swallow a real critical alert.
 """
 import logging
 import time
-from datetime import datetime, timedelta, timezone
 
 from .. import db
 from ..api.sse import broadcaster
@@ -102,7 +98,6 @@ async def run_extraction_batch(db_conn) -> None:
     llm_health.record_run_start()
     try:
         extracted_count = await _extract_batch(db_conn)
-        await _run_fallback_sweep(db_conn)
         if extracted_count:
             llm_health.record_success(extracted_count)
     except Exception as exc:
@@ -222,42 +217,3 @@ async def _extract_batch(db_conn) -> int:
         )
 
     return extracted_count
-
-
-async def _run_fallback_sweep(db_conn) -> None:
-    cutoff = (
-        datetime.now(timezone.utc) - timedelta(minutes=settings.llm_fallback_alert_minutes)
-    ).isoformat()
-    stale = await db.get_unextracted_critical_older_than(db_conn, cutoff_iso=cutoff)
-
-    for item in stale:
-        await db.upsert_extraction(
-            db_conn,
-            item_id=item["id"],
-            crime_type="other",
-            victim=None,
-            victim_sector=None,
-            victim_country=None,
-            actor=None,
-            cve_ids=[],
-            iocs=[],
-            significance="critical",
-            false_positive=False,
-            confidence=None,
-            reasoning="LLM backend unreachable; alerted via regex fallback after grace period",
-            model="fallback-timeout",
-        )
-        title, message = _gotify_payload(item)
-        await push_gotify(title=title, message=message, priority=8)
-        log.warning(
-            "[llm] fallback-alerted item %s after %d min unextracted "
-            "(backend unreachable?)",
-            item["id"],
-            settings.llm_fallback_alert_minutes,
-        )
-        await _log_activity(
-            db_conn, action="fallback_alerted", status="error",
-            summary=f"LLM backend unreachable — regex-fallback alerted item #{item['id']}",
-            detail={"url": item["url"], "title": item["title"]},
-            ref_type="item", ref_id=item["id"], model="fallback-timeout",
-        )
