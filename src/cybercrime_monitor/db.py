@@ -938,8 +938,10 @@ async def get_recent_topics(conn: aiosqlite.Connection, *, since_days: int = 30,
         """
         SELECT DISTINCT e.crime_type FROM extractions e
         WHERE e.extracted_at >= :since AND e.false_positive = 0 AND e.crime_type != 'other'
+        ORDER BY e.crime_type ASC
+        LIMIT :limit
         """,
-        {"since": since},
+        {"since": since, "limit": limit},
     )
     actor_rows = await conn.execute_fetchall(
         """
