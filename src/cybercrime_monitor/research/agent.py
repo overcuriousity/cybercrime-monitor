@@ -105,9 +105,17 @@ incident using web search and any pages you need to fetch. Try to: confirm \
 the incident is real and ongoing/recent, identify the threat actor or \
 seller if not already known, identify the victim organization if not \
 already known, find any concrete indicators of compromise (domains, \
-hashes, IPs, onion addresses, leak-site URLs) tied to this incident, and \
-find corroborating independent sources (not just the original report \
-below).
+hashes, IPs, onion addresses, leak-site URLs, ransom/extortion \
+cryptocurrency wallet addresses) tied to this incident, and find \
+corroborating independent sources (not just the original report below).
+
+Actively look for a technical malware/incident write-up of this case, not \
+just news coverage — the kind of deep-dive analysis BleepingComputer, The \
+DFIR Report, vendor threat-intel blogs (Mandiant, Recorded Future, Talos, \
+etc.), or the actor's own leak-site posting would publish. These write-ups \
+are the best source of concrete IoCs and CVEs, often in a table or list — \
+if you find one, pull every IoC and CVE it publishes into this incident's \
+record rather than just summarizing the prose.
 
 INCIDENT:
 Title: {title}
@@ -148,8 +156,10 @@ def _gap_note(case: dict) -> str:
     if not missing:
         return (
             "\nThis case has already been researched before but was re-queued for "
-            "deeper research — dig further than a surface-level search, and look "
-            "for additional corroborating sources beyond what's already known.\n"
+            "deeper research — dig further than a surface-level search. Specifically "
+            "look for a technical malware/incident write-up (BleepingComputer, The "
+            "DFIR Report, vendor threat-intel blogs, the actor's own leak-site post) "
+            "beyond what's already known, and pull any IoCs/CVEs it publishes.\n"
         )
     return (
         "\nThis case was specifically re-queued for deeper research because the "

@@ -10,7 +10,7 @@ A self-hosted cybercrime-intelligence dashboard that scrapes breach/ransomware/m
 - **Case correlation**: merges related raw observations into deduplicated incidents, including aggregated IoCs.
 - **Algorithmic case cross-correlation**: links related cases by shared victim/actor/CVE/IoC overlap — surfaced as "Related cases".
 - **CISA KEV enrichment**: flags cases that mention known-exploited vulnerabilities.
-- **Autonomous self-improvement loop**: optional Hermes-agent research on significant cases (on a schedule or on-demand per case), self-healing that auto-applies validated fixes to `sources.yaml`, auto-prunes low-value/dead sources, and discovers new RSS/Atom sources — all gated by a relative investigation-value judgement (`sources/value.py`), informed by analyst feedback, with a full audit trail and revertible (`source_heal_proposals`, backed-up `sources.yaml`).
+- **Autonomous self-improvement loop**: optional Hermes-agent research on significant cases (on a schedule or on-demand per case) — actively seeking out technical malware/incident write-ups (BleepingComputer, The DFIR Report, vendor blogs) and pulling their IoCs/CVEs into the case, not just news confirmation; self-healing that auto-applies validated fixes to `sources.yaml`; auto-prunes low-value/dead sources *and* eventually removes any long-disabled source, hand-disabled or not (see `SOURCE_PRUNE_GRACE_DAYS`); and discovers new sources across RSS/Atom feeds, clearnet forums, *and* darknet (.onion) forums/leak sites — prioritizing dark-web sources, then researcher feeds, then press feeds (heise, KrebsOnSecurity, etc.). Discovered forum sources are validated by actually scraping them with LLM-proposed selectors before being added, not just probed for reachability. All gated by a relative investigation-value judgement (`sources/value.py`), informed by analyst feedback, with a full audit trail and revertible (`source_heal_proposals`, backed-up `sources.yaml`).
 - **Analyst feedback**: mark cases/items useful, noise, or wrong-attribution — feeds both source value scoring and the autonomous loop's prompts.
 - **Live dashboard**: FastAPI + vanilla-JS SPA with Server-Sent Events, Chart.js gauges, and a real-time subsystem status bar.
 - **Advanced feed filtering**: filter items by time range, source, priority, crime type, actor, victim, CVE, IOC, tags, classification state, confidence, and cross-source cluster size. Cases are searchable by victim, actor, CVE, IoC, or timeframe.
@@ -43,6 +43,16 @@ Configuration lives in three places:
 | `config/keywords.yaml` | Regex keyword rules with priority (`info`/`warn`/`critical`) and tags. |
 
 See `.env.example` and `config/*.yaml.example` for documented templates.
+
+### Tor requirement
+
+A local Tor daemon providing a SOCKS proxy at `127.0.0.1:9050` (or wherever `TOR_SOCKS` in `.env` points) **must be installed and running** for:
+
+- collecting from any configured `tor_forum` source,
+- self-healing's reachability probes for Tor sources,
+- and the discovery loop's darknet (.onion) forum/leak-site discovery — it fetches candidate listing pages through Tor, has Hermes propose scraper selectors against the real page, and validates them before auto-adding.
+
+On Debian/Ubuntu: `apt install tor && systemctl enable --now tor`. Without Tor running, `.onion` collection and discovery simply fail their reachability probe each tick (logged, not fatal) — clearnet sources and RSS discovery are unaffected.
 
 ## Architecture
 
@@ -81,7 +91,7 @@ The scheduler runs all subsystems concurrently:
 | Retention | daily | Prune old non-critical items. |
 | Hermes research | `HERMES_RESEARCH_INTERVAL_SECONDS` | Autonomous OSINT on significant (or explicitly re-queued) cases. |
 | Hermes heal | `HERMES_HEAL_INTERVAL_SECONDS` | Investigate broken collectors, auto-apply validated fixes, prune low-value sources. |
-| Hermes discover | `HERMES_DISCOVER_INTERVAL_SECONDS` | Search for and auto-add new RSS/Atom sources. |
+| Hermes discover | `HERMES_DISCOVER_INTERVAL_SECONDS` | Search for and auto-add new sources: RSS/Atom feeds, and clearnet/darknet forums (selector-validated before adding — see "Tor requirement" below). |
 
 ## API
 

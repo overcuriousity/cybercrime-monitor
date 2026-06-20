@@ -133,7 +133,8 @@ Extract these fields:
 - cve_ids: array of any CVE identifiers mentioned (e.g. "CVE-2024-12345"), \
   empty array if none.
 - iocs: array of any concrete indicators of compromise mentioned (domains, \
-  hashes, IPs, onion addresses) — empty array if none.
+  hashes, IPs, onion addresses, leak-site URLs, cryptocurrency wallet \
+  addresses used for ransom/extortion payments) — empty array if none.
 
 Assess significance:
 - "critical": an active data-for-sale offering — a named victim AND a named \

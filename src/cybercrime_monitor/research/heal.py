@@ -17,12 +17,20 @@ without applying them.
 Three behaviors, one tick each (bounded — a Hermes run can take minutes):
   1. heal    — investigate a broken/disabled source, probe a proposed fix,
                apply it (URL swap and/or re-enable) if the probe passes and
-               the source is worth restoring.
+               the source is worth restoring. Runs against ANY disabled
+               source (auto-disabled or hand-disabled in sources.yaml) on a
+               cooldown, so a manually-disabled `# needs: ...` entry gets
+               periodically re-investigated too, not just left alone.
   2. prune   — disable a source sources/value.py judges "dead" (never
                produced a successful fetch) or "marginal" with corroborating
                zero-value evidence (no case contribution + negative analyst
-               feedback); remove it outright after a grace period of
-               continued non-value (settings.source_prune_grace_days).
+               feedback); remove ANY disabled source outright (auto- or
+               hand-disabled — see _maybe_remove_source) after a grace
+               period of continued non-recovery
+               (settings.source_prune_grace_days). A hand-disabled source
+               has no prior proposal to read a "disabled since" timestamp
+               from, so the first prune pass that observes it starts the
+               clock right there instead of leaving it disabled forever.
   3. (discovery is a separate job — see research/discover.py — since it's a
      different kind of Hermes run: open-ended search vs. investigate-one-
      source.)
@@ -389,16 +397,25 @@ async def _prune_pass(db_conn, *, scheduler, sse_broadcaster) -> None:
 
     for source_id, src in sources_by_id.items():
         value = values.get(source_id)
+
+        if not src.get("enabled", True):
+            # Already disabled — whether by this loop's value judgement or
+            # by hand (a `# needs:` entry in sources.yaml). Removal-eligibility
+            # is intentionally NOT gated on should_prune/min_history here: a
+            # disabled source produces no fresh run history to ever satisfy
+            # that gate, which is exactly why hand-disabled sources used to
+            # sit forever. _heal_one already gets a crack at fixing it every
+            # _HEAL_COOLDOWN_HOURS; if that never pans out, age it out after
+            # the grace period regardless of why it was disabled.
+            await _maybe_remove_source(db_conn, src, value)
+            continue
+
         if value is None:
             continue
         min_history = _min_history(source_id)
         if not source_value.should_prune(value=value, min_history=min_history):
             continue
-
-        if src.get("enabled", True):
-            await _disable_source(db_conn, src, value, scheduler=scheduler, sse_broadcaster=sse_broadcaster)
-        else:
-            await _maybe_remove_source(db_conn, src, value)
+        await _disable_source(db_conn, src, value, scheduler=scheduler, sse_broadcaster=sse_broadcaster)
 
 
 async def _disable_source(db_conn, source: dict, value: dict, *, scheduler, sse_broadcaster) -> None:
@@ -424,17 +441,43 @@ async def _disable_source(db_conn, source: dict, value: dict, *, scheduler, sse_
         unschedule_source(scheduler, source["id"])
 
 
-async def _maybe_remove_source(db_conn, source: dict, value: dict) -> None:
-    """Already disabled by a prior prune pass — remove outright once the
-    grace period has elapsed with no recovery (a heal investigation that
-    found a fix would have re-enabled it before this runs)."""
+async def _maybe_remove_source(db_conn, source: dict, value: dict | None) -> None:
+    """Already disabled — by a prior prune pass, or by hand (a `# needs:`
+    entry someone added directly to sources.yaml, which has no proposal
+    history at all). Remove outright once the grace period has elapsed with
+    no recovery (a heal investigation that found a fix would have
+    re-enabled it before this runs).
+
+    If there's no existing prune-applied proposal to read a disabled_at
+    from — true for every hand-disabled source, and for any source disabled
+    before this clock-starting logic existed — start the clock now instead
+    of leaving it disabled forever. This is what makes manually-disabled
+    sources eventually get cleaned up at all."""
     proposals = await db.get_heal_proposals(db_conn, status="validated")
     disabled_at = None
     for p in proposals:
         if p["source_id"] == source["id"] and p.get("action") == "prune" and p.get("applied"):
             disabled_at = p["created_at"]
             break
+
     if disabled_at is None:
+        classification = value["classification"] if value else "unknown"
+        reason = f"already disabled, no prior prune record — starting removal grace clock (value={classification})"
+        proposal_id = await db.create_heal_proposal(
+            db_conn, source_id=source["id"], proposal={"classification": classification},
+            notes=reason, action="prune",
+        )
+        await db.update_heal_proposal_status(db_conn, proposal_id=proposal_id, status="validated")
+        await db.record_applied_change(db_conn, proposal_id=proposal_id, before={}, after={})
+        log.info("[heal] prune %s: starting removal grace clock for already-disabled source", source["id"])
+        await _log_activity(
+            db_conn, subsystem="prune", action="removal_clock_started",
+            summary=(
+                f"Source '{source['id']}' is disabled with no tracked prune history — "
+                f"will be removed in {settings.source_prune_grace_days}d if not recovered by heal"
+            ),
+            detail={"value": value}, ref_id=source["id"],
+        )
         return
     try:
         elapsed = datetime.now(timezone.utc) - datetime.fromisoformat(disabled_at)

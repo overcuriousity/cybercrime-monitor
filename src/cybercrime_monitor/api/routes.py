@@ -23,6 +23,7 @@ from ..db import (
     fetch_cases,
     fetch_items,
     get_actor_profile,
+    get_all_source_values,
     get_case_by_id,
     get_case_items,
     get_case_links,
@@ -39,7 +40,6 @@ from ..db import (
     stats_cases_by_crime_type,
     stats_cases_in_kev,
     stats_timeseries,
-    stats_top_actors,
     stats_top_keywords,
 )
 from ..matcher import matcher
@@ -217,9 +217,10 @@ async def api_stream():
 # ── Sources ───────────────────────────────────────────────────────────────────
 
 @router.get("/api/sources")
-async def api_sources(request: Request):
+async def api_sources(request: Request, db=Depends(get_db)):
     sources = load_sources()
     scheduler = getattr(request.app.state, "scheduler", None)
+    values = await get_all_source_values(db)
     result = []
     for s in sources:
         h = health.get(s["id"])
@@ -229,6 +230,7 @@ async def api_sources(request: Request):
         # unless the dashboard can say "first run scheduled at X."
         job = scheduler.get_job(s["id"]) if scheduler else None
         next_run_at = job.next_run_time.isoformat() if job and job.next_run_time else None
+        value = values.get(s["id"])
         result.append(
             {
                 "id": s["id"],
@@ -246,6 +248,12 @@ async def api_sources(request: Request):
                 "last_empty_at": h.last_empty_at if h else None,
                 "consecutive_empty": h.consecutive_empty if h else 0,
                 "next_run_at": next_run_at,
+                # Cached investigation-value classification from the
+                # autonomous heal/prune loop (sources/value.py) — lets the
+                # dashboard explain *why* a disabled source was disabled
+                # (e.g. "dead" vs a human's manual "# needs:" disable, which
+                # has no classification yet).
+                "value_classification": value.get("classification") if value else None,
             }
         )
     return result
@@ -317,7 +325,12 @@ async def api_stats_top_keywords(db=Depends(get_db), limit: int = Query(default=
 
 @router.get("/api/stats/top_actors")
 async def api_stats_top_actors(db=Depends(get_db), limit: int = Query(default=10, le=50)):
-    return {"actors": await stats_top_actors(db, limit=limit)}
+    # Case-based (deduplicated incidents), not item-mention counts — see
+    # stats_cases_by_actor's docstring. Kept at this URL/shape ("actors":
+    # [{"actor","count"}]) so the Feed dashboard's existing chart call works
+    # unchanged; this is the same leaderboard the Landscape tab uses.
+    rows = await stats_cases_by_actor(db, limit=limit)
+    return {"actors": [{"actor": r["actor"], "count": r["n"]} for r in rows]}
 
 
 # ── Classifier ────────────────────────────────────────────────────────────────
