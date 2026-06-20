@@ -13,6 +13,17 @@ selected by settings.llm_backend:
     already configured and working (see settings.hermes_model).
   - "none": extraction layer disabled entirely.
 
+When llm_backend="openai" and the configured endpoint is simply unreachable
+(connection refused/timeout — no dedicated LLM server running) but `hermes`
+is installed, extraction transparently falls back to the hermes_cli
+transport instead of leaving every item permanently unextracted (see
+settings.llm_auto_fallback_to_hermes, _fallback_eligible, and
+_BackendUnreachable below). This only triggers on genuine unreachability,
+not on a bad/rejected response — a misconfigured endpoint that's up but
+returning errors stays a visible failure rather than being silently masked
+by switching transports. llm/health.py's `using_fallback` flag (surfaced via
+/api/classifier/health) reflects when this is active.
+
 This replaces the old triage-only classifier: instead of a single priority
 label, each item is run through a richer schema that pulls out the
 structured fields the case layer needs — crime type, victim, attribution,
@@ -22,6 +33,8 @@ signal the old classifier produced. See db.py's `extractions` table.
 import json
 import logging
 import re
+import shutil
+import time
 from dataclasses import dataclass, field
 
 import httpx
@@ -31,6 +44,54 @@ from ..settings import settings
 from . import health as llm_health
 
 log = logging.getLogger(__name__)
+
+
+class _BackendUnreachable(Exception):
+    """Raised internally when the configured openai-compatible endpoint
+    can't be reached at all (connection refused/timeout) — distinct from a
+    malformed/rejected response, which means "this call failed," not "this
+    transport is gone." Only this case triggers the hermes-agent fallback
+    below; a 401 or a schema-violating response stays a real, visible
+    failure rather than being silently papered over by switching backends."""
+
+
+# ── Automatic hermes-agent fallback for llm_backend="openai" ────────────────
+# See settings.llm_auto_fallback_to_hermes's docstring. Process-local cooldown
+# state, mirroring the backoff pattern in llm/job.py — once the openai
+# endpoint is found unreachable, stop spending a request probing it every
+# single batch and just use hermes until the cooldown elapses, then try
+# openai again so a since-restarted local server gets picked back up
+# automatically.
+_openai_unreachable_until = 0.0
+
+
+def _hermes_available() -> bool:
+    return bool(settings.hermes_bin) and shutil.which(settings.hermes_bin) is not None
+
+
+def _fallback_eligible() -> bool:
+    return settings.llm_backend == "openai" and settings.llm_auto_fallback_to_hermes and _hermes_available()
+
+
+def _in_fallback_cooldown() -> bool:
+    return time.monotonic() < _openai_unreachable_until
+
+
+def _enter_fallback_cooldown() -> None:
+    global _openai_unreachable_until
+    _openai_unreachable_until = time.monotonic() + settings.llm_fallback_cooldown_seconds
+    llm_health.set_using_fallback(True)
+    log.warning(
+        "[llm] openai-compatible endpoint %s unreachable — falling back to "
+        "hermes-agent for the next %ds",
+        settings.llm_base_url, settings.llm_fallback_cooldown_seconds,
+    )
+
+
+def _maybe_exit_fallback_cooldown() -> None:
+    if llm_health.get().using_fallback and not _in_fallback_cooldown():
+        llm_health.set_using_fallback(False)
+        log.info("[llm] retrying openai-compatible endpoint %s after fallback cooldown", settings.llm_base_url)
 
 # Appended to every hermes_cli prompt — without this, a model with web/browser
 # toolsets available may "helpfully" search for corroborating info on a
@@ -297,12 +358,25 @@ async def extract_batch(items: list[dict]) -> list[Extraction | None]:
     parallel to `items` — entries are None where the model omitted that
     item's extraction or the whole call failed, so llm/job.py's per-item
     backoff logic can retry just that item next batch. Transport (HTTP vs
-    hermes CLI) is chosen by settings.llm_backend — see module docstring."""
+    hermes CLI) is chosen by settings.llm_backend — see module docstring,
+    with an automatic one-way fallback to hermes when llm_backend="openai"
+    but nothing is listening there (see _fallback_eligible)."""
     if not items:
         return []
     if settings.llm_backend == "hermes_cli":
         return await _extract_batch_via_hermes(items)
-    return await _extract_batch_via_openai(items)
+    if not _fallback_eligible():
+        return await _extract_batch_via_openai(items)
+
+    if _in_fallback_cooldown():
+        return await _extract_batch_via_hermes(items)
+    try:
+        result = await _extract_batch_via_openai(items)
+    except _BackendUnreachable:
+        _enter_fallback_cooldown()
+        return await _extract_batch_via_hermes(items)
+    _maybe_exit_fallback_cooldown()
+    return result
 
 
 async def _extract_batch_via_openai(items: list[dict]) -> list[Extraction | None]:
@@ -339,6 +413,9 @@ async def _extract_batch_via_openai(items: list[dict]) -> list[Extraction | None
         if not extractions_by_idx:
             llm_health.record_error(f"unparseable batch response: {content[:200]!r}")
         return [extractions_by_idx.get(i) for i in range(len(items))]
+    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+        llm_health.record_error(str(exc) or repr(exc))
+        raise _BackendUnreachable(str(exc)) from exc
     except Exception as exc:
         llm_health.record_error(str(exc) or repr(exc))
         return [None] * len(items)
@@ -367,10 +444,22 @@ async def extract_one(
 ) -> Extraction | None:
     """Single-item variant of extract_batch — used where batching doesn't
     apply (e.g. ad-hoc re-extraction). Returns None on any failure. Transport
-    chosen by settings.llm_backend — see module docstring."""
+    chosen by settings.llm_backend — see module docstring — with the same
+    automatic hermes fallback as extract_batch."""
     if settings.llm_backend == "hermes_cli":
         return await _extract_one_via_hermes(title, snippet, source_name, regex_priority, regex_tags)
-    return await _extract_one_via_openai(title, snippet, source_name, regex_priority, regex_tags)
+    if not _fallback_eligible():
+        return await _extract_one_via_openai(title, snippet, source_name, regex_priority, regex_tags)
+
+    if _in_fallback_cooldown():
+        return await _extract_one_via_hermes(title, snippet, source_name, regex_priority, regex_tags)
+    try:
+        result = await _extract_one_via_openai(title, snippet, source_name, regex_priority, regex_tags)
+    except _BackendUnreachable:
+        _enter_fallback_cooldown()
+        return await _extract_one_via_hermes(title, snippet, source_name, regex_priority, regex_tags)
+    _maybe_exit_fallback_cooldown()
+    return result
 
 
 async def _extract_one_via_openai(
@@ -406,6 +495,9 @@ async def _extract_one_via_openai(
             llm_health.record_error(f"unparseable response: {content[:200]!r}")
             return None
         return extraction
+    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+        llm_health.record_error(str(exc) or repr(exc))
+        raise _BackendUnreachable(str(exc)) from exc
     except Exception as exc:
         llm_health.record_error(str(exc) or repr(exc))
         return None

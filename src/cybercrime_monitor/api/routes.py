@@ -35,6 +35,7 @@ from ..db import (
 from ..matcher import matcher
 from ..pipeline import correlate as correlate_health
 from ..research import agent as research_health
+from ..research import discover as discover_health
 from ..research import heal as heal_health
 from ..scheduler import load_sources
 from ..settings import settings
@@ -49,7 +50,7 @@ async def get_db(request: Request):
 
 
 # ── Liveness/readiness ───────────────────────────────────────────────────────
-# For systemd/uptime checks (see systemd/marketplace-monitor.service) — no
+# For systemd/uptime checks (see systemd/cybercrime-monitor.service) — no
 # auth, no sensitive data, just enough to tell "process is up and the DB/
 # scheduler are functioning" from "process is wedged."
 
@@ -318,6 +319,7 @@ async def api_classifier_health(db=Depends(get_db)):
     h = llm_health.get()
     return {
         "backend": settings.llm_backend,
+        "using_fallback": h.using_fallback,
         "last_run_at": h.last_run_at,
         "last_success_at": h.last_success_at,
         "last_batch_size": h.last_batch_size,
@@ -369,6 +371,7 @@ async def api_status(request: Request, db=Depends(get_db)):
     ch = correlate_health.get()
     rh = research_health.get()
     hh = heal_health.get()
+    dh = discover_health.get()
 
     cooldown_iso = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
 
@@ -382,6 +385,7 @@ async def api_status(request: Request, db=Depends(get_db)):
             break
 
     return {
+        "admin": {"enabled": bool(settings.admin_token)},
         "scheduler": {"running": scheduler_running, "jobs": jobs},
         "sources": {
             "total": len(enabled_sources),
@@ -390,6 +394,7 @@ async def api_status(request: Request, db=Depends(get_db)):
         },
         "classifier": {
             "backend": settings.llm_backend,
+            "using_fallback": h.using_fallback,
             "last_run_at": h.last_run_at,
             "last_success_at": h.last_success_at,
             "last_batch_size": h.last_batch_size,
@@ -430,6 +435,15 @@ async def api_status(request: Request, db=Depends(get_db)):
             "last_error_at": hh.last_error_at,
             "consecutive_errors": hh.consecutive_errors,
             "proposals": await count_heal_proposals_by_status(db),
+            "autoapply_enabled": settings.source_autoapply_enabled,
+        },
+        "discover": {
+            "last_run_at": dh.last_run_at,
+            "last_success_at": dh.last_success_at,
+            "last_processed_count": dh.last_processed_count,
+            "last_error": dh.last_error,
+            "last_error_at": dh.last_error_at,
+            "consecutive_errors": dh.consecutive_errors,
         },
     }
 
@@ -437,6 +451,21 @@ async def api_status(request: Request, db=Depends(get_db)):
 # ── Cases (deduplicated incidents) ──────────────────────────────────────────
 # See pipeline/correlate.py — the structured, deduplicated view on top of
 # the raw item feed above.
+
+_DATE_ONLY_LEN = len("YYYY-MM-DD")
+
+
+def _normalize_date_filter(value: str | None, *, end_of_day: bool) -> str | None:
+    """Expand a UI date-only string (YYYY-MM-DD) to a bound that compares
+    correctly against ISO timestamps stored in the DB. `since` gets the
+    start of the day; `until` gets the end of the day so the full day is
+    included rather than excluding timestamps after 00:00:00."""
+    if value is None or len(value) != _DATE_ONLY_LEN:
+        return value
+    if end_of_day:
+        return f"{value}T23:59:59.999999+00:00"
+    return f"{value}T00:00:00+00:00"
+
 
 @router.get("/api/cases")
 async def api_cases(
@@ -447,6 +476,8 @@ async def api_cases(
     crime_type: str | None = Query(default=None),
     in_kev: bool | None = Query(default=None),
     search: str | None = Query(default=None),
+    since: str | None = Query(default=None),
+    until: str | None = Query(default=None),
 ):
     cases = await fetch_cases(
         db,
@@ -456,6 +487,8 @@ async def api_cases(
         crime_type=crime_type,
         in_kev=in_kev,
         search=search,
+        since=_normalize_date_filter(since, end_of_day=False),
+        until=_normalize_date_filter(until, end_of_day=True),
     )
     total = await count_cases(db)
     return {"total": total, "cases": cases}
@@ -463,13 +496,44 @@ async def api_cases(
 
 @router.get("/api/cases/{case_id}")
 async def api_case_detail(case_id: int, db=Depends(get_db)):
+    from ..db import get_case_links, get_research_runs_for_case
+
     case = await get_case_by_id(db, case_id)
     if case is None:
         raise HTTPException(status_code=404, detail="Case not found")
     case["cve_ids"] = json.loads(case["cve_ids"]) if case["cve_ids"] else []
+    case["iocs"] = json.loads(case["iocs"]) if case["iocs"] else []
     case["in_kev"] = bool(case["in_kev"])
     items = await get_case_items(db, case_id)
-    return {"case": case, "items": items}
+    research_runs = await get_research_runs_for_case(db, case_id)
+    related = await get_case_links(db, case_id)
+    return {"case": case, "items": items, "research_runs": research_runs, "related_cases": related}
+
+
+@router.post("/api/cases/{case_id}/research", dependencies=[Depends(require_admin)])
+async def api_case_request_research(case_id: int, request: Request, db=Depends(get_db)):
+    """Force a deep-research pass on this case, bypassing the normal
+    significance/cooldown gating (see db.get_cases_needing_research) — for
+    "re-research this with whatever's missing" from the case detail pane.
+    Admin-gated: each call spends a Hermes run, same cost class as the
+    keyword editor's write access."""
+    from ..db import request_case_research
+
+    ok = await request_case_research(db, case_id=case_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Case not found")
+
+    # Nudge the research job to run soon rather than waiting out its full
+    # interval — best-effort: if the job isn't registered (research
+    # disabled) this just no-ops and the flag sits until/unless research is
+    # re-enabled.
+    scheduler = getattr(request.app.state, "scheduler", None)
+    if scheduler is not None:
+        job = scheduler.get_job("_research")
+        if job is not None:
+            scheduler.modify_job("_research", next_run_time=datetime.now(timezone.utc))
+
+    return {"status": "queued"}
 
 
 @router.get("/api/stats/cases")
@@ -479,6 +543,36 @@ async def api_stats_cases(db=Depends(get_db)):
         "by_crime_type": await stats_cases_by_crime_type(db),
         "in_kev": await stats_cases_in_kev(db),
     }
+
+
+# ── Analyst feedback ─────────────────────────────────────────────────────────
+# Public-write like the rest of the dashboard (this is a single-analyst
+# tool, not multi-tenant) but bounded by the existing per-IP rate limit
+# (api/app.py's rate_limit_middleware) — feeds sources/value.py's scoring
+# and the heal/discover prompts (research/heal.py, research/discover.py).
+
+class FeedbackCreate(BaseModel):
+    case_id: int | None = None
+    item_id: int | None = None
+    verdict: str
+    note: str | None = None
+
+
+@router.post("/api/feedback")
+async def api_feedback_create(body: FeedbackCreate, db=Depends(get_db)):
+    from ..db import VALID_FEEDBACK_VERDICTS, add_feedback
+
+    if (body.case_id is None) == (body.item_id is None):
+        raise HTTPException(status_code=400, detail="exactly one of case_id or item_id is required")
+    if body.verdict not in VALID_FEEDBACK_VERDICTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"verdict must be one of {sorted(VALID_FEEDBACK_VERDICTS)}",
+        )
+    feedback_id = await add_feedback(
+        db, case_id=body.case_id, item_id=body.item_id, verdict=body.verdict, note=body.note
+    )
+    return {"id": feedback_id, "status": "ok"}
 
 
 # ── Self-healing source proposals ───────────────────────────────────────────

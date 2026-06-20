@@ -21,6 +21,25 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _normalize_published_at(dt: datetime | None) -> str | None:
+    """Collectors hand back published_at in whatever timezone the source
+    used (e.g. RSS feeds commonly carry an explicit "-04:00" offset). Stored
+    naively, that breaks every later string comparison against seen_at/
+    other items' published_at (case first_seen/last_seen MIN/MAX, the
+    since/until date filters) — lexicographic ordering of ISO strings is
+    only chronological when every string shares the same offset. Normalize
+    to UTC at the single point of insertion so every stored timestamp is
+    "+00:00" consistently, same as seen_at via _utcnow(). A naive datetime
+    (no tzinfo — rare, but some date formats omit an offset) is assumed
+    already UTC rather than rejected, since "unknown offset" is a worse
+    failure mode than "off by a few hours in an edge case.\""""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
 log = logging.getLogger(__name__)
 
 _SCHEMA = """
@@ -115,7 +134,16 @@ CREATE TABLE IF NOT EXISTS cases (
     first_seen              TEXT NOT NULL,
     last_seen               TEXT NOT NULL,
     source_count            INTEGER NOT NULL DEFAULT 0,
-    extra                   TEXT NOT NULL DEFAULT '{}'
+    extra                   TEXT NOT NULL DEFAULT '{}',
+    -- IoCs aggregated across all linked items + research findings (union,
+    -- same precedence as cve_ids). Added via ALTER TABLE migration for
+    -- pre-existing DBs — see _migrate() below.
+    iocs                    TEXT NOT NULL DEFAULT '[]',
+    -- Set by POST /api/cases/{id}/research to force a deep-research pass on
+    -- this case regardless of significance/cooldown gating (see
+    -- get_cases_needing_research). NULL = no forced request pending.
+    -- Added via ALTER TABLE migration for pre-existing DBs.
+    research_requested_at   TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_cases_last_seen ON cases(last_seen DESC);
@@ -178,10 +206,65 @@ CREATE TABLE IF NOT EXISTS source_heal_proposals (
     notes         TEXT,
     error         TEXT,
     created_at    TEXT NOT NULL,
-    validated_at  TEXT
+    validated_at  TEXT,
+    -- ── Autonomous apply audit trail (sources/writer.py + research/heal.py) ──
+    -- action: heal | prune | discover. applied=1 means writer.py actually
+    -- touched sources.yaml for this proposal (and a .bak-<ts> exists to
+    -- revert it). before/after are JSON snapshots of the affected source
+    -- entry's mutated fields, for human review without diffing the file.
+    -- All columns added via ALTER TABLE migration for pre-existing DBs.
+    action        TEXT,
+    applied       INTEGER NOT NULL DEFAULT 0,
+    before_value  TEXT,
+    after_value   TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_heal_proposals_source_id ON source_heal_proposals(source_id);
+
+-- One row per analyst verdict on a case or item — feeds sources/value.py's
+-- investigation-value scoring and is summarized into heal/discover prompts
+-- (research/heal.py, research/discover.py) so Hermes knows *why* a source
+-- is being reconsidered. case_id/item_id are both nullable but exactly one
+-- should be set; enforced in db.add_feedback, not at the schema level (kept
+-- simple — this is a single-analyst tool, not a multi-tenant write path).
+CREATE TABLE IF NOT EXISTS feedback (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id     INTEGER REFERENCES cases(id) ON DELETE CASCADE,
+    item_id     INTEGER REFERENCES items(id) ON DELETE CASCADE,
+    verdict     TEXT NOT NULL, -- useful | not_useful | noise | wrong_attribution
+    note        TEXT,
+    created_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_feedback_case_id ON feedback(case_id);
+CREATE INDEX IF NOT EXISTS idx_feedback_item_id ON feedback(item_id);
+
+-- Cached investigation-value snapshot per source (sources/value.py) — a
+-- score + classification computed from yield quality, case contribution,
+-- health, feedback and recency. Read by the dashboard and by the autonomous
+-- source loop's should_apply() guardrail instead of recomputing on every
+-- request. One row per source_id, overwritten on each refresh.
+CREATE TABLE IF NOT EXISTS source_value (
+    source_id       TEXT PRIMARY KEY,
+    score           REAL NOT NULL,
+    classification  TEXT NOT NULL, -- valuable | marginal | dead
+    components      TEXT NOT NULL DEFAULT '{}',
+    computed_at     TEXT NOT NULL
+);
+
+-- Algorithmic (non-LLM) case-to-case relationships — shared victim/actor/
+-- CVE/IoC overlap within a temporal window (pipeline/cross_correlate.py).
+-- Symmetric: case_a < case_b by convention so a pair is stored once.
+CREATE TABLE IF NOT EXISTS case_links (
+    case_a       INTEGER NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+    case_b       INTEGER NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+    score        REAL NOT NULL,
+    reasons      TEXT NOT NULL DEFAULT '[]',
+    computed_at  TEXT NOT NULL,
+    PRIMARY KEY (case_a, case_b)
+);
+
+CREATE INDEX IF NOT EXISTS idx_case_links_b ON case_links(case_b);
 
 -- Periodic snapshot of health.py's in-memory per-source registry (see
 -- scheduler.py's "_health_persist" job and health.snapshot/restore) — purely
@@ -240,6 +323,24 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
     # exists on both brand-new (via _SCHEMA's CREATE TABLE) and migrated DBs.
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_items_content_key ON items(content_key)")
 
+    case_cols = {r["name"] for r in await conn.execute_fetchall("PRAGMA table_info(cases)")}
+    if "iocs" not in case_cols:
+        await conn.execute("ALTER TABLE cases ADD COLUMN iocs TEXT NOT NULL DEFAULT '[]'")
+        log.info("Migrated cases table: added iocs column")
+    if "research_requested_at" not in case_cols:
+        await conn.execute("ALTER TABLE cases ADD COLUMN research_requested_at TEXT")
+        log.info("Migrated cases table: added research_requested_at column")
+
+    heal_cols = {r["name"] for r in await conn.execute_fetchall("PRAGMA table_info(source_heal_proposals)")}
+    for col, ddl in (
+        ("action", "ALTER TABLE source_heal_proposals ADD COLUMN action TEXT"),
+        ("applied", "ALTER TABLE source_heal_proposals ADD COLUMN applied INTEGER NOT NULL DEFAULT 0"),
+        ("before_value", "ALTER TABLE source_heal_proposals ADD COLUMN before_value TEXT"),
+        ("after_value", "ALTER TABLE source_heal_proposals ADD COLUMN after_value TEXT"),
+    ):
+        if col not in heal_cols:
+            await conn.execute(ddl)
+            log.info("Migrated source_heal_proposals table: added %s column", col)
 
 async def insert_item(conn: aiosqlite.Connection, item: Item) -> int | None:
     """Insert item; returns new row id or None if duplicate. Deliberately
@@ -260,7 +361,7 @@ async def insert_item(conn: aiosqlite.Connection, item: Item) -> int | None:
                 item.title,
                 item.url,
                 item.snippet,
-                item.published_at.isoformat() if item.published_at else None,
+                _normalize_published_at(item.published_at),
                 item.dedupe_key,
                 _utcnow().isoformat(),
                 json.dumps(item.source_tags),
@@ -407,12 +508,17 @@ def _build_items_where(
         idx += 1
 
     if since:
-        parts.append(f"i.seen_at >= :p{idx}")
+        # COALESCE to the real event date when the collector captured one
+        # (RSS/Mastodon/HIBP/ransomware.live/dated forum posts) — "items
+        # from last week" should mean the incident happened last week, not
+        # merely that our scraper saw it last week. Falls back to seen_at
+        # for sources that never carry a publish date (paste sites).
+        parts.append(f"COALESCE(i.published_at, i.seen_at) >= :p{idx}")
         params[f"p{idx}"] = since
         idx += 1
 
     if until:
-        parts.append(f"i.seen_at <= :p{idx}")
+        parts.append(f"COALESCE(i.published_at, i.seen_at) <= :p{idx}")
         params[f"p{idx}"] = until
         idx += 1
 
@@ -509,6 +615,13 @@ async def fetch_items(
         LEFT JOIN item_priority ep ON ep.item_id = i.id
         LEFT JOIN extractions e ON e.item_id = i.id
         {named_where}
+        -- Deliberately seen_at, not published_at: this is the live feed's
+        -- pagination/SSE order — a freshly-ingested item must always land at
+        -- the top regardless of its (possibly old) publish date, or live
+        -- prepending and "load more" offsets would desync from what the
+        -- user is actually scrolled through. The *displayed* timestamp on
+        -- each card prefers published_at when known (see api/static/app.js
+        -- buildCard) — only the ordering stays ingest-time.
         ORDER BY i.seen_at DESC
         LIMIT :limit OFFSET :offset
         """,
@@ -1119,7 +1232,7 @@ async def get_uncorrelated_extracted_items(conn: aiosqlite.Connection, *, limit:
     rows = await conn.execute_fetchall(
         """
         SELECT i.id, i.title, i.snippet, i.source_id, i.source_name, i.url,
-               i.seen_at, i.content_key,
+               i.seen_at, i.published_at, i.content_key,
                e.crime_type, e.victim, e.victim_sector, e.victim_country, e.actor,
                e.cve_ids, e.iocs, e.significance, e.confidence
         FROM items i
@@ -1221,22 +1334,30 @@ async def create_case(
     cve_ids: list[str],
     in_kev: bool,
     item_id: int,
+    event_at: str,
+    iocs: list[str] | None = None,
 ) -> int:
     """Create a new case and link its founding item in one go. Returns the
-    new case id."""
-    now = _utcnow().isoformat()
+    new case id.
+
+    event_at: the founding item's real-world date — its published_at if the
+    collector captured one (RSS/Mastodon/HIBP/ransomware.live/dated forum
+    posts), else its seen_at. Seeds both first_seen and last_seen so a case's
+    timeline reflects when the incident actually happened/was reported, not
+    merely when our scraper first noticed it — see merge_item_into_case for
+    how subsequent items extend this range."""
     cur = await conn.execute(
         """
         INSERT INTO cases
             (case_key, title, summary, crime_type, attribution, attribution_confidence,
              damaged_party, damaged_party_sector, damaged_party_country,
              significance, significance_score, status, cve_ids, in_kev,
-             first_seen, last_seen, source_count, extra)
+             first_seen, last_seen, source_count, extra, iocs)
         VALUES
             (:case_key, :title, :summary, :crime_type, :attribution, :attribution_confidence,
              :damaged_party, :damaged_party_sector, :damaged_party_country,
              :significance, :significance_score, 'new', :cve_ids, :in_kev,
-             :first_seen, :last_seen, 1, '{}')
+             :event_at, :event_at, 1, '{}', :iocs)
         """,
         {
             "case_key": case_key,
@@ -1252,8 +1373,8 @@ async def create_case(
             "significance_score": significance_score,
             "cve_ids": json.dumps(cve_ids),
             "in_kev": 1 if in_kev else 0,
-            "first_seen": now,
-            "last_seen": now,
+            "event_at": event_at,
+            "iocs": json.dumps(iocs or []),
         },
     )
     case_id = cur.lastrowid
@@ -1278,21 +1399,33 @@ async def merge_item_into_case(
     attribution_confidence: float | None,
     damaged_party_sector: str | None,
     damaged_party_country: str | None,
+    event_at: str,
+    iocs: list[str] | None = None,
 ) -> None:
     """Link a corroborating item into an existing case and recompute its
     aggregate fields: significance/score (max across all linked items —
-    corroboration never lowers significance), cve_ids (union), in_kev (OR),
-    last_seen (extended), source_count (recount of distinct item sources).
-    Sparse fields (crime_type/attribution/sector/country) are only filled in
-    when the case doesn't have a value yet — first reporter's structured
-    data wins unless blank, rather than the newest report silently
-    overwriting an established attribution."""
+    corroboration never lowers significance), cve_ids (union), iocs (union),
+    in_kev (OR), first_seen/last_seen (widened to cover this item's real
+    event date — see event_at), source_count (recount of distinct item
+    sources). Sparse fields (crime_type/attribution/sector/country) are only
+    filled in when the case doesn't have a value yet — first reporter's
+    structured data wins unless blank, rather than the newest report
+    silently overwriting an established attribution.
+
+    event_at: the merging item's published_at if known, else its seen_at —
+    same convention as create_case. A corroborating report can be OLDER than
+    the case's current first_seen (e.g. someone finds an earlier mention of
+    the same incident) or simply confirm the same window; MIN/MAX widen the
+    range rather than assuming reports arrive in chronological order."""
     case = await get_case_by_id(conn, case_id)
     if case is None:
         return
 
     existing_cve_ids = json.loads(case["cve_ids"]) if case["cve_ids"] else []
     merged_cve_ids = list(dict.fromkeys([*existing_cve_ids, *cve_ids]))
+
+    existing_iocs = json.loads(case["iocs"]) if case["iocs"] else []
+    merged_iocs = list(dict.fromkeys([*existing_iocs, *(iocs or [])]))
 
     new_rank = max(_SIG_RANK.get(case["significance"], 1), _SIG_RANK.get(significance, 1))
 
@@ -1316,13 +1449,15 @@ async def merge_item_into_case(
             significance = :significance,
             significance_score = MAX(significance_score, :significance_score),
             cve_ids = :cve_ids,
+            iocs = :iocs,
             in_kev = MAX(in_kev, :in_kev),
             crime_type = COALESCE(NULLIF(crime_type, 'other'), :crime_type, crime_type),
             attribution = COALESCE(attribution, :attribution),
             attribution_confidence = COALESCE(attribution_confidence, :attribution_confidence),
             damaged_party_sector = COALESCE(damaged_party_sector, :damaged_party_sector),
             damaged_party_country = COALESCE(damaged_party_country, :damaged_party_country),
-            last_seen = :last_seen,
+            first_seen = MIN(first_seen, :event_at),
+            last_seen = MAX(last_seen, :event_at),
             source_count = :source_count
         WHERE id = :case_id
         """,
@@ -1331,13 +1466,14 @@ async def merge_item_into_case(
             "significance": _RANK_SIG[new_rank],
             "significance_score": new_rank / 3.0,
             "cve_ids": json.dumps(merged_cve_ids),
+            "iocs": json.dumps(merged_iocs),
             "in_kev": 1 if in_kev else 0,
             "crime_type": crime_type,
             "attribution": attribution,
             "attribution_confidence": attribution_confidence,
             "damaged_party_sector": damaged_party_sector,
             "damaged_party_country": damaged_party_country,
-            "last_seen": _utcnow().isoformat(),
+            "event_at": event_at,
             "source_count": source_count,
         },
     )
@@ -1358,9 +1494,14 @@ async def fetch_cases(
     crime_type: str | None = None,
     in_kev: bool | None = None,
     search: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
 ) -> list[dict]:
     """Case-centric counterpart to fetch_items — see that function's
-    docstring for the shared filter/pagination shape this mirrors."""
+    docstring for the shared filter/pagination shape this mirrors.
+    `search` also matches IoCs (not just title/victim/actor) so an
+    investigator can land on a case from an indicator alone. `since`/`until`
+    bound on last_seen — a timeframe search ("what happened last week")."""
     parts = []
     params: dict = {}
     if min_significance:
@@ -1375,8 +1516,17 @@ async def fetch_cases(
         parts.append("in_kev = :in_kev")
         params["in_kev"] = 1 if in_kev else 0
     if search:
-        parts.append("(title LIKE :search OR damaged_party LIKE :search OR attribution LIKE :search)")
+        parts.append(
+            "(title LIKE :search OR damaged_party LIKE :search OR attribution LIKE :search "
+            "OR iocs LIKE :search OR cve_ids LIKE :search)"
+        )
         params["search"] = f"%{search}%"
+    if since:
+        parts.append("last_seen >= :since")
+        params["since"] = since
+    if until:
+        parts.append("last_seen <= :until")
+        params["until"] = until
     where = ("WHERE " + " AND ".join(parts)) if parts else ""
     rows = await conn.execute_fetchall(
         f"""
@@ -1391,6 +1541,7 @@ async def fetch_cases(
     for r in rows:
         d = dict(r)
         d["cve_ids"] = json.loads(d["cve_ids"]) if d["cve_ids"] else []
+        d["iocs"] = json.loads(d["iocs"]) if d["iocs"] else []
         d["in_kev"] = bool(d["in_kev"])
         out.append(d)
     return out
@@ -1407,20 +1558,28 @@ async def count_cases(conn: aiosqlite.Connection) -> int:
 # the log; cases.status tracks where a case is in that lifecycle.
 
 async def get_cases_needing_research(conn: aiosqlite.Connection, *, limit: int, cooldown_iso: str) -> list[dict]:
-    """Cases worth spending a Hermes research run on: significant (warn or
-    critical — info-level cases aren't worth the cost) and not researched
-    since `cooldown_iso` (so a case that didn't yield new information isn't
-    re-researched every tick forever). Oldest-significant-first, so a
-    backlog drains in a stable order rather than thrashing between cases."""
+    """Cases worth spending a Hermes research run on: either explicitly
+    forced via POST /api/cases/{id}/research (research_requested_at set —
+    bypasses both the significance and cooldown gates, since an analyst
+    asking for a re-research means "go again right now"), or naturally
+    significant (warn/critical) and not researched since `cooldown_iso` (so
+    a case that didn't yield new information isn't re-researched every tick
+    forever). Forced cases sort first, then critical-before-warn, then
+    oldest-first, so a backlog drains in a stable order rather than
+    thrashing between cases."""
     rows = await conn.execute_fetchall(
         """
         SELECT * FROM cases
-        WHERE significance IN ('warn', 'critical')
-          AND NOT EXISTS (
-            SELECT 1 FROM research_runs r
-            WHERE r.case_id = cases.id AND r.started_at >= :cooldown
-          )
+        WHERE research_requested_at IS NOT NULL
+           OR (
+             significance IN ('warn', 'critical')
+             AND NOT EXISTS (
+               SELECT 1 FROM research_runs r
+               WHERE r.case_id = cases.id AND r.started_at >= :cooldown
+             )
+           )
         ORDER BY
+            (research_requested_at IS NOT NULL) DESC,
             CASE significance WHEN 'critical' THEN 3 WHEN 'warn' THEN 2 ELSE 1 END DESC,
             last_seen ASC
         LIMIT :limit
@@ -1431,8 +1590,34 @@ async def get_cases_needing_research(conn: aiosqlite.Connection, *, limit: int, 
     for r in rows:
         d = dict(r)
         d["cve_ids"] = json.loads(d["cve_ids"]) if d["cve_ids"] else []
+        d["iocs"] = json.loads(d["iocs"]) if d["iocs"] else []
         out.append(d)
     return out
+
+
+async def clear_case_research_request(conn: aiosqlite.Connection, *, case_id: int) -> None:
+    """Clear a forced-research flag without otherwise touching the case —
+    used when a research run fails/times out so a persistently-broken
+    Hermes backend doesn't make a forced case retry every single tick
+    forever (see research/agent.py's failure path). The analyst can always
+    re-request via the API if it's still wanted."""
+    await conn.execute(
+        "UPDATE cases SET research_requested_at = NULL WHERE id = :id", {"id": case_id}
+    )
+    await conn.commit()
+
+
+async def request_case_research(conn: aiosqlite.Connection, *, case_id: int) -> bool:
+    """Flag a case for a forced deep-research pass (POST
+    /api/cases/{id}/research) — picked up first by the next _research tick
+    via get_cases_needing_research. Returns False if the case doesn't
+    exist."""
+    cur = await conn.execute(
+        "UPDATE cases SET research_requested_at = :now WHERE id = :id",
+        {"now": _utcnow().isoformat(), "id": case_id},
+    )
+    await conn.commit()
+    return cur.rowcount > 0
 
 
 async def count_cases_needing_research(conn: aiosqlite.Connection, *, cooldown_iso: str) -> int:
@@ -1499,26 +1684,34 @@ async def apply_research_findings(
     attribution: str | None,
     damaged_party: str | None,
     summary_addendum: str | None,
+    iocs: list[str] | None = None,
 ) -> None:
     """Merge Hermes' research findings back into the case. Sparse fields
     (attribution/damaged_party) only fill in if the case doesn't have a
     value yet — same first-reporter-wins precedence as
     merge_item_into_case, so an autonomous research run can fill gaps but
     can't silently overwrite a human/extraction-derived attribution it
-    disagrees with."""
+    disagrees with. iocs are unioned in (research can only add indicators,
+    never remove ones extraction already found). Always clears
+    research_requested_at — a forced research request is satisfied by one
+    completed run, whatever it found."""
     case = await get_case_by_id(conn, case_id)
     if case is None:
         return
     summary = case["summary"] or ""
     if summary_addendum:
         summary = (summary + "\n\n[research] " + summary_addendum).strip()
+    existing_iocs = json.loads(case["iocs"]) if case["iocs"] else []
+    merged_iocs = list(dict.fromkeys([*existing_iocs, *(iocs or [])]))
     await conn.execute(
         """
         UPDATE cases SET
             status = :status,
             attribution = COALESCE(attribution, :attribution),
             damaged_party = COALESCE(damaged_party, :damaged_party),
-            summary = :summary
+            summary = :summary,
+            iocs = :iocs,
+            research_requested_at = NULL
         WHERE id = :case_id
         """,
         {
@@ -1527,6 +1720,7 @@ async def apply_research_findings(
             "attribution": attribution,
             "damaged_party": damaged_party,
             "summary": summary,
+            "iocs": json.dumps(merged_iocs),
         },
     )
     await conn.commit()
@@ -1560,18 +1754,22 @@ async def source_recently_proposed(conn: aiosqlite.Connection, *, source_id: str
 
 
 async def create_heal_proposal(
-    conn: aiosqlite.Connection, *, source_id: str, proposal: dict, notes: str | None
+    conn: aiosqlite.Connection, *, source_id: str, proposal: dict, notes: str | None, action: str = "heal"
 ) -> int:
+    """action: "heal" (fix a broken source), "prune" (disable/remove a
+    low-value source), or "discover" (a brand-new candidate source) — see
+    research/heal.py and research/discover.py."""
     cur = await conn.execute(
         """
-        INSERT INTO source_heal_proposals (source_id, status, proposal, notes, created_at)
-        VALUES (:source_id, 'pending', :proposal, :notes, :created_at)
+        INSERT INTO source_heal_proposals (source_id, status, proposal, notes, created_at, action)
+        VALUES (:source_id, 'pending', :proposal, :notes, :created_at, :action)
         """,
         {
             "source_id": source_id,
             "proposal": json.dumps(proposal),
             "notes": notes,
             "created_at": _utcnow().isoformat(),
+            "action": action,
         },
     )
     await conn.commit()
@@ -1592,6 +1790,24 @@ async def update_heal_proposal_status(
             "error": error,
             "validated_at": _utcnow().isoformat(),
         },
+    )
+    await conn.commit()
+
+
+async def record_applied_change(
+    conn: aiosqlite.Connection, *, proposal_id: int, before: dict, after: dict
+) -> None:
+    """Mark a proposal as actually applied to sources.yaml (see
+    sources/writer.py) and record the before/after snapshot for audit —
+    every autonomous edit must be reviewable and revertible without diffing
+    the file by hand."""
+    await conn.execute(
+        """
+        UPDATE source_heal_proposals SET
+            applied = 1, before_value = :before, after_value = :after
+        WHERE id = :id
+        """,
+        {"id": proposal_id, "before": json.dumps(before), "after": json.dumps(after)},
     )
     await conn.commit()
 
@@ -1634,16 +1850,251 @@ async def count_running_research_runs(conn: aiosqlite.Connection) -> int:
     return row[0]["n"] if row else 0
 
 
+# ── Analyst feedback (POST /api/feedback) ───────────────────────────────────
+# Feeds sources/value.py's investigation-value scoring and is digested into
+# heal/discover prompts (research/heal.py, research/discover.py) so the
+# autonomous source loop knows which sources the analyst trusts.
+
+VALID_FEEDBACK_VERDICTS = {"useful", "not_useful", "noise", "wrong_attribution"}
+
+
+async def add_feedback(
+    conn: aiosqlite.Connection,
+    *,
+    case_id: int | None,
+    item_id: int | None,
+    verdict: str,
+    note: str | None,
+) -> int:
+    if verdict not in VALID_FEEDBACK_VERDICTS:
+        raise ValueError(f"invalid verdict: {verdict!r}")
+    if bool(case_id) == bool(item_id):
+        raise ValueError("feedback needs exactly one of case_id or item_id")
+    cur = await conn.execute(
+        """
+        INSERT INTO feedback (case_id, item_id, verdict, note, created_at)
+        VALUES (:case_id, :item_id, :verdict, :note, :created_at)
+        """,
+        {
+            "case_id": case_id,
+            "item_id": item_id,
+            "verdict": verdict,
+            "note": (note or "")[:1000] or None,
+            "created_at": _utcnow().isoformat(),
+        },
+    )
+    await conn.commit()
+    return cur.lastrowid
+
+
+async def get_feedback_for_case(conn: aiosqlite.Connection, case_id: int) -> list[dict]:
+    rows = await conn.execute_fetchall(
+        "SELECT * FROM feedback WHERE case_id = :case_id ORDER BY created_at DESC",
+        {"case_id": case_id},
+    )
+    return [dict(r) for r in rows]
+
+
+async def aggregate_feedback_by_source(conn: aiosqlite.Connection, *, since_iso: str) -> dict[str, dict[str, int]]:
+    """Verdict counts per source_id since `since_iso`, joining feedback →
+    item/case → originating items.source_id. A case's feedback is
+    attributed to every source that contributed an item to it (a case can
+    span multiple sources). Used by sources/value.py's feedback component
+    and to digest "why" into heal/discover prompts."""
+    rows = await conn.execute_fetchall(
+        """
+        SELECT i.source_id AS source_id, f.verdict AS verdict, COUNT(*) AS n
+        FROM feedback f
+        JOIN items i ON i.id = f.item_id
+        WHERE f.created_at >= :since AND f.item_id IS NOT NULL
+        GROUP BY i.source_id, f.verdict
+
+        UNION ALL
+
+        SELECT i.source_id AS source_id, f.verdict AS verdict, COUNT(*) AS n
+        FROM feedback f
+        JOIN case_items ci ON ci.case_id = f.case_id
+        JOIN items i ON i.id = ci.item_id
+        WHERE f.created_at >= :since AND f.case_id IS NOT NULL
+        GROUP BY i.source_id, f.verdict
+        """,
+        {"since": since_iso},
+    )
+    out: dict[str, dict[str, int]] = {}
+    for r in rows:
+        out.setdefault(r["source_id"], {}).setdefault(r["verdict"], 0)
+        out[r["source_id"]][r["verdict"]] += r["n"]
+    return out
+
+
+# ── Investigation-value snapshot (sources/value.py) ─────────────────────────
+
+async def save_source_value(
+    conn: aiosqlite.Connection, *, source_id: str, score: float, classification: str, components: dict
+) -> None:
+    await conn.execute(
+        """
+        INSERT INTO source_value (source_id, score, classification, components, computed_at)
+        VALUES (:source_id, :score, :classification, :components, :computed_at)
+        ON CONFLICT(source_id) DO UPDATE SET
+            score = excluded.score, classification = excluded.classification,
+            components = excluded.components, computed_at = excluded.computed_at
+        """,
+        {
+            "source_id": source_id,
+            "score": score,
+            "classification": classification,
+            "components": json.dumps(components),
+            "computed_at": _utcnow().isoformat(),
+        },
+    )
+    await conn.commit()
+
+
+async def get_source_value(conn: aiosqlite.Connection, source_id: str) -> dict | None:
+    rows = await conn.execute_fetchall(
+        "SELECT * FROM source_value WHERE source_id = :source_id", {"source_id": source_id}
+    )
+    if not rows:
+        return None
+    d = dict(rows[0])
+    d["components"] = json.loads(d["components"]) if d["components"] else {}
+    return d
+
+
+async def get_all_source_values(conn: aiosqlite.Connection) -> dict[str, dict]:
+    """Whole cached value snapshot — used both by the dashboard (/api/sources)
+    and by the autonomous loop's relative/percentile comparisons (a source's
+    classification is judged against its peers, not a fixed cutoff)."""
+    rows = await conn.execute_fetchall("SELECT * FROM source_value")
+    out = {}
+    for r in rows:
+        d = dict(r)
+        d["components"] = json.loads(d["components"]) if d["components"] else {}
+        out[d["source_id"]] = d
+    return out
+
+
+async def yield_stats_by_source(conn: aiosqlite.Connection, *, since_iso: str) -> dict[str, dict]:
+    """Per-source extraction yield over the window: total extracted, non-
+    false-positive rate, share reaching warn/critical, mean confidence. The
+    "yield quality" component of sources/value.py's score."""
+    rows = await conn.execute_fetchall(
+        """
+        SELECT i.source_id AS source_id,
+               COUNT(*) AS total,
+               SUM(CASE WHEN e.false_positive = 0 THEN 1 ELSE 0 END) AS useful,
+               SUM(CASE WHEN e.significance IN ('warn', 'critical') THEN 1 ELSE 0 END) AS significant,
+               AVG(e.confidence) AS mean_confidence
+        FROM extractions e
+        JOIN items i ON i.id = e.item_id
+        WHERE e.extracted_at >= :since
+        GROUP BY i.source_id
+        """,
+        {"since": since_iso},
+    )
+    return {r["source_id"]: dict(r) for r in rows}
+
+
+async def case_contribution_by_source(conn: aiosqlite.Connection, *, since_iso: str) -> dict[str, dict]:
+    """Per-source contribution to cases: how many distinct cases this
+    source's items are linked into, weighted toward confirmed/significant
+    cases. The "case contribution" component of sources/value.py's score."""
+    rows = await conn.execute_fetchall(
+        """
+        SELECT i.source_id AS source_id,
+               COUNT(DISTINCT c.id) AS cases_touched,
+               SUM(CASE WHEN c.status = 'confirmed' THEN 1 ELSE 0 END) AS confirmed_links,
+               SUM(CASE WHEN c.significance IN ('warn', 'critical') THEN 1 ELSE 0 END) AS significant_links
+        FROM case_items ci
+        JOIN items i ON i.id = ci.item_id
+        JOIN cases c ON c.id = ci.case_id
+        WHERE i.seen_at >= :since
+        GROUP BY i.source_id
+        """,
+        {"since": since_iso},
+    )
+    return {r["source_id"]: dict(r) for r in rows}
+
+
+# ── Algorithmic case-to-case correlation (pipeline/cross_correlate.py) ──────
+
+async def save_case_link(
+    conn: aiosqlite.Connection, *, case_a: int, case_b: int, score: float, reasons: list[str]
+) -> None:
+    lo, hi = (case_a, case_b) if case_a < case_b else (case_b, case_a)
+    await conn.execute(
+        """
+        INSERT INTO case_links (case_a, case_b, score, reasons, computed_at)
+        VALUES (:a, :b, :score, :reasons, :computed_at)
+        ON CONFLICT(case_a, case_b) DO UPDATE SET
+            score = excluded.score, reasons = excluded.reasons, computed_at = excluded.computed_at
+        """,
+        {
+            "a": lo,
+            "b": hi,
+            "score": score,
+            "reasons": json.dumps(reasons),
+            "computed_at": _utcnow().isoformat(),
+        },
+    )
+    await conn.commit()
+
+
+async def get_case_links(conn: aiosqlite.Connection, case_id: int) -> list[dict]:
+    """Related cases for the detail pane — both directions of the symmetric
+    pair, joined with the related case's headline fields so the UI doesn't
+    need a second round-trip per link."""
+    rows = await conn.execute_fetchall(
+        """
+        SELECT cl.score, cl.reasons,
+               c.id AS case_id, c.title, c.significance, c.damaged_party, c.attribution
+        FROM case_links cl
+        JOIN cases c ON c.id = (CASE WHEN cl.case_a = :case_id THEN cl.case_b ELSE cl.case_a END)
+        WHERE cl.case_a = :case_id OR cl.case_b = :case_id
+        ORDER BY cl.score DESC
+        LIMIT 20
+        """,
+        {"case_id": case_id},
+    )
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["reasons"] = json.loads(d["reasons"]) if d["reasons"] else []
+        out.append(d)
+    return out
+
+
+async def get_cases_for_cross_correlation(conn: aiosqlite.Connection, *, since_iso: str) -> list[dict]:
+    """Cases active within the window — the candidate pool for
+    pipeline/cross_correlate.py's pairwise overlap scan. Bounded by recency
+    for the same reason find_candidate_cases is: an old, settled case
+    shouldn't get re-linked against every new case forever."""
+    rows = await conn.execute_fetchall(
+        "SELECT * FROM cases WHERE last_seen >= :since ORDER BY last_seen DESC",
+        {"since": since_iso},
+    )
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["cve_ids"] = json.loads(d["cve_ids"]) if d["cve_ids"] else []
+        d["iocs"] = json.loads(d["iocs"]) if d["iocs"] else []
+        out.append(d)
+    return out
+
+
 async def get_case_items(conn: aiosqlite.Connection, case_id: int) -> list[dict]:
     """The raw observations linked into a case — the case detail view's
-    corroboration list. Newest first."""
+    corroboration list. Ordered by real-world event date (published_at when
+    known, else seen_at) so the timeline reflects when things happened, not
+    when our scraper picked them up."""
     rows = await conn.execute_fetchall(
         """
         SELECT i.id, i.source_id, i.source_name, i.title, i.url, i.snippet,
                i.published_at, i.seen_at
         FROM case_items ci JOIN items i ON i.id = ci.item_id
         WHERE ci.case_id = :case_id
-        ORDER BY i.seen_at DESC
+        ORDER BY COALESCE(i.published_at, i.seen_at) DESC
         """,
         {"case_id": case_id},
     )

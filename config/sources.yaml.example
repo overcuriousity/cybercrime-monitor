@@ -1,4 +1,4 @@
-# Source configuration for marketplace-monitor.
+# Source configuration for cybercrime-monitor.
 # Top-level keys: nitter_instances (list), sources (list)
 
 nitter_instances:

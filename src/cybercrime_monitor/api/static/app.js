@@ -56,6 +56,8 @@ const iocInput       = document.getElementById('ioc-input');
 const tagInput       = document.getElementById('tag-input');
 const extraKeyInput  = document.getElementById('extra-key-input');
 const clusterSizeInput = document.getElementById('cluster-size-input');
+const adminTokenInput = document.getElementById('admin-token');
+const adminTokenStatus = document.getElementById('admin-token-status');
 
 // ── Init ───────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
@@ -378,7 +380,7 @@ async function loadMore() {
 }
 
 function itemsFetchOpts() {
-  return state.filters.showFiltered ? { headers: adminHeaders() } : {};
+  return (state.filters.showFiltered && hasAdminToken()) ? { headers: adminHeaders() } : {};
 }
 
 function buildParams(offset, limit) {
@@ -521,11 +523,19 @@ function buildCard(item) {
 
   const time = document.createElement('span');
   time.className = 'item-time';
-  if (item.published_at && item.source_tags && item.source_tags.includes('hibp')) {
-    time.textContent = 'breached ' + fmtTime(item.published_at);
+  // Prefer the source's own publish/event date over ingest time whenever a
+  // collector captured one (RSS, Mastodon, HIBP, ransomware.live, dated
+  // forum posts — see collectors/*.py) — seen_at is "when our scraper saw
+  // this," not "when it happened," and showing it as the headline date was
+  // misleading for anything that isn't brand new. seen_at is always kept in
+  // the tooltip so ingest lag is still visible on hover.
+  if (item.published_at) {
+    const label = item.source_tags && item.source_tags.includes('hibp') ? 'breached ' : '';
+    time.textContent = label + fmtTime(item.published_at);
     time.title = 'ingested ' + fmtTime(item.seen_at);
   } else {
     time.textContent = fmtTime(item.seen_at);
+    time.title = 'no publish date captured for this source — showing ingest time';
   }
   meta.appendChild(time);
 
@@ -694,26 +704,55 @@ function handleLiveItem(item) {
   }
 }
 
-// ── Keywords editor (admin-token gated) ──────────────────────────────────────
-// The editor can reveal investigation TARGET indicators and writes regex
-// straight to disk, so it's never auto-loaded — the operator must supply the
-// ADMIN_TOKEN configured server-side before the textarea is even fetched.
+// ── Admin token (central header input) ───────────────────────────────────────
+// The token unlocks admin-gated features across tabs: keyword editing,
+// filtered-item view, and the case deep-research trigger. It lives in the
+// header toolbar so it is reachable from every tab.
 const ADMIN_TOKEN_KEY = 'mm_admin_token';
+let adminEnabledServerSide = true;
 
 function initKeywordsAuth() {
-  const tokenInput = document.getElementById('kw-token');
-  tokenInput.value = localStorage.getItem(ADMIN_TOKEN_KEY) || '';
+  adminTokenInput.value = localStorage.getItem(ADMIN_TOKEN_KEY) || '';
+  adminTokenInput.addEventListener('input', () => {
+    localStorage.setItem(ADMIN_TOKEN_KEY, adminTokenInput.value);
+    updateAdminUiState();
+  });
   document.getElementById('kw-token-load').addEventListener('click', unlockKeywords);
   document.getElementById('kw-save').addEventListener('click', saveKeywords);
+  updateAdminUiState();
 }
 
 function adminHeaders() {
-  return { 'X-Admin-Token': document.getElementById('kw-token').value };
+  return { 'X-Admin-Token': adminTokenInput.value };
+}
+
+function hasAdminToken() {
+  return adminEnabledServerSide && adminTokenInput.value.trim().length > 0;
+}
+
+function updateAdminUiState() {
+  const token = adminTokenInput.value.trim();
+  if (!adminEnabledServerSide) {
+    adminTokenInput.classList.add('hidden');
+    adminTokenStatus.classList.add('hidden');
+    document.getElementById('show-filtered-row').classList.add('hidden');
+    return;
+  }
+  adminTokenInput.classList.remove('hidden');
+  if (token) {
+    adminTokenStatus.textContent = '🔒 admin';
+    adminTokenStatus.classList.remove('hidden', 'error');
+  } else {
+    adminTokenStatus.textContent = 'Admin token required for research/keywords';
+    adminTokenStatus.classList.remove('hidden');
+    adminTokenStatus.classList.add('error');
+  }
+  document.getElementById('show-filtered-row').classList.toggle('hidden', !token);
 }
 
 async function unlockKeywords() {
   const tokenStatus = document.getElementById('kw-token-status');
-  const token = document.getElementById('kw-token').value;
+  const token = adminTokenInput.value;
   localStorage.setItem(ADMIN_TOKEN_KEY, token);
   tokenStatus.textContent = 'Loading…';
   try {
@@ -726,7 +765,7 @@ async function unlockKeywords() {
     document.getElementById('kw-editor').value = data.yaml || '';
     document.getElementById('kw-editor').disabled = false;
     document.getElementById('kw-save').disabled = false;
-    tokenStatus.textContent = '✓ unlocked';
+    tokenStatus.textContent = '✓ loaded';
   } catch (e) {
     tokenStatus.textContent = String(e);
   }
@@ -768,7 +807,16 @@ async function saveKeywords() {
 // ── Utilities ──────────────────────────────────────────────────────────────
 async function api(path, opts = {}) {
   const resp = await fetch(path, opts);
-  if (!resp.ok) throw new Error(`API ${path}: ${resp.status}`);
+  if (!resp.ok) {
+    const err = new Error(`API ${path}: ${resp.status}`);
+    err.status = resp.status;
+    try {
+      err.body = await resp.json();
+    } catch {
+      err.body = null;
+    }
+    throw err;
+  }
   return resp.json();
 }
 
@@ -831,9 +879,12 @@ async function loadDashboard() {
       const el = document.getElementById('gauge-classifier-backlog');
       el.textContent = classifierHealth.backlog.toLocaleString();
       el.className = 'gauge-value' + (classifierHealth.consecutive_errors >= 3 ? ' prio-critical' : '');
+      const backendLabel = classifierHealth.using_fallback
+        ? `${classifierHealth.backend} (unreachable — using hermes-agent fallback)`
+        : classifierHealth.backend;
       el.title = classifierHealth.last_error
-        ? `backend: ${classifierHealth.backend}\nlast error: ${classifierHealth.last_error}`
-        : `backend: ${classifierHealth.backend}`;
+        ? `backend: ${backendLabel}\nlast error: ${classifierHealth.last_error}`
+        : `backend: ${backendLabel}`;
     }
 
     renderTimeseries(timeseries.buckets);
@@ -942,23 +993,30 @@ window.applyFilters = applyFilters;
 // ── Cases ──────────────────────────────────────────────────────────────────
 // Case-centric view on top of pipeline/correlate.py's deduplicated incidents
 // — distinct from the raw Feed tab above. See /api/cases* (api/routes.py).
+// Two-pane layout (rail | detail) with filters in a top toolbar — see
+// style.css's "Cases tab" section for why this replaced the old three-column
+// filter-sidebar/list/detail-sidebar split.
 const casesState = {
   cases: [],
   offset: 0,
   pageSize: 50,
   hasMore: false,
   selectedId: null,
-  filters: { search: '', significance: '', kevOnly: false, crimeType: '' },
+  filters: { search: '', significance: '', kevOnly: false, crimeType: '', since: '', until: '' },
 };
 
-const casesList       = document.getElementById('cases-list');
-const casesEmpty      = document.getElementById('cases-empty');
+const casesList        = document.getElementById('cases-list');
+const casesEmpty       = document.getElementById('cases-empty');
 const casesLoadMoreBtn = document.getElementById('cases-load-more');
-const caseSearchInput = document.getElementById('case-search-input');
-const caseKevOnlyCb   = document.getElementById('case-kev-only');
-const caseCrimeTypeLegend = document.getElementById('case-crime-type-legend');
-const caseDetailPane  = document.getElementById('case-detail');
-const caseDetailEmpty = document.getElementById('case-detail-empty');
+const caseSearchInput  = document.getElementById('case-search-input');
+const caseKevOnlyCb    = document.getElementById('case-kev-only');
+const caseSignificanceSelect = document.getElementById('case-significance-select');
+const caseCrimeTypeSelect    = document.getElementById('case-crime-type-select');
+const caseSinceInput   = document.getElementById('case-since-input');
+const caseUntilInput   = document.getElementById('case-until-input');
+const caseFiltersClear = document.getElementById('case-filters-clear');
+const caseDetailPane   = document.getElementById('case-detail');
+const caseDetailEmpty  = document.getElementById('case-detail-empty');
 
 function initCases() {
   caseSearchInput.addEventListener('input', debounce(() => {
@@ -969,11 +1027,32 @@ function initCases() {
     casesState.filters.kevOnly = caseKevOnlyCb.checked;
     applyCaseFilters();
   });
-  document.querySelectorAll('input[name="case-significance"]').forEach(r =>
-    r.addEventListener('change', () => {
-      casesState.filters.significance = document.querySelector('input[name="case-significance"]:checked')?.value || '';
-      applyCaseFilters();
-    }));
+  caseSignificanceSelect.addEventListener('change', () => {
+    casesState.filters.significance = caseSignificanceSelect.value;
+    applyCaseFilters();
+  });
+  caseCrimeTypeSelect.addEventListener('change', () => {
+    casesState.filters.crimeType = caseCrimeTypeSelect.value;
+    applyCaseFilters();
+  });
+  caseSinceInput.addEventListener('change', () => {
+    casesState.filters.since = caseSinceInput.value;
+    applyCaseFilters();
+  });
+  caseUntilInput.addEventListener('change', () => {
+    casesState.filters.until = caseUntilInput.value;
+    applyCaseFilters();
+  });
+  caseFiltersClear.addEventListener('click', () => {
+    casesState.filters = { search: '', significance: '', kevOnly: false, crimeType: '', since: '', until: '' };
+    caseSearchInput.value = '';
+    caseKevOnlyCb.checked = false;
+    caseSignificanceSelect.value = '';
+    caseCrimeTypeSelect.value = '';
+    caseSinceInput.value = '';
+    caseUntilInput.value = '';
+    applyCaseFilters();
+  });
   casesLoadMoreBtn.addEventListener('click', loadMoreCases);
 
   loadCaseStats();
@@ -987,6 +1066,8 @@ function caseQueryParams(extra = {}) {
   if (casesState.filters.significance) params.set('min_significance', casesState.filters.significance);
   if (casesState.filters.kevOnly) params.set('in_kev', 'true');
   if (casesState.filters.crimeType) params.set('crime_type', casesState.filters.crimeType);
+  if (casesState.filters.since) params.set('since', casesState.filters.since);
+  if (casesState.filters.until) params.set('until', casesState.filters.until);
   Object.entries(extra).forEach(([k, v]) => params.set(k, v));
   return params.toString();
 }
@@ -1020,14 +1101,29 @@ async function loadCaseStats() {
     const stats = await api('/api/stats/cases');
     document.getElementById('gauge-cases-total').textContent = stats.total.toLocaleString();
     document.getElementById('gauge-cases-kev').textContent = stats.in_kev.toLocaleString();
-    renderCrimeTypeLegend(stats.by_crime_type || []);
-    populateCrimeTypeDropdown(stats.by_crime_type || []);
+    populateCaseCrimeTypeSelect(stats.by_crime_type || []);
+    // The Feed tab's crime-type filter dropdown is populated from the same
+    // case-aggregated stats (crime types only become meaningful once
+    // extraction has run) — kept from the original three-column layout.
+    populateFeedCrimeTypeDropdown(stats.by_crime_type || []);
   } catch (e) {
     console.error('Failed to load case stats', e);
   }
 }
 
-function populateCrimeTypeDropdown(byCrimeType) {
+function populateCaseCrimeTypeSelect(byCrimeType) {
+  const current = casesState.filters.crimeType;
+  caseCrimeTypeSelect.innerHTML = '<option value="">All crime types</option>';
+  byCrimeType.forEach(({ crime_type, n }) => {
+    const opt = document.createElement('option');
+    opt.value = crime_type;
+    opt.textContent = `${crime_type} (${n})`;
+    caseCrimeTypeSelect.appendChild(opt);
+  });
+  caseCrimeTypeSelect.value = current || '';
+}
+
+function populateFeedCrimeTypeDropdown(byCrimeType) {
   const current = crimeTypeInput.value;
   crimeTypeInput.innerHTML = '<option value="">Any</option>';
   byCrimeType.forEach(({ crime_type }) => {
@@ -1037,23 +1133,6 @@ function populateCrimeTypeDropdown(byCrimeType) {
     crimeTypeInput.appendChild(opt);
   });
   crimeTypeInput.value = current || '';
-}
-
-function renderCrimeTypeLegend(byCrimeType) {
-  caseCrimeTypeLegend.innerHTML = '';
-  byCrimeType.forEach(({ crime_type, n }) => {
-    const item = document.createElement('span');
-    item.className = 'legend-item crime-type-filter';
-    item.textContent = `${crime_type} (${n})`;
-    item.style.cursor = 'pointer';
-    item.classList.toggle('active', casesState.filters.crimeType === crime_type);
-    item.addEventListener('click', () => {
-      casesState.filters.crimeType = casesState.filters.crimeType === crime_type ? '' : crime_type;
-      renderCrimeTypeLegend(byCrimeType);
-      applyCaseFilters();
-    });
-    caseCrimeTypeLegend.appendChild(item);
-  });
 }
 
 function renderCasesList() {
@@ -1073,7 +1152,7 @@ function buildCaseCard(c) {
   const card = document.createElement('div');
   card.className = 'item-card' + (c.significance ? ' prio-' + c.significance : '');
   card.dataset.caseId = c.id;
-  if (c.id === casesState.selectedId) card.classList.add('flashUpdate');
+  if (c.id === casesState.selectedId) card.classList.add('selected');
 
   const meta = document.createElement('div');
   meta.className = 'item-meta';
@@ -1108,6 +1187,7 @@ function buildCaseCard(c) {
   const time = document.createElement('span');
   time.className = 'item-time';
   time.textContent = fmtTime(c.last_seen);
+  time.title = 'last corroborating report';
   meta.appendChild(time);
 
   card.appendChild(meta);
@@ -1135,34 +1215,46 @@ function buildCaseCard(c) {
 async function selectCase(id) {
   casesState.selectedId = id;
   document.querySelectorAll('[data-case-id]').forEach(el => {
-    el.classList.toggle('flashUpdate', Number(el.dataset.caseId) === id);
+    el.classList.toggle('selected', Number(el.dataset.caseId) === id);
   });
   try {
-    const { case: c, items } = await api(`/api/cases/${id}`);
-    renderCaseDetail(c, items);
+    const { case: c, items, research_runs, related_cases } = await api(`/api/cases/${id}`);
+    renderCaseDetail(c, items, research_runs || [], related_cases || []);
   } catch (e) {
     console.error('Failed to load case detail', e);
   }
 }
 
-function renderCaseDetail(c, items) {
+function renderCaseDetail(c, items, researchRuns, relatedCases) {
   caseDetailEmpty.classList.add('hidden');
   caseDetailPane.classList.remove('hidden');
   caseDetailPane.innerHTML = '';
 
-  const h = document.createElement('h3');
+  // ── Header ──
+  const header = document.createElement('div');
+  header.className = 'case-detail-header';
+  const h = document.createElement('h2');
   h.textContent = c.title;
-  caseDetailPane.appendChild(h);
+  header.appendChild(h);
+  if (c.significance) {
+    const chip = document.createElement('span');
+    chip.className = 'tag-chip prio-' + c.significance;
+    chip.textContent = c.significance.toUpperCase();
+    header.appendChild(chip);
+  }
+  caseDetailPane.appendChild(header);
 
+  // ── Field grid ──
+  const grid = document.createElement('div');
+  grid.className = 'case-field-grid';
   const fields = [
-    ['Significance', c.significance],
     ['Crime type', c.crime_type],
     ['Victim', c.damaged_party],
     ['Sector', c.damaged_party_sector],
     ['Country', c.damaged_party_country],
     ['Attribution', c.attribution],
     ['Status', c.status],
-    ['CVEs', c.cve_ids.join(', ') || null],
+    ['CVEs', (c.cve_ids || []).join(', ') || null],
     ['In KEV', c.in_kev ? 'yes' : 'no'],
     ['First seen', fmtTime(c.first_seen)],
     ['Last seen', fmtTime(c.last_seen)],
@@ -1172,9 +1264,10 @@ function renderCaseDetail(c, items) {
     if (!value) return;
     const row = document.createElement('div');
     row.className = 'hint';
-    row.innerHTML = `<strong>${escHtml(label)}:</strong> ${escHtml(String(value))}`;
-    caseDetailPane.appendChild(row);
+    row.innerHTML = `<b>${escHtml(label)}:</b> ${escHtml(String(value))}`;
+    grid.appendChild(row);
   });
+  caseDetailPane.appendChild(grid);
 
   if (c.summary) {
     const summary = document.createElement('div');
@@ -1183,13 +1276,105 @@ function renderCaseDetail(c, items) {
     caseDetailPane.appendChild(summary);
   }
 
+  // ── IoCs ──
+  if (c.iocs && c.iocs.length) {
+    const iocHeader = document.createElement('h3');
+    iocHeader.textContent = `Indicators of compromise (${c.iocs.length})`;
+    caseDetailPane.appendChild(iocHeader);
+    const row = document.createElement('div');
+    row.className = 'ioc-chip-row';
+    c.iocs.forEach(ioc => {
+      const chip = document.createElement('span');
+      chip.className = 'ioc-chip';
+      chip.textContent = ioc;
+      row.appendChild(chip);
+    });
+    caseDetailPane.appendChild(row);
+  }
+
+  // ── Research ──
+  const showResearch = hasAdminToken();
+  if (showResearch) {
+    const researchHeader = document.createElement('h3');
+    researchHeader.textContent = 'Autonomous research';
+    caseDetailPane.appendChild(researchHeader);
+
+    const researchRow = document.createElement('div');
+    researchRow.className = 'research-status-row';
+    const btn = document.createElement('button');
+    btn.className = 'btn-deep-research';
+    const pending = !!c.research_requested_at;
+    const running = researchRuns.some(r => r.status === 'running');
+    btn.textContent = pending || running ? 'Research queued…' : (researchRuns.length ? 'Re-research (fill gaps)' : 'Deep research');
+    btn.disabled = pending || running;
+    const researchStatus = document.createElement('span');
+    researchStatus.className = 'research-status-msg';
+    btn.addEventListener('click', () => requestCaseResearch(c.id, btn, researchStatus));
+    researchRow.appendChild(btn);
+    researchRow.appendChild(researchStatus);
+    caseDetailPane.appendChild(researchRow);
+  }
+
+  if (researchRuns.length) {
+    const list = document.createElement('div');
+    list.className = 'research-run-list';
+    researchRuns.slice(0, 5).forEach(r => {
+      const row = document.createElement('div');
+      row.className = 'research-run-row';
+      const findings = r.findings && r.findings.summary ? r.findings.summary : '';
+      row.innerHTML = `<b>${escHtml(r.status)}</b> · ${escHtml(fmtTime(r.started_at))}` +
+        (findings ? `<br>${escHtml(findings)}` : '');
+      list.appendChild(row);
+    });
+    caseDetailPane.appendChild(list);
+  }
+
+  // ── Feedback ──
+  const feedbackHeader = document.createElement('h3');
+  feedbackHeader.textContent = 'Your assessment';
+  caseDetailPane.appendChild(feedbackHeader);
+  const feedbackRow = document.createElement('div');
+  feedbackRow.className = 'feedback-row';
+  [['useful', '👍 Useful'], ['noise', '👎 Noise'], ['wrong_attribution', '⚑ Wrong attribution']].forEach(([verdict, label]) => {
+    const fbtn = document.createElement('button');
+    fbtn.className = 'feedback-btn';
+    fbtn.textContent = label;
+    fbtn.addEventListener('click', () => submitFeedback({ case_id: c.id, verdict }, fbtn, feedbackRow));
+    feedbackRow.appendChild(fbtn);
+  });
+  caseDetailPane.appendChild(feedbackRow);
+
+  // ── Related cases ──
+  if (relatedCases.length) {
+    const relHeader = document.createElement('h3');
+    relHeader.textContent = `Related cases (${relatedCases.length})`;
+    caseDetailPane.appendChild(relHeader);
+    const relList = document.createElement('div');
+    relList.className = 'related-case-list';
+    relatedCases.forEach(r => {
+      const rcard = document.createElement('button');
+      rcard.className = 'related-case-card';
+      rcard.appendChild(document.createTextNode(r.title));
+      const rreasons = document.createElement('div');
+      rreasons.className = 'related-reasons';
+      rreasons.textContent = `${(r.reasons || []).join(', ')} · score ${(r.score * 100).toFixed(0)}%`;
+      rcard.appendChild(rreasons);
+      rcard.addEventListener('click', () => selectCase(r.case_id));
+      relList.appendChild(rcard);
+    });
+    caseDetailPane.appendChild(relList);
+  }
+
+  // ── Timeline of corroborating reports ──
   const itemsHeader = document.createElement('h3');
-  itemsHeader.textContent = `Corroborating reports (${items.length})`;
+  itemsHeader.textContent = `Timeline · corroborating reports (${items.length})`;
   caseDetailPane.appendChild(itemsHeader);
 
+  const timeline = document.createElement('div');
+  timeline.className = 'case-timeline';
   items.forEach(it => {
     const row = document.createElement('div');
-    row.className = 'item-card';
+    row.className = 'case-timeline-item';
     const a = document.createElement('a');
     a.href = isSafeUrl(it.url) ? it.url : '#';
     a.target = '_blank';
@@ -1198,10 +1383,73 @@ function renderCaseDetail(c, items) {
     row.appendChild(a);
     const meta = document.createElement('div');
     meta.className = 'item-time';
-    meta.textContent = `${it.source_name} · ${fmtTime(it.seen_at)}`;
+    meta.textContent = `${it.source_name} · ${fmtTime(it.published_at || it.seen_at)}`;
+    if (it.published_at) {
+      meta.title = `ingested ${fmtTime(it.seen_at)}`;
+    }
     row.appendChild(meta);
-    caseDetailPane.appendChild(row);
+    const fbRow = document.createElement('div');
+    fbRow.className = 'feedback-row';
+    [['useful', '👍'], ['noise', '👎']].forEach(([verdict, label]) => {
+      const fbtn = document.createElement('button');
+      fbtn.className = 'feedback-btn';
+      fbtn.textContent = label;
+      fbtn.title = verdict === 'useful' ? 'Useful' : 'Noise';
+      fbtn.addEventListener('click', () => submitFeedback({ item_id: it.id, verdict }, fbtn, fbRow));
+      fbRow.appendChild(fbtn);
+    });
+    row.appendChild(fbRow);
+    timeline.appendChild(row);
   });
+  caseDetailPane.appendChild(timeline);
+}
+
+async function requestCaseResearch(caseId, btn, statusEl) {
+  statusEl.textContent = '';
+  statusEl.className = 'research-status-msg';
+  btn.disabled = true;
+  btn.textContent = 'Queuing…';
+  try {
+    await api(`/api/cases/${caseId}/research`, { method: 'POST', headers: adminHeaders() });
+    btn.textContent = 'Research queued…';
+  } catch (e) {
+    btn.textContent = 'Failed — retry';
+    btn.disabled = false;
+    let detail = '';
+    if (e && e.status) {
+      if (e.status === 403) {
+        detail = 'Invalid admin token.';
+      } else if (e.status === 404) {
+        detail = 'Case not found.';
+      } else if (e.status === 429) {
+        detail = 'Rate limit exceeded — wait a moment.';
+      } else {
+        detail = `Server error ${e.status}.`;
+      }
+    } else {
+      detail = 'Network or server error.';
+    }
+    statusEl.textContent = detail + ' Check the browser console for details.';
+    statusEl.classList.add('error');
+    console.error('Failed to request research', e);
+  }
+}
+
+async function submitFeedback(body, btn, row) {
+  const original = btn.textContent;
+  try {
+    await api('/api/feedback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    row.querySelectorAll('.feedback-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+  } catch (e) {
+    btn.textContent = '✗';
+    setTimeout(() => { btn.textContent = original; }, 1500);
+    console.error('Failed to submit feedback', e);
+  }
 }
 
 // ── Real-time subsystem status bar ───────────────────────────────────────────
@@ -1221,6 +1469,9 @@ async function updateStatusBar() {
 }
 
 function renderStatusBar(s) {
+  adminEnabledServerSide = !!(s.admin && s.admin.enabled);
+  updateAdminUiState();
+
   const sched = s.scheduler || {};
   setStatusPill('status-scheduler', sched.running ? 'scheduler: running' : 'scheduler: stopped', sched.running ? 'ok' : 'error');
 
@@ -1231,8 +1482,10 @@ function renderStatusBar(s) {
   const cls = s.classifier || {};
   const clsText = cls.backend === 'none'
     ? 'classifier: disabled'
-    : `classifier: ${cls.backlog || 0} backlog`;
-  const clsState = cls.consecutive_errors >= 3 ? 'error' : (cls.backlog > 50 ? 'warn' : 'ok');
+    : cls.using_fallback
+      ? `classifier: ${cls.backlog || 0} backlog (hermes fallback)`
+      : `classifier: ${cls.backlog || 0} backlog`;
+  const clsState = cls.consecutive_errors >= 3 ? 'error' : (cls.using_fallback ? 'warn' : (cls.backlog > 50 ? 'warn' : 'ok'));
   setStatusPill('status-classifier', clsText, clsState);
 
   const corr = s.correlation || {};

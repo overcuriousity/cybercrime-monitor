@@ -1,0 +1,26 @@
+[Unit]
+Description=Cybercrime Monitor — real-time cybercrime landscape monitor
+After=network-online.target tor.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cybercrime-monitor
+Group=cybercrime-monitor
+WorkingDirectory=/opt/cybercrime-monitor
+EnvironmentFile=/etc/cybercrime-monitor.env
+ExecStart=/opt/cybercrime-monitor/.venv/bin/cybercrime-monitor
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cybercrime-monitor
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/cybercrime-monitor/data /opt/cybercrime-monitor/config
+
+[Install]
+WantedBy=multi-user.target
