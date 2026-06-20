@@ -1198,7 +1198,7 @@ function renderLandscapeSector(bySector) {
     type: 'bar',
     data: {
       labels: top.map(r => r.sector),
-      datasets: [{ label: 'cases', data: top.map(r => r.n), backgroundColor: '#2a9d8f' }],
+      datasets: [{ label: 'cases', data: top.map(r => r.n), backgroundColor: PRIO_COLORS.info }],
     },
     options: {
       indexAxis: 'y',
