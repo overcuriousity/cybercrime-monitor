@@ -2141,7 +2141,8 @@ function handleLiveActivity(ev) {
   const matchesStatus = !activityState.filters.status || ev.status === activityState.filters.status;
   if (!matchesSubsystem || !matchesStatus) return;
 
-  const atTop = activityList.scrollTop < 50;
+  const scrollEl = document.getElementById('tab-activity');
+  const atTop = (scrollEl ? scrollEl.scrollTop : 0) < 50;
   if (atTop) {
     const row = buildActivityRow(ev);
     row.classList.add('fadeIn');

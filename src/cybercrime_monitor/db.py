@@ -2403,14 +2403,17 @@ async def stats_trends(
             bucket = current_counts if r["first_seen"] >= current_since else previous_counts
             for cve_id in cve_ids:
                 bucket[cve_id] = bucket.get(cve_id, 0) + 1
-        values = set(current_counts) | set(previous_counts)
-        kev_rows = await conn.execute_fetchall(
-            "SELECT cve_id FROM kev_catalog WHERE cve_id IN ({})".format(
-                ",".join(f":k{i}" for i in range(len(values)))
-            ) if values else "SELECT cve_id FROM kev_catalog WHERE 0",
-            {f"k{i}": v for i, v in enumerate(values)},
-        )
-        kev_set = {r["cve_id"] for r in kev_rows}
+        values = list(set(current_counts) | set(previous_counts))
+        kev_set: set[str] = set()
+        chunk_size = 500  # stay well under SQLite's default 999 bound-variable limit
+        for i in range(0, len(values), chunk_size):
+            chunk = values[i : i + chunk_size]
+            placeholders = ",".join(f":k{j}" for j in range(len(chunk)))
+            kev_rows = await conn.execute_fetchall(
+                f"SELECT cve_id FROM kev_catalog WHERE cve_id IN ({placeholders})",
+                {f"k{j}": v for j, v in enumerate(chunk)},
+            )
+            kev_set.update(r["cve_id"] for r in kev_rows)
     else:
         kev_set = set()
         column = _TREND_DIMENSION_COLUMNS.get(dimension)

@@ -726,10 +726,10 @@ async def api_stats_trends(
 
 
 def _landscape_snapshot_markdown(
-    *, since_days: int | None, stats: dict, actor_trends: list[dict],
+    *, since_iso: str | None, since_days: int | None, stats: dict, actor_trends: list[dict],
     sector_trends: list[dict], cve_trends: list[dict],
 ) -> str:
-    window_label = f"last {since_days} day(s)" if since_days else "all time"
+    window_label = f"last {since_days} day(s)" if since_iso else "all time"
     lines = [f"# Cybercrime Landscape Snapshot — {window_label}", "", f"Generated: {datetime.now(timezone.utc).isoformat()}", ""]
 
     lines.append(f"- **Cases:** {stats['total']}")
@@ -770,7 +770,7 @@ def _landscape_snapshot_markdown(
 @router.get("/api/stats/landscape/export")
 async def api_landscape_export(
     db=Depends(get_db),
-    since_days: int | None = Query(default=30, ge=1, le=3650),
+    since_days: int | None = Query(default=None, ge=1, le=3650),
     trend_window_days: int = Query(default=7, ge=1, le=180),
     all_time: bool = Query(default=False),
 ):
@@ -793,7 +793,7 @@ async def api_landscape_export(
     cve_trends = await stats_trends(db, dimension="cve", window_days=trend_window_days, limit=15)
 
     markdown = _landscape_snapshot_markdown(
-        since_days=since_days, stats=stats,
+        since_iso=since_iso, since_days=since_days, stats=stats,
         actor_trends=actor_trends, sector_trends=sector_trends, cve_trends=cve_trends,
     )
     return PlainTextResponse(
