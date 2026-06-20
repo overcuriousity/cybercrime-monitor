@@ -322,11 +322,9 @@ CREATE INDEX IF NOT EXISTS idx_investigations_status ON investigations(status);
 -- Resolves one effective priority rank + false_positive flag per item, from
 -- the LLM extraction's significance — the sole classification signal (the
 -- old regex-matcher fallback was removed; an item simply has no priority
--- until the extraction job reaches it). NOTE: CREATE VIEW IF NOT EXISTS is
--- frozen at creation — if this formula ever changes, existing DBs need a
--- manual `DROP VIEW item_priority` before restart, since IF NOT EXISTS won't
--- redefine it.
-CREATE VIEW IF NOT EXISTS item_priority AS
+-- until the extraction job reaches it).
+DROP VIEW IF EXISTS item_priority;
+CREATE VIEW item_priority AS
 SELECT i.id AS item_id,
        CASE e.significance WHEN 'critical' THEN 3 WHEN 'warn' THEN 2 WHEN 'info' THEN 1 ELSE 0 END AS prio_rank,
        COALESCE(e.false_positive, 0) AS false_positive
@@ -1827,8 +1825,12 @@ async def create_investigation(conn: aiosqlite.Connection, *, brief: str) -> int
 
 
 async def get_queued_investigations(conn: aiosqlite.Connection, *, limit: int) -> list[dict]:
+    """Drain investigations that need work. Includes 'running' rows so a
+    crash/restart mid-run doesn't leave an investigation stuck forever
+    (the scheduler is single-worker, so a stale 'running' row is safe to
+    resume rather than duplicate)."""
     rows = await conn.execute_fetchall(
-        "SELECT * FROM investigations WHERE status = 'queued' ORDER BY id ASC LIMIT :limit",
+        "SELECT * FROM investigations WHERE status IN ('queued', 'running') ORDER BY id ASC LIMIT :limit",
         {"limit": limit},
     )
     return [dict(r) for r in rows]

@@ -178,6 +178,18 @@ def test_api_create_investigation_requires_admin(client, monkeypatch):
         assert resp.status_code == 403
 
 
+def test_api_create_investigation_rejects_empty_brief(client, monkeypatch):
+    monkeypatch.setattr(app_settings, "admin_token", ADMIN_TOKEN)
+    with client:
+        resp = client.post(
+            "/api/investigations",
+            json={"brief": "   "},
+            headers={"X-Admin-Token": ADMIN_TOKEN},
+        )
+        assert resp.status_code == 400
+        assert "required" in resp.json()["detail"].lower()
+
+
 def test_api_create_investigation_queues_and_nudges(client, monkeypatch):
     monkeypatch.setattr(app_settings, "admin_token", ADMIN_TOKEN)
     from cybercrime_monitor.api import routes as routes_module

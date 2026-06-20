@@ -861,7 +861,13 @@ async def api_heal_proposals(db=Depends(get_db), status: str | None = Query(defa
 
 @router.post("/api/investigations", dependencies=[Depends(require_admin)])
 async def api_investigation_create(body: InvestigationCreate, request: Request, db=Depends(get_db)):
-    investigation_id = await create_investigation(db, brief=body.brief.strip())
+    brief = body.brief.strip()
+    if not brief:
+        raise HTTPException(status_code=400, detail="brief is required")
+    if len(brief) > 5000:
+        raise HTTPException(status_code=400, detail="brief must be at most 5000 characters")
+
+    investigation_id = await create_investigation(db, brief=brief)
 
     scheduler = getattr(request.app.state, "scheduler", None)
     if scheduler is not None:

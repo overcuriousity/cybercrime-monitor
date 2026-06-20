@@ -256,6 +256,10 @@ async def _investigate_one(db_conn, inv: dict, scheduler, sse_broadcaster) -> No
     brief = inv["brief"]
     await db.mark_investigation_running(db_conn, investigation_id=investigation_id)
 
+    # run_investigation_batch() may be invoked without an explicit broadcaster
+    # (tests/CLI), so fall back to the module-level broadcaster for item broadcasts.
+    sse_broadcaster = sse_broadcaster or broadcaster
+
     existing_sources = load_sources()
     local_items = await db.fetch_items(db_conn, limit=_LOCAL_CONTEXT_LIMIT, search=_search_terms(brief))
 
@@ -272,7 +276,7 @@ async def _investigate_one(db_conn, inv: dict, scheduler, sse_broadcaster) -> No
         )
         await _log_activity(
             db_conn, action="investigation_failed", status="error",
-            summary=f"Investigation #{investigation_id} failed", ref_type="item",
+            summary=f"Investigation #{investigation_id} failed", ref_type="investigation",
             detail={"error": result.error, "brief": brief[:200]}, ref_id=investigation_id,
         )
         return
@@ -287,7 +291,7 @@ async def _investigate_one(db_conn, inv: dict, scheduler, sse_broadcaster) -> No
     if not found or confidence < settings.investigate_min_confidence:
         await db.finish_investigation(db_conn, investigation_id=investigation_id, status="no_match", findings=data)
         await _log_activity(
-            db_conn, action="investigation_no_match", status="skipped", ref_type="item",
+            db_conn, action="investigation_no_match", status="skipped", ref_type="investigation",
             summary=f"Investigation #{investigation_id}: no confident match (confidence {confidence:.2f})",
             detail={"brief": brief[:200], "confidence": confidence}, ref_id=investigation_id,
         )
@@ -330,7 +334,7 @@ async def _investigate_one(db_conn, inv: dict, scheduler, sse_broadcaster) -> No
         # default is "didn't actually add anything new," not a fabricated case.
         await db.finish_investigation(db_conn, investigation_id=investigation_id, status="no_match", findings=data)
         await _log_activity(
-            db_conn, action="investigation_no_match", status="skipped", ref_type="item",
+            db_conn, action="investigation_no_match", status="skipped", ref_type="investigation",
             summary=f"Investigation #{investigation_id}: match claimed but no new items produced",
             detail={"brief": brief[:200]}, ref_id=investigation_id,
         )
