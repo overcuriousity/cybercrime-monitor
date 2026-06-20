@@ -914,23 +914,23 @@ function debounce(fn, ms) {
 const dashCharts = {}; // canvas id -> Chart.js instance, kept around for .update()
 
 const PRIO_COLORS = {
-  critical: '#f85149',
-  warn: '#e3b341',
-  info: '#388bfd',
-  none: '#30363d',
+  critical: '#e63946',
+  warn: '#f4a261',
+  info: '#2a9d8f',
+  none: '#3f3f46',
 };
 
 // Cycled for Landscape's crime-type doughnut, which has an open-ended
 // number of categories (unlike priority's fixed 4) — distinct enough hues
 // to stay readable up to a dozen-ish slices.
 const CHART_PALETTE = [
-  '#388bfd', '#3fb950', '#e3b341', '#f85149', '#bc8cff',
-  '#56d4dd', '#f778ba', '#ffa657', '#79c0ff', '#7ee787',
+  '#f4a261', '#2a9d8f', '#e63946', '#c77dff', '#64dfdf',
+  '#ff9ecd', '#7ee787', '#e76f51', '#9d4edd', '#56d4dd',
 ];
 
 function initDashboard() {
-  Chart.defaults.color = '#8b949e';
-  Chart.defaults.borderColor = '#30363d';
+  Chart.defaults.color = '#71717a';
+  Chart.defaults.borderColor = '#27272a';
   Chart.defaults.font.size = 11;
 }
 
@@ -1036,7 +1036,7 @@ function renderSourcesBar(sources) {
       datasets: [{
         label: 'items',
         data: sorted.map(s => s.total),
-        backgroundColor: sorted.map(s => s.consecutive_errors > 0 ? PRIO_COLORS.warn : '#3fb950'),
+        backgroundColor: sorted.map(s => s.consecutive_errors > 0 ? PRIO_COLORS.warn : PRIO_COLORS.info),
       }],
     },
     options: {
@@ -1075,7 +1075,7 @@ window.applyFilters = applyFilters;
 // upsertChart/PRIO_COLORS from the Feed tab's dashboard above.
 
 const landscapeState = { windowDays: 30 };
-const ACTOR_BAR_COLOR = '#bc8cff';
+const ACTOR_BAR_COLOR = '#c77dff';
 
 const landscapeWindowSelect = document.getElementById('landscape-window-select');
 const landscapeExportBtn = document.getElementById('landscape-export-btn');
@@ -1180,7 +1180,7 @@ function renderLandscapeCountry(byCountry) {
     type: 'bar',
     data: {
       labels: top.map(r => r.country),
-      datasets: [{ label: 'victims', data: top.map(r => r.n), backgroundColor: '#388bfd' }],
+      datasets: [{ label: 'victims', data: top.map(r => r.n), backgroundColor: PRIO_COLORS.warn }],
     },
     options: {
       indexAxis: 'y',
@@ -1198,7 +1198,7 @@ function renderLandscapeSector(bySector) {
     type: 'bar',
     data: {
       labels: top.map(r => r.sector),
-      datasets: [{ label: 'cases', data: top.map(r => r.n), backgroundColor: '#3fb950' }],
+      datasets: [{ label: 'cases', data: top.map(r => r.n), backgroundColor: PRIO_COLORS.info }],
     },
     options: {
       indexAxis: 'y',
