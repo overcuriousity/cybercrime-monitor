@@ -329,14 +329,43 @@ async def _investigate_one(db_conn, inv: dict, scheduler, sse_broadcaster) -> No
         await sse_broadcaster.broadcast(_item_payload(item, data, confidence, significance, cve_ids, iocs))
 
     if not inserted_items:
-        # Hermes claimed a match but produced nothing insertable (no usable
-        # items, or every one was already a known duplicate) — conservative
-        # default is "didn't actually add anything new," not a fabricated case.
-        await db.finish_investigation(db_conn, investigation_id=investigation_id, status="no_match", findings=data)
+        # If the investigation is being retried (e.g. crash/restart while it
+        # was "running"), its targeted_research items may already exist. Try
+        # to recover a linked case_id from those items before declaring no_match.
+        case_id = None
+        for raw in raw_items[:_MAX_ITEMS]:
+            url = str(raw.get("url") or "").strip()
+            if not url:
+                continue
+            rows = await db_conn.execute_fetchall(
+                "SELECT id FROM items WHERE source_id = :sid AND url = :url LIMIT 1",
+                {"sid": _SOURCE_ID, "url": url},
+            )
+            if rows:
+                case_id = await db.get_case_id_for_item(db_conn, rows[0]["id"])
+                if case_id is not None:
+                    break
+
+        status = "completed" if case_id is not None else "no_match"
+        await db.finish_investigation(
+            db_conn,
+            investigation_id=investigation_id,
+            status=status,
+            findings=data,
+            case_id=case_id,
+        )
         await _log_activity(
-            db_conn, action="investigation_no_match", status="skipped", ref_type="investigation",
-            summary=f"Investigation #{investigation_id}: match claimed but no new items produced",
-            detail={"brief": brief[:200]}, ref_id=investigation_id,
+            db_conn,
+            action="investigation_completed" if status == "completed" else "investigation_no_match",
+            status="ok" if status == "completed" else "skipped",
+            ref_type="investigation",
+            ref_id=investigation_id,
+            summary=(
+                f"Investigation #{investigation_id}: already integrated" + (f" (case #{case_id})" if case_id else "")
+                if status == "completed"
+                else f"Investigation #{investigation_id}: match claimed but no new items produced"
+            ),
+            detail={"brief": brief[:200]},
         )
         return
 
