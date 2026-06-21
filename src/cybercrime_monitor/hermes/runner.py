@@ -57,6 +57,23 @@ def _is_transient(error: str | None) -> bool:
     return any(marker in low for marker in _TRANSIENT_ERROR_MARKERS)
 
 
+# Process-wide cap on concurrently-running hermes-agent subprocesses, shared
+# by every caller (research/agent.py, research/investigate.py,
+# research/heal.py) since they all ultimately hit the same primary backend
+# and its published rate limit — see settings.hermes_max_concurrent_runs's
+# docstring for the sizing rationale. Created lazily so it binds to whatever
+# event loop is actually running (module import happens before the app's
+# loop starts).
+_concurrency_guard: asyncio.Semaphore | None = None
+
+
+def _guard() -> asyncio.Semaphore:
+    global _concurrency_guard
+    if _concurrency_guard is None:
+        _concurrency_guard = asyncio.Semaphore(settings.hermes_max_concurrent_runs)
+    return _concurrency_guard
+
+
 @dataclass
 class HermesResult:
     ok: bool
@@ -109,20 +126,21 @@ async def run_agent(
     usable way to request "no tools"; callers must name a real, narrow
     toolset instead (see llm/backend.py's _NO_TOOLS_TOOLSET).
     """
-    result = await _run_agent_once(prompt, toolsets=toolsets, timeout=timeout, model=model)
-    attempts = 1
-    while attempts <= settings.hermes_max_retries:
-        retryable = _is_transient(result.error) or (result.ok and expect_json and result.data is None)
-        if not retryable:
-            break
-        backoff = settings.hermes_retry_backoff_seconds * attempts
-        log.warning(
-            "[hermes] transient failure (attempt %d/%d), retrying in %.0fs: %s",
-            attempts, settings.hermes_max_retries, backoff, result.error or "empty/unparseable response",
-        )
-        await asyncio.sleep(backoff)
+    async with _guard():
         result = await _run_agent_once(prompt, toolsets=toolsets, timeout=timeout, model=model)
-        attempts += 1
+        attempts = 1
+        while attempts <= settings.hermes_max_retries:
+            retryable = _is_transient(result.error) or (result.ok and expect_json and result.data is None)
+            if not retryable:
+                break
+            backoff = settings.hermes_retry_backoff_seconds * attempts
+            log.warning(
+                "[hermes] transient failure (attempt %d/%d), retrying in %.0fs: %s",
+                attempts, settings.hermes_max_retries, backoff, result.error or "empty/unparseable response",
+            )
+            await asyncio.sleep(backoff)
+            result = await _run_agent_once(prompt, toolsets=toolsets, timeout=timeout, model=model)
+            attempts += 1
     return result
 
 
