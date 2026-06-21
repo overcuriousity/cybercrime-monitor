@@ -236,6 +236,7 @@ async def run_discover_batch(db_conn, scheduler=None, sse_broadcaster=None) -> i
             toolsets=settings.hermes_toolsets,
             timeout=settings.hermes_timeout_seconds,
             model=settings.hermes_model or None,
+            expect_json=True,
         )
         if not result.ok or result.data is None:
             record_error(result.error or "no parseable result")
@@ -380,7 +381,7 @@ async def _propose_selectors(url: str, html: str) -> dict | None:
     no need to re-spend a browsing budget on a page we already have."""
     prompt = _SELECTOR_PROMPT_TEMPLATE.format(url=url, html=html[:_SELECTOR_HTML_CHARS])
     result = await run_agent(prompt, toolsets="memory", timeout=settings.hermes_timeout_seconds,
-                              model=settings.hermes_model or None)
+                              model=settings.hermes_model or None, expect_json=True)
     if not result.ok or not isinstance(result.data, dict):
         return None
     data = result.data

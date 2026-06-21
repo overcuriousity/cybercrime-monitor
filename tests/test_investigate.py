@@ -18,9 +18,9 @@ def _investigate_enabled(monkeypatch):
     monkeypatch.setattr(app_settings, "investigate_min_confidence", 0.5)
 
 
-async def _stub_run_agent_factory(data: dict | None, *, ok: bool = True):
-    async def _stub(prompt, *, toolsets=None, timeout=None, model=None):
-        return HermesResult(ok=ok, text="", data=data, error=None if ok else "stub failure", duration_seconds=0.1)
+async def _stub_run_agent_factory(data: dict | None, *, ok: bool = True, error: str = "stub failure"):
+    async def _stub(prompt, *, toolsets=None, timeout=None, model=None, expect_json=False):
+        return HermesResult(ok=ok, text="", data=data, error=None if ok else error, duration_seconds=0.1)
     return _stub
 
 
@@ -155,6 +155,100 @@ async def test_confident_match_passes_new_feeds_to_discover(db_conn, monkeypatch
     assert result["status"] == "completed"
     assert len(called_with) == 1
     assert called_with[0]["name"] == "ACME News Feed"
+
+
+@pytest.mark.asyncio
+async def test_transient_failure_requeues_instead_of_failing(db_conn, monkeypatch):
+    """A hermes failure that hermes/runner.py's _is_transient recognizes
+    (e.g. the live "no final response was produced" cascade from a broken
+    fallback-chain link) should be re-queued with a cooldown, not marked
+    terminally failed — see research/investigate.py's _investigate_one."""
+    monkeypatch.setattr(
+        investigate, "run_agent",
+        await _stub_run_agent_factory(
+            None, ok=False, error="hermes -z: no final response was produced; treating the run as failed.",
+        ),
+    )
+
+    inv_id = await db_module.create_investigation(db_conn, brief="Ransomware targeting German victims")
+    inv = await db_module.get_investigation(db_conn, inv_id)
+    assert inv["attempts"] == 0
+    await investigate._investigate_one(db_conn, inv, scheduler=None, sse_broadcaster=broadcaster)
+
+    result = await db_module.get_investigation(db_conn, inv_id)
+    assert result["status"] == "queued"
+    assert result["attempts"] == 1
+    assert result["next_retry_at"] is not None
+    assert "no final response" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_transient_failure_goes_terminal_after_max_attempts(db_conn, monkeypatch):
+    """Once a re-queued investigation has been retried investigate_max_attempts
+    times, a further transient failure should stop re-queueing and go
+    terminal instead — otherwise a chronically-failing brief loops forever."""
+    monkeypatch.setattr(app_settings, "investigate_max_attempts", 2)
+    monkeypatch.setattr(
+        investigate, "run_agent",
+        await _stub_run_agent_factory(None, ok=False, error="429 Too Many Requests"),
+    )
+
+    inv_id = await db_module.create_investigation(db_conn, brief="Ransomware targeting German victims")
+    await db_module.requeue_investigation(
+        db_conn, investigation_id=inv_id, error="429 Too Many Requests", next_retry_at="2000-01-01T00:00:00+00:00",
+    )
+    inv = await db_module.get_investigation(db_conn, inv_id)
+    assert inv["attempts"] == 1
+
+    await investigate._investigate_one(db_conn, inv, scheduler=None, sse_broadcaster=broadcaster)
+
+    result = await db_module.get_investigation(db_conn, inv_id)
+    assert result["status"] == "queued"
+    assert result["attempts"] == 2
+
+    inv2 = await db_module.get_investigation(db_conn, inv_id)
+    await investigate._investigate_one(db_conn, inv2, scheduler=None, sse_broadcaster=broadcaster)
+
+    final = await db_module.get_investigation(db_conn, inv_id)
+    assert final["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_permanent_failure_goes_terminal_immediately(db_conn, monkeypatch):
+    """A non-transient hermes failure (e.g. a misconfigured binary path)
+    should still go straight to terminal "failed" on the first try."""
+    monkeypatch.setattr(
+        investigate, "run_agent",
+        await _stub_run_agent_factory(None, ok=False, error="hermes binary not found: 'hermes'"),
+    )
+
+    inv_id = await db_module.create_investigation(db_conn, brief="Ransomware targeting German victims")
+    inv = await db_module.get_investigation(db_conn, inv_id)
+    await investigate._investigate_one(db_conn, inv, scheduler=None, sse_broadcaster=broadcaster)
+
+    result = await db_module.get_investigation(db_conn, inv_id)
+    assert result["status"] == "failed"
+    assert result["attempts"] == 0
+
+
+@pytest.mark.asyncio
+async def test_get_queued_investigations_respects_cooldown(db_conn):
+    """A re-queued investigation with a future next_retry_at must not be
+    drained until the cooldown elapses — get_queued_investigations' gate."""
+    inv_id = await db_module.create_investigation(db_conn, brief="Cooling down")
+    await db_module.requeue_investigation(
+        db_conn, investigation_id=inv_id, error="429", next_retry_at="2999-01-01T00:00:00+00:00",
+    )
+
+    queued = await db_module.get_queued_investigations(db_conn, limit=10)
+    assert queued == []
+
+    await db_module.requeue_investigation(
+        db_conn, investigation_id=inv_id, error="429", next_retry_at="2000-01-01T00:00:00+00:00",
+    )
+    queued = await db_module.get_queued_investigations(db_conn, limit=10)
+    assert len(queued) == 1
+    assert queued[0]["id"] == inv_id
 
 
 # ── API route tests ──────────────────────────────────────────────────────────

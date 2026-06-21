@@ -29,6 +29,33 @@ log = logging.getLogger(__name__)
 # stdout to be valid JSON.
 _JSON_OBJECT = re.compile(r"\{.*\}", re.DOTALL)
 
+# Substrings of a HermesResult.error (or "empty data despite ok=True") that
+# mark a single bad provider hop rather than a real outage — worth one
+# in-process retry. Observed live (2026-06-21): a rate-limited free primary
+# falling through a fallback chain with one broken link (wrong model id —
+# 404) ends the agent loop with no final message at all, which oneshot.py
+# reports as "no final response was produced" with exit 1; that's the same
+# class of failure as a transient 429, not a permanent misconfiguration.
+# Deliberately NOT retried here: "binary not found" / invalid toolsets
+# (permanent, retrying just repeats the same failure) and "timeout" (a
+# 900s+ run is too expensive to redo in-process — left to the caller's own
+# scheduler/cooldown, e.g. research/investigate.py's failure-retry).
+_TRANSIENT_ERROR_MARKERS = (
+    "no final response was produced",
+    "no parseable result",
+    "too many requests",
+    "rate limit",
+    "ratelimit",  # e.g. hermes' own error_type=RateLimitError (no space)
+    "429",
+)
+
+
+def _is_transient(error: str | None) -> bool:
+    if not error:
+        return False
+    low = error.lower()
+    return any(marker in low for marker in _TRANSIENT_ERROR_MARKERS)
+
 
 @dataclass
 class HermesResult:
@@ -45,15 +72,33 @@ async def run_agent(
     toolsets: str | None = None,
     timeout: float | None = None,
     model: str | None = None,
+    expect_json: bool = False,
 ) -> HermesResult:
     """Run one headless hermes-agent turn and return its result.
 
     Always returns a HermesResult rather than raising — callers (research and
-    self-healing jobs) treat a Hermes failure exactly like an unreachable LLM
-    backend: log it, record health, leave the case/source as-is for the next
-    tick. No internal retry; the caller's own scheduler interval is the retry
-    loop, same pattern as llm/job.py's unclassified-items query being
-    naturally self-healing.
+    self-healing jobs) treat a sustained Hermes failure exactly like an
+    unreachable LLM backend: log it, record health, leave the case/source as-
+    is for the next tick. The caller's own scheduler interval (or, for
+    investigate.py, an explicit failure-retry/cooldown) remains the retry
+    loop for real outages, same pattern as llm/job.py's unclassified-items
+    query being naturally self-healing.
+
+    What this function DOES retry, in-process, bounded by
+    settings.hermes_max_retries: clearly transient failures (see
+    _is_transient) — a single bad provider hop (rate limit, a broken link in
+    the fallback chain) that ends the run with no final message, or a run
+    that exits 0 but produces no parseable JSON when expect_json=True. A
+    backoff sleep (hermes_retry_backoff_seconds * attempt) separates
+    attempts. Anything else (timeout, permanent misconfiguration, a real
+    outage that survives the retry budget) is returned as-is for the caller
+    to handle.
+
+    expect_json: when True, a 0-exit run whose stdout has no parseable JSON
+    object is treated as transient and retried too (an agent that "completed"
+    but ignored the requested output format is often just a bad sample, not
+    a permanent contract violation) — see research/agent.py and
+    research/investigate.py, both of which require JSON back.
 
     toolsets: None means "use settings.hermes_toolsets" (the default for
     agentic callers). Pass an explicit minimal toolset (e.g. "memory") to
@@ -64,6 +109,31 @@ async def run_agent(
     usable way to request "no tools"; callers must name a real, narrow
     toolset instead (see llm/backend.py's _NO_TOOLS_TOOLSET).
     """
+    result = await _run_agent_once(prompt, toolsets=toolsets, timeout=timeout, model=model)
+    attempts = 1
+    while attempts <= settings.hermes_max_retries:
+        retryable = _is_transient(result.error) or (result.ok and expect_json and result.data is None)
+        if not retryable:
+            break
+        backoff = settings.hermes_retry_backoff_seconds * attempts
+        log.warning(
+            "[hermes] transient failure (attempt %d/%d), retrying in %.0fs: %s",
+            attempts, settings.hermes_max_retries, backoff, result.error or "empty/unparseable response",
+        )
+        await asyncio.sleep(backoff)
+        result = await _run_agent_once(prompt, toolsets=toolsets, timeout=timeout, model=model)
+        attempts += 1
+    return result
+
+
+async def _run_agent_once(
+    prompt: str,
+    *,
+    toolsets: str | None = None,
+    timeout: float | None = None,
+    model: str | None = None,
+) -> HermesResult:
+    """Single headless hermes-agent turn, no retry — see run_agent."""
     toolsets = settings.hermes_toolsets if toolsets is None else toolsets
     timeout = timeout or settings.hermes_timeout_seconds
     model = model or settings.hermes_model
