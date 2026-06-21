@@ -803,6 +803,7 @@ mark { background: var(--prio-warn-bg); color: var(--prio-warn); padding: 0 2px;
 .case-detail h3:first-child { margin-top: 0; }
 .case-detail-header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
 .case-detail-header h2 { font-size: 1.25rem; margin: 0; font-weight: 600; }
+.case-id-tag { font-size: 0.8rem; font-family: monospace; color: var(--text-muted); user-select: all; }
 
 #case-pivot-banner {
   align-items: center;

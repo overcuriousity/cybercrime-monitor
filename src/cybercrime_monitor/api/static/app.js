@@ -1751,7 +1751,7 @@ function buildCaseCard(c) {
 
   const titleDiv = document.createElement('div');
   titleDiv.className = 'item-title';
-  titleDiv.textContent = c.title;
+  titleDiv.textContent = `#${c.id} · ${c.title}`;
   card.appendChild(titleDiv);
 
   if (c.damaged_party || c.attribution) {
@@ -1793,6 +1793,11 @@ function renderCaseDetail(c, items, researchRuns, relatedCases) {
   const h = document.createElement('h2');
   h.textContent = c.title;
   header.appendChild(h);
+  const idTag = document.createElement('span');
+  idTag.className = 'case-id-tag';
+  idTag.textContent = `#${c.id}`;
+  idTag.title = 'Case ID — used for "Merge with case…"';
+  header.appendChild(idTag);
   if (c.significance) {
     const chip = document.createElement('span');
     chip.className = 'tag-chip prio-' + c.significance;
@@ -1953,7 +1958,7 @@ function renderCaseDetail(c, items, researchRuns, relatedCases) {
     relatedCases.forEach(r => {
       const rcard = document.createElement('button');
       rcard.className = 'related-case-card';
-      rcard.appendChild(document.createTextNode(r.title));
+      rcard.appendChild(document.createTextNode(`#${r.case_id} · ${r.title}`));
       const rreasons = document.createElement('div');
       rreasons.className = 'related-reasons';
       rreasons.textContent = `${(r.reasons || []).join(', ')} · score ${(r.score * 100).toFixed(0)}%`;
