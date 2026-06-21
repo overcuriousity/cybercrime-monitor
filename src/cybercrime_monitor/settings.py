@@ -143,6 +143,39 @@ class Settings(BaseSettings):
     source_prune_grace_days: int = 5
     source_value_refresh_interval_seconds: int = 1800
 
+    # ── Semantic search / embeddings ────────────────────────────────────────
+    # Separate from the llm_* extraction layer above — embeddings are a
+    # distinct call shape (/embeddings, not /chat/completions) and the local
+    # default deliberately doesn't depend on an LLM server being up at all.
+    # "local": fastembed (ONNX, no torch) running embed_local_model in-process
+    # — works with zero external config, all on-machine, multilingual.
+    # "openai": any OpenAI-compatible /embeddings endpoint — reuses
+    # llm_base_url/llm_api_key unless embed_base_url/embed_api_key are set,
+    # so a single already-configured provider (e.g. a real OpenAI account)
+    # covers both extraction and embeddings.
+    # "none": semantic search disabled — the UI's keyword mode (unaffected,
+    # plain SQL LIKE) is the only search available, and the semantic toggle
+    # reports itself unavailable rather than silently degrading to keyword.
+    #
+    # INTEGRITY: every vector is tagged with a fingerprint of
+    # (embed_backend, model, dimension). Changing any of those three values
+    # invalidates the entire vector index on next startup — vec_cases/
+    # vec_items are dropped and rebuilt from scratch by the embedding job,
+    # rather than silently mixing vectors from two different embedding
+    # spaces (which would make every similarity score meaningless). See
+    # embeddings/index.py's init_vectors.
+    embed_backend: str = "local"  # "local" | "openai" | "none"
+    # bge-m3: multilingual (100+ languages), 1024-dim, strong general-purpose
+    # retrieval quality for its size. Downloaded once via fastembed (ONNX,
+    # ~2GB) and cached under fastembed's model cache dir on first local use —
+    # that first run needs internet even though every run after is offline.
+    embed_local_model: str = "BAAI/bge-m3"
+    embed_base_url: str = ""  # blank = reuse llm_base_url
+    embed_api_key: str = ""  # blank = reuse llm_api_key
+    embed_model: str = "text-embedding-3-small"  # used only when embed_backend="openai"
+    embed_batch_size: int = 32
+    embed_interval_seconds: int = 60
+
     # CISA KEV (Known Exploited Vulnerabilities) catalog — refreshed daily
     # into the kev_catalog table; see enrich/kev.py.
     kev_feed_url: str = (

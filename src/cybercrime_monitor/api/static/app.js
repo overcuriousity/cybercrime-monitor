@@ -10,6 +10,7 @@ const state = {
   sources: [],
   filters: {
     search: '',
+    searchMode: 'keyword', // 'keyword' | 'semantic' — see initSearchModeToggle
     priority: '',
     matchedOnly: false,
     showFiltered: false,
@@ -41,6 +42,8 @@ const sseStatus      = document.getElementById('sse-status');
 const sourceFilters  = document.getElementById('source-filters');
 const sourceLegend   = document.getElementById('source-legend');
 const searchInput    = document.getElementById('search-input');
+const searchModeToggle = document.getElementById('search-mode-toggle');
+const searchModeHint   = document.getElementById('search-mode-hint');
 const matchedOnlyCb  = document.getElementById('matched-only');
 const showFilteredCb = document.getElementById('show-filtered');
 const sinceInput     = document.getElementById('since-input');
@@ -85,6 +88,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     state.filters.search = searchInput.value.trim();
     applyFilters();
   }, 400));
+  initSearchModeToggle(searchModeToggle, searchModeHint, mode => {
+    state.filters.searchMode = mode;
+    applyFilters();
+  });
   matchedOnlyCb.addEventListener('change', () => {
     state.filters.matchedOnly = matchedOnlyCb.checked;
     applyFilters();
@@ -348,6 +355,44 @@ function patchCardWithVerdict(verdict) {
 }
 
 // ── Items ──────────────────────────────────────────────────────────────────
+// ── Search mode toggle (keyword/semantic) ───────────────────────────────────
+// Shared by the Feed sidebar search and the Cases toolbar search. Two
+// explicit, separately labeled modes rather than one blended search — a
+// failed/unavailable semantic request must read as visibly different from
+// "keyword found nothing" (see settings.embed_backend's docstring and
+// api/routes.py's mode=semantic branch). semanticSearchEnabled mirrors
+// /api/status's semantic_search.enabled (kept fresh by renderStatusBar) and
+// only gates whether the Semantic button is clickable.
+let semanticSearchEnabled = true;
+
+function initSearchModeToggle(toggleEl, hintEl, onChange) {
+  toggleEl.querySelectorAll('.search-mode-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      if (btn.disabled) return;
+      toggleEl.querySelectorAll('.search-mode-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      hintEl.classList.add('hidden');
+      onChange(btn.dataset.mode);
+    });
+  });
+}
+
+function syncSearchModeToggle(toggleEl, mode) {
+  toggleEl.querySelectorAll('.search-mode-btn').forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
+}
+
+function setSearchModeToggleEnabled(toggleEl, enabled) {
+  const semanticBtn = toggleEl.querySelector('.search-mode-btn[data-mode="semantic"]');
+  if (!semanticBtn) return;
+  semanticBtn.disabled = !enabled;
+  semanticBtn.title = enabled ? '' : 'Semantic search is disabled on this server (EMBED_BACKEND=none)';
+}
+
+function showSemanticUnavailableHint(hintEl) {
+  hintEl.textContent = 'Semantic search unavailable right now — showing no results (not silently falling back to keyword).';
+  hintEl.classList.remove('hidden');
+}
+
 async function applyFilters() {
   state.offset = 0;
   state.pendingLive = [];
@@ -369,6 +414,8 @@ async function applyFilters() {
     }
     throw e;
   }
+
+  if (data.semantic_unavailable) showSemanticUnavailableHint(searchModeHint);
 
   feedList.innerHTML = '';
   state.items = data.items || [];
@@ -402,6 +449,7 @@ function buildParams(offset, limit) {
   p.set('limit', limit);
   p.set('offset', offset);
   if (f.search)       p.set('search', f.search);
+  if (f.searchMode === 'semantic') p.set('mode', 'semantic');
   if (f.priority)     p.set('priority', f.priority);
   if (f.matchedOnly)  p.set('matched_only', 'true');
   if (f.showFiltered) p.set('show_filtered', 'true');
@@ -439,6 +487,7 @@ function loadFiltersFromUrl() {
   const p = new URLSearchParams(location.search);
   const f = state.filters;
   f.search = p.get('search') || '';
+  f.searchMode = p.get('mode') === 'semantic' ? 'semantic' : 'keyword';
   f.priority = p.get('priority') || '';
   f.matchedOnly = p.get('matched_only') === 'true';
   f.showFiltered = p.get('show_filtered') === 'true';
@@ -463,6 +512,7 @@ function loadFiltersFromUrl() {
 function syncFilterControls() {
   const f = state.filters;
   searchInput.value = f.search;
+  syncSearchModeToggle(searchModeToggle, f.searchMode);
   document.querySelectorAll('input[name="priority"]').forEach(r => {
     r.checked = r.value === f.priority;
   });
@@ -1458,7 +1508,7 @@ const casesState = {
   pageSize: 50,
   hasMore: false,
   selectedId: null,
-  filters: { search: '', significance: '', kevOnly: false, crimeType: '', since: '', until: '', cveId: '', ioc: '' },
+  filters: { search: '', searchMode: 'keyword', significance: '', kevOnly: false, crimeType: '', since: '', until: '', cveId: '', ioc: '' },
 };
 const CASE_FILTERS_DEFAULT = { ...casesState.filters };
 
@@ -1466,6 +1516,8 @@ const casesList        = document.getElementById('cases-list');
 const casesEmpty       = document.getElementById('cases-empty');
 const casesLoadMoreBtn = document.getElementById('cases-load-more');
 const caseSearchInput  = document.getElementById('case-search-input');
+const caseSearchModeToggle = document.getElementById('case-search-mode-toggle');
+const caseSearchModeHint   = document.getElementById('case-search-mode-hint');
 const caseKevOnlyCb    = document.getElementById('case-kev-only');
 const caseSignificanceSelect = document.getElementById('case-significance-select');
 const caseCrimeTypeSelect    = document.getElementById('case-crime-type-select');
@@ -1508,6 +1560,8 @@ function initCases() {
     caseCrimeTypeSelect.value = '';
     caseSinceInput.value = '';
     caseUntilInput.value = '';
+    syncSearchModeToggle(caseSearchModeToggle, casesState.filters.searchMode);
+    caseSearchModeHint.classList.add('hidden');
     updateIndicatorPivotBanner();
     applyCaseFilters();
   });
@@ -1518,6 +1572,10 @@ function initCases() {
     applyCaseFilters();
   });
   casesLoadMoreBtn.addEventListener('click', loadMoreCases);
+  initSearchModeToggle(caseSearchModeToggle, caseSearchModeHint, mode => {
+    casesState.filters.searchMode = mode;
+    applyCaseFilters();
+  });
 
   loadCaseStats();
   applyCaseFilters();
@@ -1527,6 +1585,7 @@ function initCases() {
 function caseQueryParams(extra = {}) {
   const params = new URLSearchParams();
   if (casesState.filters.search) params.set('search', casesState.filters.search);
+  if (casesState.filters.searchMode === 'semantic') params.set('mode', 'semantic');
   if (casesState.filters.significance) params.set('min_significance', casesState.filters.significance);
   if (casesState.filters.kevOnly) params.set('in_kev', 'true');
   if (casesState.filters.crimeType) params.set('crime_type', casesState.filters.crimeType);
@@ -1550,6 +1609,8 @@ function pivotCasesByIndicator(kind, value) {
   caseCrimeTypeSelect.value = '';
   caseSinceInput.value = '';
   caseUntilInput.value = '';
+  syncSearchModeToggle(caseSearchModeToggle, casesState.filters.searchMode);
+  caseSearchModeHint.classList.add('hidden');
   updateIndicatorPivotBanner();
   document.querySelector('.tab[data-tab="cases"]').click();
   applyCaseFilters();
@@ -1571,6 +1632,7 @@ async function applyCaseFilters() {
   casesState.offset = 0;
   try {
     const data = await api('/api/cases?' + caseQueryParams({ limit: casesState.pageSize, offset: 0 }));
+    if (data.semantic_unavailable) showSemanticUnavailableHint(caseSearchModeHint);
     casesState.cases = data.cases;
     casesState.hasMore = data.cases.length === casesState.pageSize && data.total > casesState.pageSize;
     renderCasesList();
@@ -2040,6 +2102,10 @@ async function updateStatusBar() {
 function renderStatusBar(s) {
   adminEnabledServerSide = !!(s.admin && s.admin.enabled);
   updateAdminUiState();
+
+  semanticSearchEnabled = !!(s.semantic_search && s.semantic_search.enabled);
+  setSearchModeToggleEnabled(searchModeToggle, semanticSearchEnabled);
+  setSearchModeToggleEnabled(caseSearchModeToggle, semanticSearchEnabled);
 
   const sched = s.scheduler || {};
   setStatusPill('status-scheduler', sched.running ? 'scheduler: running' : 'scheduler: stopped', sched.running ? 'ok' : 'error');

@@ -10,6 +10,8 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .. import health
+from ..embeddings import backend as embed_backend
+from ..embeddings import index as vec_index
 from ..llm import health as llm_health
 from ..db import (
     count_cases,
@@ -110,6 +112,39 @@ async def require_admin(x_admin_token: str | None = Header(default=None)):
         raise HTTPException(status_code=403, detail="Admin token required")
 
 
+# ── Semantic search ──────────────────────────────────────────────────────────
+# Shared by api_items/api_cases' mode="semantic" branch. Keyword mode (the
+# default, and the only mode when embeddings are disabled) is the existing
+# plain SQL LIKE search via fetch_items/fetch_cases' `search` param — the
+# two modes are kept strictly separate (see settings.embed_backend's
+# docstring): a failed/unavailable semantic request must be surfaced to the
+# UI as unavailable, never silently re-run as a keyword search.
+
+# Wide enough that structured filters (significance, date range, etc.)
+# applied after the vector search still leave a full page of results in
+# the common case, without making every semantic query scan the whole
+# vector index.
+_SEMANTIC_CANDIDATE_K = 300
+
+
+async def _semantic_rank(db, kind: str, query: str) -> list[int]:
+    """Embeds `query` and returns case/item ids ranked nearest-first by
+    vector similarity. Raises embed_backend.EmbeddingUnavailable if the
+    configured backend can't serve the embed call."""
+    qvec = (await embed_backend.embed_texts([query]))[0]
+    candidates = await vec_index.search(db, kind, qvec, k=_SEMANTIC_CANDIDATE_K)
+    return [ref_id for ref_id, _distance in candidates]
+
+
+def _paginate_ranked(rows_by_id: dict[int, dict], ranked_ids: list[int], *, limit: int, offset: int) -> tuple[list[dict], int]:
+    """Re-applies the vector-similarity order (rows_by_id came back from a
+    SQL query ordered by seen_at/last_seen, not similarity) and paginates
+    in Python — the ranking only exists in the candidate-id order, not as a
+    SQL ORDER BY. Returns (page, total_after_filters)."""
+    ordered = [rows_by_id[i] for i in ranked_ids if i in rows_by_id]
+    return ordered[offset : offset + limit], len(ordered)
+
+
 # ── Items ─────────────────────────────────────────────────────────────────────
 
 @router.get("/api/items")
@@ -138,6 +173,7 @@ async def api_items(
     since: str | None = Query(default=None),
     until: str | None = Query(default=None),
     extra_key: str | None = Query(default=None),
+    mode: str = Query(default="keyword", pattern="^(keyword|semantic)$"),  # "keyword" | "semantic"
     x_admin_token: str | None = Header(default=None),
 ):
     # show_filtered reveals classifier-flagged false positives — admin-gated
@@ -162,6 +198,30 @@ async def api_items(
         "extra_key": extra_key,
     }
 
+    if mode == "semantic" and search:
+        try:
+            ranked_ids = await _semantic_rank(db, "items", search)
+        except embed_backend.EmbeddingUnavailable:
+            return {"total": 0, "items": [], "mode": "semantic", "semantic_unavailable": True}
+        if not ranked_ids:
+            return {"total": 0, "items": [], "mode": "semantic"}
+        # No `search=` here — id_in (the vector-search candidate set) takes
+        # over search's job; every other structured filter still applies.
+        candidates = await fetch_items(
+            db,
+            limit=len(ranked_ids),
+            offset=0,
+            source_id=source_id,
+            min_priority=priority,
+            matched_only=matched_only,
+            show_filtered=show_filtered,
+            id_in=ranked_ids,
+            **filter_kwargs,
+        )
+        by_id = {item["id"]: item for item in candidates}
+        page, total = _paginate_ranked(by_id, ranked_ids, limit=limit, offset=offset)
+        return {"total": total, "items": page, "mode": "semantic"}
+
     items = await fetch_items(
         db,
         limit=limit,
@@ -185,7 +245,7 @@ async def api_items(
         show_filtered=show_filtered,
         **filter_kwargs,
     )
-    return {"total": total, "items": items}
+    return {"total": total, "items": items, "mode": "keyword"}
 
 
 # ── SSE stream ────────────────────────────────────────────────────────────────
@@ -423,6 +483,15 @@ async def api_status(request: Request, db=Depends(get_db)):
             "count": await count_kev_catalog(db),
             "next_refresh_at": kev_next_run,
         },
+        # Lets the frontend show/disable the keyword/semantic search toggle
+        # without a failed search round-trip first — "enabled" only means
+        # the backend is configured, not that the vector index is fully
+        # populated yet (a fresh DB or one mid-reindex just returns fewer
+        # results, not an error).
+        "semantic_search": {
+            "enabled": settings.embed_backend != "none",
+            "backend": settings.embed_backend,
+        },
         "research": {
             "last_run_at": rh.last_run_at,
             "last_success_at": rh.last_success_at,
@@ -495,9 +564,35 @@ async def api_cases(
     ioc: str | None = Query(default=None),
     since: str | None = Query(default=None),
     until: str | None = Query(default=None),
+    mode: str = Query(default="keyword", pattern="^(keyword|semantic)$"),  # "keyword" | "semantic"
 ):
     since_norm = _normalize_date_filter(since, end_of_day=False)
     until_norm = _normalize_date_filter(until, end_of_day=True)
+
+    if mode == "semantic" and search:
+        try:
+            ranked_ids = await _semantic_rank(db, "cases", search)
+        except embed_backend.EmbeddingUnavailable:
+            return {"total": 0, "cases": [], "mode": "semantic", "semantic_unavailable": True}
+        if not ranked_ids:
+            return {"total": 0, "cases": [], "mode": "semantic"}
+        candidates = await fetch_cases(
+            db,
+            limit=len(ranked_ids),
+            offset=0,
+            min_significance=min_significance,
+            crime_type=crime_type,
+            in_kev=in_kev,
+            cve_id=cve_id,
+            ioc=ioc,
+            since=since_norm,
+            until=until_norm,
+            id_in=ranked_ids,
+        )
+        by_id = {case["id"]: case for case in candidates}
+        page, total = _paginate_ranked(by_id, ranked_ids, limit=limit, offset=offset)
+        return {"total": total, "cases": page, "mode": "semantic"}
+
     cases = await fetch_cases(
         db,
         limit=limit,
@@ -522,7 +617,7 @@ async def api_cases(
         since=since_norm,
         until=until_norm,
     )
-    return {"total": total, "cases": cases}
+    return {"total": total, "cases": cases, "mode": "keyword"}
 
 
 async def _load_case_bundle(db, case_id: int) -> tuple[dict, list[dict], list[dict], list[dict]]:
