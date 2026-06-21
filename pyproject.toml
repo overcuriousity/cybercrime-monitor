@@ -16,6 +16,8 @@ dependencies = [
     "watchfiles>=1.0",
     "regex>=2026.5.9",
     "ruamel.yaml>=0.18",
+    "sqlite-vec>=0.1.6",
+    "fastembed>=0.4",
 ]
 
 [project.scripts]

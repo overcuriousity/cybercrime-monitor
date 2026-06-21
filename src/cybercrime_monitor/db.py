@@ -361,6 +361,33 @@ CREATE TABLE IF NOT EXISTS investigations (
 
 CREATE INDEX IF NOT EXISTS idx_investigations_status ON investigations(status);
 
+-- Semantic search (embeddings/ package). embedding_meta is a single-row
+-- table identifying which backend/model produced the vectors *currently*
+-- stored in vec_cases/vec_items (those vec0 virtual tables are created
+-- lazily by embeddings/index.py, not here, since their column width
+-- depends on the active model's dimension). vec_index_state tracks, per
+-- embedded row, the content hash it was embedded from — lets the embedding
+-- job detect both "this case's summary changed since it was indexed" and,
+-- via embedding_meta's fingerprint check at startup, "this backend changed
+-- and the whole index needs rebuilding." See embeddings/index.py's
+-- module docstring for the full integrity contract.
+CREATE TABLE IF NOT EXISTS embedding_meta (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    fingerprint TEXT NOT NULL,
+    backend     TEXT NOT NULL,
+    model       TEXT NOT NULL,
+    dim         INTEGER,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vec_index_state (
+    kind          TEXT NOT NULL, -- 'cases' | 'items'
+    ref_id        INTEGER NOT NULL,
+    content_hash  TEXT NOT NULL,
+    fingerprint   TEXT NOT NULL,
+    PRIMARY KEY (kind, ref_id)
+);
+
 -- Resolves one effective priority rank + false_positive flag per item, from
 -- the LLM extraction's significance — the sole classification signal (the
 -- old regex-matcher fallback was removed; an item simply has no priority
@@ -383,6 +410,11 @@ async def open_db() -> aiosqlite.Connection:
     await conn.executescript(_SCHEMA)
     await _migrate(conn)
     await conn.commit()
+    # Semantic-search vector index lifecycle/integrity check — see
+    # embeddings/index.py's module docstring. No-op when
+    # settings.embed_backend == "none".
+    from .embeddings.index import init_vectors
+    await init_vectors(conn)
     return conn
 
 
@@ -490,6 +522,7 @@ def _build_items_where(
     since: str | None = None,
     until: str | None = None,
     extra_key: str | None = None,
+    id_in: list[int] | None = None,
 ) -> tuple[str, dict, bool]:
     """Shared WHERE-clause + named-params builder for fetch_items and
     count_items. These two queries used to build their filters independently
@@ -600,6 +633,21 @@ def _build_items_where(
         params[f"p{idx}"] = f"%{extra_key}%"
         idx += 1
 
+    if id_in is not None:
+        # Semantic search mode: ranking comes from vector similarity (see
+        # api/routes.py's mode="semantic" branch), not a SQL ORDER BY — this
+        # scopes the row set to whatever the vector search returned so every
+        # *other* structured filter (significance, date range, etc.) still
+        # applies on top, then the caller re-sorts by similarity in Python.
+        if not id_in:
+            parts.append("0")  # empty candidate set -> no rows, not "no filter"
+        else:
+            placeholders = ", ".join(f":idin{idx + i}" for i in range(len(id_in)))
+            parts.append(f"i.id IN ({placeholders})")
+            for i, v in enumerate(id_in):
+                params[f"idin{idx + i}"] = v
+            idx += len(id_in)
+
     parts.append("(:matched_only = 0 OR ep.prio_rank > 0)")
     parts.append("(:min_rank = 0 OR ep.prio_rank >= :min_rank)")
     parts.append("(:show_filtered = 1 OR ep.false_positive = 0)")
@@ -635,6 +683,7 @@ async def fetch_items(
     since: str | None = None,
     until: str | None = None,
     extra_key: str | None = None,
+    id_in: list[int] | None = None,
 ) -> list[dict]:
     """Return items enriched with classifier data as JSON-serialisable dicts.
     Priority filtering/ordering reads the `item_priority` view (the
@@ -667,6 +716,7 @@ async def fetch_items(
         since=since,
         until=until,
         extra_key=extra_key,
+        id_in=id_in,
     )
 
     rows = await conn.execute_fetchall(
@@ -1704,6 +1754,7 @@ def _build_cases_where(
     ioc: str | None = None,
     since: str | None = None,
     until: str | None = None,
+    id_in: list[int] | None = None,
 ) -> tuple[str, dict]:
     parts = []
     params: dict = {}
@@ -1740,6 +1791,18 @@ def _build_cases_where(
     if until:
         parts.append("last_seen <= :until")
         params["until"] = until
+    if id_in is not None:
+        # Semantic search mode — see _build_items_where's id_in for the
+        # same pattern: scope to the vector-search candidate set, let every
+        # other structured filter still apply, caller re-sorts by
+        # similarity afterward.
+        if not id_in:
+            parts.append("0")
+        else:
+            placeholders = ", ".join(f":idin{i}" for i in range(len(id_in)))
+            parts.append(f"id IN ({placeholders})")
+            for i, v in enumerate(id_in):
+                params[f"idin{i}"] = v
     where = ("WHERE " + " AND ".join(parts)) if parts else ""
     return where, params
 
@@ -1757,6 +1820,7 @@ async def fetch_cases(
     ioc: str | None = None,
     since: str | None = None,
     until: str | None = None,
+    id_in: list[int] | None = None,
 ) -> list[dict]:
     """Case-centric counterpart to fetch_items — see that function's
     docstring for the shared filter/pagination shape this mirrors.
@@ -1767,7 +1831,7 @@ async def fetch_cases(
     a CVE/IoC -> every case sharing it)."""
     where, params = _build_cases_where(
         min_significance=min_significance, crime_type=crime_type, in_kev=in_kev,
-        search=search, cve_id=cve_id, ioc=ioc, since=since, until=until,
+        search=search, cve_id=cve_id, ioc=ioc, since=since, until=until, id_in=id_in,
     )
     rows = await conn.execute_fetchall(
         f"""
@@ -2534,6 +2598,7 @@ async def stats_trends(
     now = _utcnow()
     current_since = (now - timedelta(days=window_days)).isoformat()
     previous_since = (now - timedelta(days=2 * window_days)).isoformat()
+    casing_counts: dict[str, dict[str, int]] = {}  # lower -> {original: n}; "cve" dimension leaves this empty
 
     if dimension == "cve":
         rows = await conn.execute_fetchall(
@@ -2570,11 +2635,22 @@ async def stats_trends(
             """,
             {"since": previous_since},
         )
+        # actor/sector are free text and vary in casing for the same entity
+        # (e.g. "LockBit5" vs "lockbit5") — bucket case-insensitively and
+        # track each casing's frequency so the displayed label is still a
+        # real, human-readable string (most frequent casing) rather than a
+        # lowercased key. crime_type is a controlled enum, no casing issue.
+        casefold = dimension in ("actor", "sector")
         current_counts = {}
         previous_counts = {}
         for r in rows:
+            raw = r["value"]
+            key = raw.lower() if casefold else raw
+            if casefold:
+                c = casing_counts.setdefault(key, {})
+                c[raw] = c.get(raw, 0) + 1
             bucket = current_counts if r["first_seen"] >= current_since else previous_counts
-            bucket[r["value"]] = bucket.get(r["value"], 0) + 1
+            bucket[key] = bucket.get(key, 0) + 1
         values = set(current_counts) | set(previous_counts)
 
     out = []
@@ -2583,8 +2659,11 @@ async def stats_trends(
         previous = previous_counts.get(v, 0)
         if current == 0 and previous == 0:
             continue
+        display = v
+        if dimension != "cve" and v in casing_counts:
+            display = sorted(casing_counts[v].items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
         entry = {
-            "value": v,
+            "value": display,
             "current": current,
             "previous": previous,
             "delta": current - previous,
@@ -2604,34 +2683,57 @@ async def stats_trends(
 # optional since_iso window (derived from since_days in routes.py) so the
 # tab's 24h/7d/30d/90d/all selector can re-slice the same queries.
 
+# Free-text entity columns (attribution/sector/country) routinely vary in
+# casing for the same real-world value (e.g. "LockBit5" vs "lockbit5" from
+# different extraction passes) — a plain `GROUP BY column` then splits one
+# entity into multiple leaderboard bars. This helper groups case-
+# insensitively while still surfacing a real display label (the most
+# frequent original casing, ties broken alphabetically) and a count summed
+# across every casing variant. crime_type is a controlled enum and doesn't
+# need this treatment.
+def _build_casefold_leaderboard_sql(column: str, *, where: str, sub_where: str) -> str:
+    return f"""
+        SELECT
+            (SELECT c2.{column} FROM cases c2 {sub_where}
+             GROUP BY c2.{column} ORDER BY COUNT(*) DESC, c2.{column} ASC LIMIT 1) AS value,
+            COUNT(*) AS n
+        FROM cases c
+        {where}
+        GROUP BY lower(c.{column})
+        ORDER BY n DESC
+    """
+
+
 async def stats_cases_by_sector(conn: aiosqlite.Connection, *, since_iso: str | None = None) -> list[dict]:
-    where = "WHERE damaged_party_sector IS NOT NULL AND damaged_party_sector != ''"
-    if since_iso:
-        where += " AND first_seen >= :since"
-    rows = await conn.execute_fetchall(
-        f"""
-        SELECT damaged_party_sector AS sector, COUNT(*) AS n
-        FROM cases {where}
-        GROUP BY damaged_party_sector ORDER BY n DESC
-        """,
-        {"since": since_iso} if since_iso else {},
+    where = "WHERE c.damaged_party_sector IS NOT NULL AND c.damaged_party_sector != ''"
+    sub_where = (
+        "WHERE c2.damaged_party_sector IS NOT NULL AND c2.damaged_party_sector != '' "
+        "AND lower(c2.damaged_party_sector) = lower(c.damaged_party_sector)"
     )
-    return [dict(r) for r in rows]
+    params: dict = {}
+    if since_iso:
+        where += " AND c.first_seen >= :since"
+        sub_where += " AND c2.first_seen >= :since"
+        params["since"] = since_iso
+    sql = _build_casefold_leaderboard_sql("damaged_party_sector", where=where, sub_where=sub_where)
+    rows = await conn.execute_fetchall(sql, params)
+    return [{"sector": r["value"], "n": r["n"]} for r in rows]
 
 
 async def stats_cases_by_country(conn: aiosqlite.Connection, *, since_iso: str | None = None) -> list[dict]:
-    where = "WHERE damaged_party_country IS NOT NULL AND damaged_party_country != ''"
-    if since_iso:
-        where += " AND first_seen >= :since"
-    rows = await conn.execute_fetchall(
-        f"""
-        SELECT damaged_party_country AS country, COUNT(*) AS n
-        FROM cases {where}
-        GROUP BY damaged_party_country ORDER BY n DESC
-        """,
-        {"since": since_iso} if since_iso else {},
+    where = "WHERE c.damaged_party_country IS NOT NULL AND c.damaged_party_country != ''"
+    sub_where = (
+        "WHERE c2.damaged_party_country IS NOT NULL AND c2.damaged_party_country != '' "
+        "AND lower(c2.damaged_party_country) = lower(c.damaged_party_country)"
     )
-    return [dict(r) for r in rows]
+    params: dict = {}
+    if since_iso:
+        where += " AND c.first_seen >= :since"
+        sub_where += " AND c2.first_seen >= :since"
+        params["since"] = since_iso
+    sql = _build_casefold_leaderboard_sql("damaged_party_country", where=where, sub_where=sub_where)
+    rows = await conn.execute_fetchall(sql, params)
+    return [{"country": r["value"], "n": r["n"]} for r in rows]
 
 
 async def stats_cases_timeseries(
@@ -2669,11 +2771,14 @@ async def get_actor_profile(conn: aiosqlite.Connection, actor: str, *, case_limi
     a prolific actor aren't silently undercounted; `cases` itself is still
     capped (case_limit) since the UI only needs a browsable list, not every
     row in memory."""
+    # Case-insensitive: the leaderboard (stats_cases_by_actor) merges casing
+    # variants of the same actor into one entry, so the click-through here
+    # must pull every casing too, not just an exact-cased match.
     all_rows = await conn.execute_fetchall(
         """
         SELECT id, title, damaged_party, damaged_party_sector, damaged_party_country,
                cve_ids, first_seen, last_seen, significance
-        FROM cases WHERE attribution = :actor
+        FROM cases WHERE lower(attribution) = lower(:actor)
         """,
         {"actor": actor},
     )
@@ -2703,7 +2808,7 @@ async def get_actor_profile(conn: aiosqlite.Connection, actor: str, *, case_limi
         """
         SELECT id, title, damaged_party, damaged_party_sector, damaged_party_country,
                significance, first_seen, last_seen
-        FROM cases WHERE attribution = :actor
+        FROM cases WHERE lower(attribution) = lower(:actor)
         ORDER BY last_seen DESC LIMIT :limit
         """,
         {"actor": actor, "limit": case_limit},
@@ -2732,18 +2837,20 @@ async def stats_cases_by_actor(
     Feed tab's "Most active ransomware actors" chart — there is no longer a
     separate item/mention-based variant (that approach over-counted actors
     proportional to press coverage and relied on a heuristic regex guess at
-    the actor name; see git history if you need the old behavior)."""
-    where = "WHERE attribution IS NOT NULL AND attribution != ''"
+    the actor name; see git history if you need the old behavior).
+
+    Case-insensitive: see _build_casefold_leaderboard_sql's docstring —
+    "LockBit5" and "lockbit5" merge into one bar with a summed count."""
+    where = "WHERE c.attribution IS NOT NULL AND c.attribution != ''"
+    sub_where = (
+        "WHERE c2.attribution IS NOT NULL AND c2.attribution != '' "
+        "AND lower(c2.attribution) = lower(c.attribution)"
+    )
     params: dict = {"limit": limit}
     if since_iso:
-        where += " AND first_seen >= :since"
+        where += " AND c.first_seen >= :since"
+        sub_where += " AND c2.first_seen >= :since"
         params["since"] = since_iso
-    rows = await conn.execute_fetchall(
-        f"""
-        SELECT attribution AS actor, COUNT(*) AS n
-        FROM cases {where}
-        GROUP BY attribution ORDER BY n DESC LIMIT :limit
-        """,
-        params,
-    )
-    return [dict(r) for r in rows]
+    sql = _build_casefold_leaderboard_sql("attribution", where=where, sub_where=sub_where) + " LIMIT :limit"
+    rows = await conn.execute_fetchall(sql, params)
+    return [{"actor": r["value"], "n": r["n"]} for r in rows]

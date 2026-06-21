@@ -89,8 +89,8 @@ header {
   text-transform: uppercase;
 }
 .logo-icon {
+  display: inline-flex;
   color: var(--prio-critical);
-  font-size: 1.3rem;
   line-height: 1;
 }
 .logo-text {
@@ -258,6 +258,54 @@ header {
   font-family: var(--font-ui);
   margin-bottom: 8px;
 }
+/* Keyword/semantic search-mode toggle — used both in the Feed sidebar
+   search section and the Cases toolbar (see index.html's two
+   #*search-mode-toggle blocks). Deliberately two explicit, separately
+   labeled modes rather than a single blended search: a failed/unavailable
+   semantic request must be visibly distinct from "keyword found nothing"
+   (see settings.embed_backend's docstring). */
+.search-mode-toggle {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  overflow: hidden;
+  margin-bottom: 8px;
+}
+.search-mode-btn {
+  background: var(--surface2);
+  border: none;
+  color: var(--text-muted);
+  font-family: var(--font-ui);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.search-mode-btn + .search-mode-btn {
+  border-left: 1px solid var(--border);
+}
+.search-mode-btn.active {
+  background: var(--accent);
+  color: var(--bg);
+  font-weight: 700;
+}
+.search-mode-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.case-toolbar .search-mode-toggle {
+  margin-bottom: 0;
+  flex-shrink: 0;
+}
+.search-mode-hint {
+  font-size: 0.72rem;
+  color: var(--prio-warn);
+  margin: 0 0 8px;
+}
+.case-toolbar .search-mode-hint {
+  margin: 0;
+}
+
 #search-input:focus,
 .sidebar input[type="text"]:focus,
 .sidebar input[type="datetime-local"]:focus,
@@ -649,26 +697,38 @@ mark { background: var(--prio-warn-bg); color: var(--prio-warn); padding: 0 2px;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
-  padding: 12px 18px;
+  gap: 8px 14px;
+  padding: 10px 16px;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
 }
 .case-toolbar #case-search-input {
-  flex: 1 1 260px;
-  min-width: 200px;
+  flex: 1 1 240px;
+  min-width: 180px;
   background: var(--surface2);
   border: 1px solid var(--border);
   color: var(--text);
-  padding: 8px 12px;
-  font-size: 0.88rem;
+  padding: 7px 12px;
+  font-size: 0.85rem;
+  margin-bottom: 0;
 }
 .case-toolbar #case-search-input:focus { outline: none; border-color: var(--accent); }
 .case-toolbar-filters {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: 6px 10px;
+  flex: 1 1 auto;
+}
+/* Controls inside the toolbar must stay intrinsically sized — without this
+   they inherit `width: 100%` from the shared input/select rule above and
+   each one wraps onto its own line, turning a one-line toolbar into a tall
+   stack (see the global rule block ~line 244). */
+.case-toolbar-filters select,
+.case-toolbar-filters input[type="date"] {
+  width: auto;
+  flex: 0 0 auto;
+  margin-bottom: 0;
 }
 .case-toolbar .matched-only-row {
   display: flex;
@@ -677,6 +737,12 @@ mark { background: var(--prio-warn-bg); color: var(--prio-warn); padding: 0 2px;
   font-size: 0.82rem;
   color: var(--text);
   cursor: pointer;
+}
+/* Push trailing actions (Clear / Export) to the right edge of the filter
+   group so the row reads "filters left, actions right" instead of just
+   trailing the last filter control. */
+.case-toolbar-filters > .link-button:last-child {
+  margin-left: auto;
 }
 .link-button {
   background: none;

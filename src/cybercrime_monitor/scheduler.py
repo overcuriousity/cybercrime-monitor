@@ -191,6 +191,28 @@ def build_scheduler(db_conn, sse_broadcaster) -> AsyncIOScheduler:
     )
     log.info("Scheduled case correlation job")
 
+    if settings.embed_backend != "none":
+        from .embeddings.job import run_embedding_batch
+
+        scheduler.add_job(
+            run_embedding_batch,
+            trigger=IntervalTrigger(seconds=settings.embed_interval_seconds),
+            id="_embed",
+            name="Semantic search embedding",
+            next_run_time=_offset_now(25),
+            misfire_grace_time=settings.embed_interval_seconds,
+            # Same reasoning as the LLM extraction job above: a batch can
+            # outrun the interval (especially the local ONNX backend), and
+            # without these a backlog of missed ticks would burst all at
+            # once instead of coalescing into a single catch-up run.
+            max_instances=1,
+            coalesce=True,
+            kwargs={"db_conn": db_conn},
+        )
+        log.info("Scheduled semantic search embedding job (backend=%s)", settings.embed_backend)
+    else:
+        log.info("Semantic search embedding disabled (embed_backend=none)")
+
     from . import db as db_module
     from . import health
 
