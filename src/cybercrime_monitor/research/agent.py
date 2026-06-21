@@ -207,14 +207,16 @@ async def run_research_batch(db_conn) -> int:
         cooldown_iso=cooldown_iso, failure_cooldown_iso=failure_cooldown_iso,
     )
 
-    async def _one(case: dict) -> bool:
+sem = asyncio.Semaphore(max(1, settings.hermes_max_concurrent_runs))
+
+async def _one(case: dict) -> bool:
+    async with sem:
         try:
             await _research_one(db_conn, case)
             return True
         except Exception as exc:
             log.error("[research] case %s failed: %s", case["id"], exc)
             return False
-
     try:
         results = await asyncio.gather(*(_one(case) for case in cases))
         processed = sum(results)
