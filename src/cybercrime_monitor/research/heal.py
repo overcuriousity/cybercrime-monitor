@@ -252,6 +252,7 @@ async def _heal_one(db_conn, source: dict, *, scheduler, sse_broadcaster) -> Non
         toolsets=settings.hermes_toolsets,
         timeout=settings.hermes_timeout_seconds,
         model=settings.hermes_model or None,
+        expect_json=True,
     )
 
     if not result.ok or result.data is None:

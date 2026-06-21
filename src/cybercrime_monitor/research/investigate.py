@@ -36,12 +36,12 @@ same pattern as the case-research force-trigger.
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from .. import db
 from ..api.sse import broadcaster
 from ..collectors.base import _content_key, _dedupe_key
-from ..hermes.runner import run_agent
+from ..hermes.runner import _is_transient, run_agent
 from ..models import Item
 from ..pipeline.correlate import _correlate_one
 from ..scheduler import load_sources
@@ -216,9 +216,11 @@ def _significance_for(confidence: float) -> str:
 
 async def run_investigation_batch(db_conn, scheduler=None, sse_broadcaster=None) -> int:
     """One tick: drain a bounded number of queued investigations. Returns
-    the number processed (regardless of outcome — no_match/failed still
-    count, since they consumed a Hermes run and the row is terminal either
-    way; the investigator can resubmit if they want another pass)."""
+    the number processed (regardless of outcome — no_match/failed/re-queued
+    all count, since they consumed a Hermes run this tick; no_match/failed
+    are terminal (the investigator can resubmit), while a transient failure
+    is re-queued with a cooldown instead — see _is_transient and
+    settings.investigate_max_attempts)."""
     if settings.hermes_investigate_interval_seconds <= 0:
         return 0
 
@@ -231,11 +233,26 @@ async def run_investigation_batch(db_conn, scheduler=None, sse_broadcaster=None)
                 await _investigate_one(db_conn, inv, scheduler, sse_broadcaster)
             except Exception as exc:
                 log.error("[investigate] investigation %s failed: %s", inv["id"], exc)
+                error = str(exc) or repr(exc)
                 try:
-                    await db.finish_investigation(
-                        db_conn, investigation_id=inv["id"], status="failed",
-                        findings={}, error=str(exc) or repr(exc),
-                    )
+                    # Same transient/permanent split as the in-flow failure
+                    # branch in _investigate_one — an exception escaping
+                    # that function (e.g. a crash mid-integration after a
+                    # transient hermes hiccup) shouldn't be treated as more
+                    # terminal than a hermes-reported failure would be.
+                    if _is_transient(error) and inv["attempts"] < settings.investigate_max_attempts:
+                        next_retry_at = (
+                            datetime.now(timezone.utc)
+                            + timedelta(minutes=settings.investigate_failure_retry_minutes)
+                        ).isoformat()
+                        await db.requeue_investigation(
+                            db_conn, investigation_id=inv["id"], error=error, next_retry_at=next_retry_at,
+                        )
+                    else:
+                        await db.finish_investigation(
+                            db_conn, investigation_id=inv["id"], status="failed",
+                            findings={}, error=error,
+                        )
                 except Exception:
                     pass
             processed += 1
@@ -266,18 +283,42 @@ async def _investigate_one(db_conn, inv: dict, scheduler, sse_broadcaster) -> No
     prompt = _build_prompt(brief, existing_sources, local_items)
     result = await run_agent(
         prompt, toolsets=settings.hermes_toolsets, timeout=settings.hermes_timeout_seconds,
-        model=settings.hermes_model or None,
+        model=settings.hermes_model or None, expect_json=True,
     )
 
     if not result.ok or result.data is None:
+        error = result.error or "no parseable result"
+        # A transient provider hop (rate limit, a broken fallback-chain link
+        # — see hermes/runner.py's _is_transient) gets a bounded re-queue
+        # instead of going straight to terminal "failed": the investigator
+        # is often waiting on this result, and the same brief frequently
+        # succeeds minutes later once the provider recovers (observed live
+        # 2026-06-21: a 404 in the hermes fallback chain made every targeted
+        # investigation fail on the first hop). attempts is 0-indexed before
+        # this run, so "< max" still allows exactly investigate_max_attempts
+        # total tries.
+        if _is_transient(error) and inv["attempts"] < settings.investigate_max_attempts:
+            next_retry_at = (
+                datetime.now(timezone.utc) + timedelta(minutes=settings.investigate_failure_retry_minutes)
+            ).isoformat()
+            await db.requeue_investigation(
+                db_conn, investigation_id=investigation_id, error=error, next_retry_at=next_retry_at,
+            )
+            await _log_activity(
+                db_conn, action="investigation_retry", status="warn", ref_type="investigation",
+                summary=f"Investigation #{investigation_id}: transient failure, retrying (attempt {inv['attempts'] + 1}/{settings.investigate_max_attempts})",
+                detail={"error": error, "brief": brief[:200]}, ref_id=investigation_id,
+            )
+            return
+
         await db.finish_investigation(
             db_conn, investigation_id=investigation_id, status="failed",
-            findings={}, error=result.error or "no parseable result",
+            findings={}, error=error,
         )
         await _log_activity(
             db_conn, action="investigation_failed", status="error",
             summary=f"Investigation #{investigation_id} failed", ref_type="investigation",
-            detail={"error": result.error, "brief": brief[:200]}, ref_id=investigation_id,
+            detail={"error": error, "brief": brief[:200]}, ref_id=investigation_id,
         )
         return
 

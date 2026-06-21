@@ -229,6 +229,7 @@ async def _research_one(db_conn, case: dict) -> None:
         toolsets=settings.hermes_toolsets,
         timeout=settings.hermes_timeout_seconds,
         model=settings.hermes_model or None,
+        expect_json=True,
     )
 
     if not result.ok or result.data is None:

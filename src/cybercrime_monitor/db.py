@@ -349,14 +349,21 @@ CREATE INDEX IF NOT EXISTS idx_ai_activity_subsystem ON ai_activity(subsystem);
 -- source_heal_proposals/ai_activity), this table just remembers what brief
 -- led to it and lets the UI poll for completion.
 CREATE TABLE IF NOT EXISTS investigations (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    brief        TEXT NOT NULL,
-    status       TEXT NOT NULL DEFAULT 'queued', -- queued | running | completed | no_match | failed
-    created_at   TEXT NOT NULL,
-    finished_at  TEXT,
-    case_id      INTEGER REFERENCES cases(id) ON DELETE SET NULL,
-    findings     TEXT NOT NULL DEFAULT '{}',
-    error        TEXT
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    brief         TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'queued', -- queued | running | completed | no_match | failed
+    created_at    TEXT NOT NULL,
+    finished_at   TEXT,
+    case_id       INTEGER REFERENCES cases(id) ON DELETE SET NULL,
+    findings      TEXT NOT NULL DEFAULT '{}',
+    error         TEXT,
+    -- attempts/next_retry_at back a bounded failure-retry/cooldown for
+    -- transient Hermes failures (see research/investigate.py and
+    -- settings.investigate_max_attempts) — same idea as research_runs'
+    -- failure cooldown, just scoped to one investigation row instead of a
+    -- separate run table, since a re-queued investigation reuses its own row.
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    next_retry_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_investigations_status ON investigations(status);
@@ -448,6 +455,15 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         if col not in heal_cols:
             await conn.execute(ddl)
             log.info("Migrated source_heal_proposals table: added %s column", col)
+
+    inv_cols = {r["name"] for r in await conn.execute_fetchall("PRAGMA table_info(investigations)")}
+    for col, ddl in (
+        ("attempts", "ALTER TABLE investigations ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"),
+        ("next_retry_at", "ALTER TABLE investigations ADD COLUMN next_retry_at TEXT"),
+    ):
+        if col not in inv_cols:
+            await conn.execute(ddl)
+            log.info("Migrated investigations table: added %s column", col)
 
 async def insert_item(conn: aiosqlite.Connection, item: Item) -> int | None:
     """Insert item; returns new row id or None if duplicate. Deliberately
@@ -2105,18 +2121,52 @@ async def get_queued_investigations(conn: aiosqlite.Connection, *, limit: int) -
     """Drain investigations that need work. Includes 'running' rows so a
     crash/restart mid-run doesn't leave an investigation stuck forever
     (the scheduler is single-worker, so a stale 'running' row is safe to
-    resume rather than duplicate)."""
+    resume rather than duplicate). A re-queued (status='queued', attempts>0)
+    row is skipped until next_retry_at elapses — see requeue_investigation."""
     rows = await conn.execute_fetchall(
-        "SELECT * FROM investigations WHERE status IN ('queued', 'running') ORDER BY id ASC LIMIT :limit",
-        {"limit": limit},
+        """
+        SELECT * FROM investigations
+        WHERE status IN ('queued', 'running')
+          AND (next_retry_at IS NULL OR next_retry_at <= :now)
+        ORDER BY id ASC LIMIT :limit
+        """,
+        {"limit": limit, "now": _utcnow().isoformat()},
     )
     return [dict(r) for r in rows]
 
 
 async def count_queued_investigations(conn: aiosqlite.Connection) -> int:
-    """Backlog depth — surfaced via /api/status."""
-    row = await conn.execute_fetchall("SELECT COUNT(*) AS n FROM investigations WHERE status = 'queued'")
+    """Backlog depth — surfaced via /api/status. Mirrors get_queued_investigations'
+    cooldown gate so a row waiting out a retry cooldown isn't counted as
+    immediately actionable backlog."""
+    row = await conn.execute_fetchall(
+        """
+        SELECT COUNT(*) AS n FROM investigations
+        WHERE status = 'queued' AND (next_retry_at IS NULL OR next_retry_at <= :now)
+        """,
+        {"now": _utcnow().isoformat()},
+    )
     return row[0]["n"] if row else 0
+
+
+async def requeue_investigation(
+    conn: aiosqlite.Connection, *, investigation_id: int, error: str, next_retry_at: str,
+) -> None:
+    """Send a transiently-failed investigation back to 'queued' instead of
+    'failed' (see research/investigate.py, settings.investigate_max_attempts)
+    — bumps attempts and sets a cooldown so it isn't immediately re-drained
+    into the same failure. finish_investigation remains the terminal path
+    for permanent failures / completed / no_match."""
+    await conn.execute(
+        """
+        UPDATE investigations SET
+            status = 'queued', attempts = attempts + 1,
+            next_retry_at = :next_retry_at, error = :error
+        WHERE id = :id
+        """,
+        {"id": investigation_id, "error": error, "next_retry_at": next_retry_at},
+    )
+    await conn.commit()
 
 
 async def mark_investigation_running(conn: aiosqlite.Connection, *, investigation_id: int) -> None:

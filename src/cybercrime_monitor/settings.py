@@ -101,6 +101,15 @@ class Settings(BaseSettings):
     # fetches) routinely take several minutes; 300s was observed timing out
     # legitimate runs mid-investigation, not just hung ones.
     hermes_timeout_seconds: float = 900.0
+    # Bounded in-process retry for hermes/runner.py's clearly-transient
+    # failures (a rate-limited/empty-response provider hop, not a real
+    # outage) — see runner.py's _is_transient. Does NOT cover timeouts (too
+    # expensive to retry a 900s+ run in-process); those still fall through
+    # to the caller's own scheduler/cooldown. 1 retry is enough to ride out
+    # a single bad provider hop in a fallback chain without doubling the
+    # cost of a sustained outage.
+    hermes_max_retries: int = 1
+    hermes_retry_backoff_seconds: float = 5.0
     # 0 disables both agentic jobs entirely (research_runs/source-healing
     # never dispatch) without touching llm_backend.
     hermes_research_interval_seconds: int = 900
@@ -128,6 +137,16 @@ class Settings(BaseSettings):
     # candidates) when Hermes reports found=true AND at least this much
     # confidence — "only if it DID really find something" per design intent.
     investigate_min_confidence: float = 0.5
+    # A *transient* investigation failure (see runner.py's _is_transient —
+    # a rate-limited/empty-response provider hop, not a real outage) is
+    # re-queued instead of going terminal, same reasoning as
+    # research_failure_retry_hours but on a much shorter cooldown:
+    # investigations are user-initiated and time-sensitive (the investigator
+    # is often waiting on the result), so minutes rather than hours is
+    # appropriate. Capped at investigate_max_attempts so a permanently
+    # broken brief can't loop forever.
+    investigate_max_attempts: int = 3
+    investigate_failure_retry_minutes: int = 15
     # A source must accumulate this many consecutive collector errors before
     # the self-healing job will spend a Hermes run investigating it.
     hermes_heal_error_threshold: int = 5
