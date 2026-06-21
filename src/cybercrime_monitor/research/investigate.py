@@ -294,9 +294,10 @@ async def _investigate_one(db_conn, inv: dict, scheduler, sse_broadcaster) -> No
         # is often waiting on this result, and the same brief frequently
         # succeeds minutes later once the provider recovers (observed live
         # 2026-06-21: a 404 in the hermes fallback chain made every targeted
-        # investigation fail on the first hop). attempts is 0-indexed before
-        # this run, so "< max" still allows exactly investigate_max_attempts
-        # total tries.
+        # investigation fail on the first hop). attempts counts how many
+        # times this row has already been re-queued, so "< max" allows up to
+        # investigate_max_attempts retries — investigate_max_attempts + 1
+        # total runs, including the initial try.
         if _is_transient(error) and inv["attempts"] < settings.investigate_max_attempts:
             next_retry_at = (
                 datetime.now(timezone.utc) + timedelta(minutes=settings.investigate_failure_retry_minutes)
@@ -306,7 +307,7 @@ async def _investigate_one(db_conn, inv: dict, scheduler, sse_broadcaster) -> No
             )
             await _log_activity(
                 db_conn, action="investigation_retry", status="warn", ref_type="investigation",
-                summary=f"Investigation #{investigation_id}: transient failure, retrying (attempt {inv['attempts'] + 1}/{settings.investigate_max_attempts})",
+                summary=f"Investigation #{investigation_id}: transient failure, retrying (retry {inv['attempts'] + 1}/{settings.investigate_max_attempts})",
                 detail={"error": error, "brief": brief[:200]}, ref_id=investigation_id,
             )
             return
