@@ -91,7 +91,10 @@ def _get_local_model():
         "[embeddings] loading local model %s (first use downloads it — may take a while)",
         settings.embed_local_model,
     )
-    _local_model = TextEmbedding(model_name=settings.embed_local_model)
+    settings.embed_local_cache_dir.mkdir(parents=True, exist_ok=True)
+    _local_model = TextEmbedding(
+        model_name=settings.embed_local_model, cache_dir=str(settings.embed_local_cache_dir)
+    )
     _local_model_name = settings.embed_local_model
     return _local_model
 

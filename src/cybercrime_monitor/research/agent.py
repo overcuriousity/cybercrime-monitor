@@ -185,16 +185,20 @@ async def run_research_batch(db_conn) -> int:
     """One tick: dispatch hermes-agent research for a bounded number of
     significant, not-recently-researched cases. Returns the number of cases
     processed (regardless of outcome — a failed/timed-out run still counts,
-    since it consumed a research_runs row and won't be retried until the
-    cooldown elapses)."""
+    since it consumed a research_runs row and won't be retried until its
+    cooldown elapses — the full 24h for a completed run, but only
+    settings.research_failure_retry_hours for a failed one; see
+    db.get_cases_needing_research's docstring)."""
     if settings.hermes_research_interval_seconds <= 0:
         return 0
 
     record_run_start()
-    cooldown_iso = (
-        datetime.now(timezone.utc) - timedelta(hours=_RESEARCH_COOLDOWN_HOURS)
-    ).isoformat()
-    cases = await db.get_cases_needing_research(db_conn, limit=_CASES_PER_TICK, cooldown_iso=cooldown_iso)
+    now = datetime.now(timezone.utc)
+    cooldown_iso = (now - timedelta(hours=_RESEARCH_COOLDOWN_HOURS)).isoformat()
+    failure_cooldown_iso = (now - timedelta(hours=settings.research_failure_retry_hours)).isoformat()
+    cases = await db.get_cases_needing_research(
+        db_conn, limit=_CASES_PER_TICK, cooldown_iso=cooldown_iso, failure_cooldown_iso=failure_cooldown_iso
+    )
 
     processed = 0
     try:
