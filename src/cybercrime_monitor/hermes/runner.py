@@ -70,7 +70,11 @@ _concurrency_guard: asyncio.Semaphore | None = None
 def _guard() -> asyncio.Semaphore:
     global _concurrency_guard
     if _concurrency_guard is None:
-        _concurrency_guard = asyncio.Semaphore(settings.hermes_max_concurrent_runs)
+        n = settings.hermes_max_concurrent_runs
+        if n < 1:
+            log.error("[hermes] invalid hermes_max_concurrent_runs=%s; must be >= 1", n)
+            n = 1
+        _concurrency_guard = asyncio.Semaphore(n)
     return _concurrency_guard
 
 
