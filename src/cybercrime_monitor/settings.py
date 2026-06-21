@@ -129,8 +129,9 @@ class Settings(BaseSettings):
     # 429s that burn the fallback_providers chain (kimi-coding -> devstral-2512)
     # instead.
     hermes_max_concurrent_runs: int = 2
-    # 0 disables both agentic jobs entirely (research_runs/source-healing
-    # never dispatch) without touching llm_backend.
+    # 0 disables this job only (research_runs never dispatch) without
+    # touching llm_backend. heal/investigate/discover are gated by their own
+    # *_interval_seconds settings below, independently.
     hermes_research_interval_seconds: int = 120
     # How many eligible cases get pulled per tick and dispatched concurrently
     # (bounded by hermes_max_concurrent_runs, not run in lockstep with this

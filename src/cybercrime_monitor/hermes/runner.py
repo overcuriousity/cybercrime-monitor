@@ -130,21 +130,28 @@ async def run_agent(
     usable way to request "no tools"; callers must name a real, narrow
     toolset instead (see llm/backend.py's _NO_TOOLS_TOOLSET).
     """
-    async with _guard():
-        result = await _run_agent_once(prompt, toolsets=toolsets, timeout=timeout, model=model)
-        attempts = 1
-        while attempts <= settings.hermes_max_retries:
-            retryable = _is_transient(result.error) or (result.ok and expect_json and result.data is None)
-            if not retryable:
-                break
-            backoff = settings.hermes_retry_backoff_seconds * attempts
-            log.warning(
-                "[hermes] transient failure (attempt %d/%d), retrying in %.0fs: %s",
-                attempts, settings.hermes_max_retries, backoff, result.error or "empty/unparseable response",
-            )
-            await asyncio.sleep(backoff)
-            result = await _run_agent_once(prompt, toolsets=toolsets, timeout=timeout, model=model)
-            attempts += 1
+    async def _run_once_guarded() -> HermesResult:
+        # Only the actual subprocess run holds the concurrency slot — the
+        # backoff sleep between retries deliberately happens outside the
+        # semaphore so a transient failure's wait doesn't block another
+        # queued case from starting its own run in the meantime.
+        async with _guard():
+            return await _run_agent_once(prompt, toolsets=toolsets, timeout=timeout, model=model)
+
+    result = await _run_once_guarded()
+    attempts = 1
+    while attempts <= settings.hermes_max_retries:
+        retryable = _is_transient(result.error) or (result.ok and expect_json and result.data is None)
+        if not retryable:
+            break
+        backoff = settings.hermes_retry_backoff_seconds * attempts
+        log.warning(
+            "[hermes] transient failure (attempt %d/%d), retrying in %.0fs: %s",
+            attempts, settings.hermes_max_retries, backoff, result.error or "empty/unparseable response",
+        )
+        await asyncio.sleep(backoff)
+        result = await _run_once_guarded()
+        attempts += 1
     return result
 
 
