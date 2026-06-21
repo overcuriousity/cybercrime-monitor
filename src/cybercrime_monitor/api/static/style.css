@@ -689,6 +689,18 @@ mark { background: var(--prio-warn-bg); color: var(--prio-warn); padding: 0 2px;
 }
 .link-button:hover { text-decoration: underline; color: var(--accent-hover); }
 
+.btn-merge-case {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  cursor: pointer;
+  padding: 4px 2px;
+  font-weight: 500;
+}
+.btn-merge-case:hover { color: var(--prio-critical); text-decoration: underline; }
+.btn-merge-case:disabled { opacity: 0.5; cursor: default; }
+
 .case-body { flex: 1; display: flex; min-height: 0; }
 
 .case-rail {

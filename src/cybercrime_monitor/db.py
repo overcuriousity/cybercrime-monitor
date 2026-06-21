@@ -2,6 +2,7 @@ import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -9,6 +10,47 @@ import aiosqlite
 
 from .models import Item
 from .settings import settings
+
+
+_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+# Loose legal-form suffixes stripped for fuzzy victim-name matching.
+# Word-boundary aware so "Sage" isn't mangled.
+_COMMON_SUFFIXES = re.compile(r"\b(ag|gmbh|inc|llc|ltd|corp|plc|sa|srl|llp|kg|ohg|ug|se)\b")
+
+
+def _normalize(value: str | None) -> str:
+    if not value:
+        return ""
+    return _NON_ALNUM.sub("", value.lower())
+
+
+def _core_name(value: str | None) -> str:
+    """Victim/actor name with bracketed qualifiers and common legal forms
+    removed, used for fuzzy similarity matching."""
+    if not value:
+        return ""
+    value = re.sub(r"\s*\([^)]*\)", "", value)
+    value = _COMMON_SUFFIXES.sub("", value.lower())
+    return _NON_ALNUM.sub("", value)
+
+
+def _victim_similar(a: str | None, b: str | None, min_ratio: float = 0.85) -> bool:
+    """Conservative fuzzy victim matcher. Returns True for exact normalized
+    equality, one string containing the other's core name, or a high-enough
+    SequenceMatcher ratio on the core names."""
+    if not a or not b:
+        return False
+    na, nb = _normalize(a), _normalize(b)
+    if na == nb:
+        return True
+    ca, cb = _core_name(a), _core_name(b)
+    if not ca or not cb:
+        return False
+    if ca == cb:
+        return True
+    if ca in cb or cb in ca:
+        return True
+    return SequenceMatcher(None, ca, cb).ratio() >= min_ratio
 
 
 def _utcnow() -> datetime:
@@ -1288,13 +1330,15 @@ async def find_candidate_cases(
     since_iso: str,
 ) -> list[dict]:
     """Fuzzy candidate set for correlate.py's adjudication step: cases last
-    updated since `since_iso` (recency bound — an old, long-closed case
-    shouldn't silently reopen) that share a normalized victim OR actor OR
-    any CVE id OR any IoC. Exact case_key matches are handled separately by
+    updated since `since_iso` that share a normalized victim OR actor OR any
+    CVE id OR any IoC. Exact case_key matches are handled separately by
     get_case_by_key — this is only consulted when that misses, so candidates
-    here are "maybe the same incident," not "definitely." IoCs are matched
-    case-insensitively since the LLM/regex sources don't agree on casing for
-    hex hashes/addresses."""
+    here are "maybe the same incident," not "definitely."
+
+    Victim matching is intentionally fuzzy: "V-Bank" and "V-Bank (Munich)"
+    should surface each other because extraction sometimes adds or drops
+    bracketed location qualifiers. Actor/CVE/IoC matching stays exact because
+    those are strong, structured signals."""
     clauses = []
     params: dict = {"since": since_iso}
     if victim:
@@ -1317,18 +1361,43 @@ async def find_candidate_cases(
             ioc_clauses.append(f"lower(iocs) LIKE :{key}")
             params[key] = f'%"{ioc.lower()}"%'
         clauses.append("(" + " OR ".join(ioc_clauses) + ")")
-    if not clauses:
-        return []
-    rows = await conn.execute_fetchall(
-        f"""
-        SELECT * FROM cases
-        WHERE last_seen >= :since AND ({" OR ".join(clauses)})
-        ORDER BY last_seen DESC
-        LIMIT 10
-        """,
-        params,
-    )
-    return [dict(r) for r in rows]
+
+    candidates: dict[int, dict] = {}
+
+    if clauses:
+        rows = await conn.execute_fetchall(
+            f"""
+            SELECT * FROM cases
+            WHERE last_seen >= :since AND ({" OR ".join(clauses)})
+            ORDER BY last_seen DESC
+            LIMIT 10
+            """,
+            params,
+        )
+        for row in rows:
+            candidates[row["id"]] = dict(row)
+
+    # Fuzzy victim pass: load recent cases with any victim name and filter in
+    # Python. Kept separate from the exact SQL so we don't weaken actor/CVE/IoC
+    # matching, and capped by the same recency window to avoid scanning the
+    # whole table.
+    if victim:
+        fuzzy_rows = await conn.execute_fetchall(
+            """
+            SELECT * FROM cases
+            WHERE last_seen >= :since AND damaged_party IS NOT NULL
+            ORDER BY last_seen DESC
+            LIMIT 50
+            """,
+            {"since": since_iso},
+        )
+        for row in fuzzy_rows:
+            if row["id"] in candidates:
+                continue
+            if _victim_similar(victim, row["damaged_party"]):
+                candidates[row["id"]] = dict(row)
+
+    return sorted(candidates.values(), key=lambda c: c["last_seen"], reverse=True)
 
 
 _SIG_RANK = {"info": 1, "warn": 2, "critical": 3}
@@ -1496,6 +1565,128 @@ async def merge_item_into_case(
         },
     )
     await conn.commit()
+
+
+def _prefer_more_specific(base: str | None, other: str | None) -> str | None:
+    """Return the more specific of two names when one clearly extends the
+    other (e.g. "V-Bank" vs "V-Bank (Munich)"). Prefers `other` only when it
+    contains the normalized base and is longer; otherwise keeps `base`."""
+    if not other:
+        return base
+    if not base:
+        return other
+    nb, no = _normalize(base), _normalize(other)
+    if len(other) > len(base) and (nb in no or no in nb):
+        return other
+    return base
+
+
+async def merge_cases(
+    conn: aiosqlite.Connection,
+    *,
+    keep_case_id: int,
+    drop_case_id: int,
+) -> dict:
+    """Merge two cases into one. All items, CVEs, IoCs and research runs from
+    `drop_case_id` are moved to `keep_case_id`; `drop_case_id` is deleted.
+    Aggregated fields are recomputed so the surviving case reflects the union.
+    Returns the updated keep case. Raises ValueError if a case is missing."""
+    keep = await get_case_by_id(conn, keep_case_id)
+    drop = await get_case_by_id(conn, drop_case_id)
+    if keep is None or drop is None:
+        raise ValueError("One or both cases not found")
+
+    # Re-link all items from the dropped case into the surviving case.
+    await conn.execute(
+        """
+        INSERT OR IGNORE INTO case_items (case_id, item_id)
+        SELECT :keep_case_id, item_id
+        FROM case_items
+        WHERE case_id = :drop_case_id
+        """,
+        {"keep_case_id": keep_case_id, "drop_case_id": drop_case_id},
+    )
+
+    # Recompute source count from the unified item set.
+    source_count_row = await conn.execute_fetchall(
+        """
+        SELECT COUNT(DISTINCT i.source_id) AS n
+        FROM case_items ci JOIN items i ON i.id = ci.item_id
+        WHERE ci.case_id = :case_id
+        """,
+        {"case_id": keep_case_id},
+    )
+    source_count = source_count_row[0]["n"] if source_count_row else keep["source_count"]
+
+    keep_cves = json.loads(keep["cve_ids"]) if keep["cve_ids"] else []
+    drop_cves = json.loads(drop["cve_ids"]) if drop["cve_ids"] else []
+    merged_cve_ids = list(dict.fromkeys([*keep_cves, *drop_cves]))
+
+    keep_iocs = json.loads(keep["iocs"]) if keep["iocs"] else []
+    drop_iocs = json.loads(drop["iocs"]) if drop["iocs"] else []
+    merged_iocs = list(dict.fromkeys([*keep_iocs, *drop_iocs]))
+
+    new_rank = max(
+        _SIG_RANK.get(keep["significance"], 1),
+        _SIG_RANK.get(drop["significance"], 1),
+    )
+
+    # Prefer the more specific victim/title when one clearly extends the other.
+    merged_damaged_party = _prefer_more_specific(keep["damaged_party"], drop["damaged_party"])
+    merged_title = _prefer_more_specific(keep["title"], drop["title"])
+
+    await conn.execute(
+        """
+        UPDATE cases SET
+            title = :title,
+            summary = :summary,
+            significance = :significance,
+            significance_score = :significance_score,
+            cve_ids = :cve_ids,
+            iocs = :iocs,
+            in_kev = MAX(in_kev, :in_kev),
+            crime_type = COALESCE(NULLIF(crime_type, 'other'), :drop_crime_type, crime_type),
+            attribution = COALESCE(attribution, :drop_attribution),
+            attribution_confidence = COALESCE(attribution_confidence, :drop_attribution_confidence),
+            damaged_party = :damaged_party,
+            damaged_party_sector = COALESCE(damaged_party_sector, :drop_damaged_party_sector),
+            damaged_party_country = COALESCE(damaged_party_country, :drop_damaged_party_country),
+            first_seen = MIN(first_seen, :drop_first_seen),
+            last_seen = MAX(last_seen, :drop_last_seen),
+            source_count = :source_count,
+            status = COALESCE(NULLIF(status, 'new'), :drop_status, status)
+        WHERE id = :case_id
+        """,
+        {
+            "case_id": keep_case_id,
+            "title": merged_title or keep["title"],
+            "summary": (keep["summary"] or "") + (f"\n\n{drop['summary']}" if drop.get("summary") else ""),
+            "significance": _RANK_SIG[new_rank],
+            "significance_score": new_rank / 3.0,
+            "cve_ids": json.dumps(merged_cve_ids),
+            "iocs": json.dumps(merged_iocs),
+            "in_kev": 1 if drop["in_kev"] else 0,
+            "drop_crime_type": drop["crime_type"],
+            "drop_attribution": drop["attribution"],
+            "drop_attribution_confidence": drop["attribution_confidence"],
+            "damaged_party": merged_damaged_party,
+            "drop_damaged_party_sector": drop["damaged_party_sector"],
+            "drop_damaged_party_country": drop["damaged_party_country"],
+            "drop_first_seen": drop["first_seen"],
+            "drop_last_seen": drop["last_seen"],
+            "source_count": source_count,
+            "drop_status": drop["status"],
+        },
+    )
+
+    await conn.execute(
+        "UPDATE research_runs SET case_id = :keep_case_id WHERE case_id = :drop_case_id",
+        {"keep_case_id": keep_case_id, "drop_case_id": drop_case_id},
+    )
+    await conn.execute("DELETE FROM cases WHERE id = :drop_case_id", {"drop_case_id": drop_case_id})
+    await conn.commit()
+
+    return await get_case_by_id(conn, keep_case_id)
 
 
 async def get_case_by_id(conn: aiosqlite.Connection, case_id: int) -> dict | None:

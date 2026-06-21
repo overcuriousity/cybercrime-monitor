@@ -34,6 +34,8 @@ from ..db import (
     get_research_runs_for_case,
     list_ai_activity,
     list_investigations,
+    log_ai_activity,
+    merge_cases,
     stats_cases_by_actor,
     stats_cases_by_country,
     stats_cases_by_sector,
@@ -676,6 +678,34 @@ async def api_case_request_research(case_id: int, request: Request, db=Depends(g
             scheduler.modify_job("_research", next_run_time=datetime.now(timezone.utc))
 
     return {"status": "queued"}
+
+
+@router.post("/api/cases/{case_id}/merge/{other_case_id}", dependencies=[Depends(require_admin)])
+async def api_merge_cases(case_id: int, other_case_id: int, db=Depends(get_db)):
+    """Manually merge two cases. The case at `case_id` survives; the case at
+    `other_case_id` is deleted after its items and aggregates are folded in.
+    Admin-gated because it mutates the incident graph."""
+    if case_id == other_case_id:
+        raise HTTPException(status_code=400, detail="Cannot merge a case with itself")
+
+    try:
+        merged = await merge_cases(db, keep_case_id=case_id, drop_case_id=other_case_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    event = await log_ai_activity(
+        db,
+        subsystem="api",
+        action="cases_merged",
+        summary=f"Merged case #{other_case_id} into case #{case_id}",
+        detail={"keep_case_id": case_id, "drop_case_id": other_case_id},
+        status="ok",
+        ref_type="case",
+        ref_id=case_id,
+    )
+    await broadcaster.broadcast_activity(event)
+
+    return {"merged": True, "case_id": merged["id"], "dropped_case_id": other_case_id}
 
 
 def _since_iso(since_days: int | None, *, all_time: bool = False) -> str | None:
