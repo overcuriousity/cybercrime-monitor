@@ -1397,7 +1397,7 @@ async def find_candidate_cases(
             if _victim_similar(victim, row["damaged_party"]):
                 candidates[row["id"]] = dict(row)
 
-    return list(candidates.values())
+    return sorted(candidates.values(), key=lambda c: c["last_seen"], reverse=True)
 
 
 _SIG_RANK = {"info": 1, "warn": 2, "critical": 3}
@@ -1679,6 +1679,10 @@ async def merge_cases(
         },
     )
 
+    await conn.execute(
+        "UPDATE research_runs SET case_id = :keep_case_id WHERE case_id = :drop_case_id",
+        {"keep_case_id": keep_case_id, "drop_case_id": drop_case_id},
+    )
     await conn.execute("DELETE FROM cases WHERE id = :drop_case_id", {"drop_case_id": drop_case_id})
     await conn.commit()
 
