@@ -277,6 +277,52 @@ async def test_stats_trends_actor(db_conn):
     assert by_actor["ActorB"]["status"] == "declining"
 
 
+@pytest.mark.asyncio
+async def test_research_eligibility_uses_separate_cooldowns_for_completed_vs_failed(db_conn):
+    """A completed research run blocks natural re-research for the full
+    (24h-equivalent) cooldown; a failed run only blocks for the much
+    shorter failure cooldown — see db.get_cases_needing_research's
+    docstring and the 2026-06-21 production incident that motivated this
+    (a backend-side failure was locking cases out of research for a full
+    day with no answer ever produced)."""
+    completed_case = await _make_case(db_conn, significance="critical", title="completed 3h ago")
+    failed_recent_case = await _make_case(db_conn, significance="critical", title="failed 1h ago")
+    failed_stale_case = await _make_case(db_conn, significance="critical", title="failed 3h ago")
+    untouched_case = await _make_case(db_conn, significance="critical", title="never researched")
+
+    async def _add_run(case_id: int, *, status: str, hours_ago: float):
+        run_id = await db_module.start_research_run(db_conn, case_id=case_id, model=None)
+        await db_conn.execute(
+            "UPDATE research_runs SET started_at = :ts WHERE id = :id",
+            {"ts": _iso(hours_ago / 24), "id": run_id},
+        )
+        await db_module.finish_research_run(
+            db_conn, run_id=run_id, status=status, findings={}, sources=[], error=None
+        )
+
+    await _add_run(completed_case, status="completed", hours_ago=3)
+    await _add_run(failed_recent_case, status="failed", hours_ago=1)
+    await _add_run(failed_stale_case, status="failed", hours_ago=3)
+
+    cooldown_iso = _iso(1)  # 24h-equivalent: anything from "1 day ago" onward is in-cooldown
+    failure_cooldown_iso = _iso(2 / 24)  # 2h failure cooldown
+
+    eligible = await db_module.get_cases_needing_research(
+        db_conn, limit=10, cooldown_iso=cooldown_iso, failure_cooldown_iso=failure_cooldown_iso
+    )
+    eligible_ids = {c["id"] for c in eligible}
+
+    assert completed_case not in eligible_ids  # completed 3h ago: still within 24h cooldown -> blocked
+    assert failed_recent_case not in eligible_ids  # failed 1h ago: still within 2h failure cooldown -> blocked
+    assert failed_stale_case in eligible_ids  # failed 3h ago: past the 2h failure cooldown -> eligible
+    assert untouched_case in eligible_ids  # never researched -> eligible
+
+    count = await db_module.count_cases_needing_research(
+        db_conn, cooldown_iso=cooldown_iso, failure_cooldown_iso=failure_cooldown_iso
+    )
+    assert count == len(eligible_ids)
+
+
 # ── Route tests ─────────────────────────────────────────────────────────────
 
 

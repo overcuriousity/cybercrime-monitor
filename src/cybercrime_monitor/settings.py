@@ -104,6 +104,19 @@ class Settings(BaseSettings):
     # 0 disables both agentic jobs entirely (research_runs/source-healing
     # never dispatch) without touching llm_backend.
     hermes_research_interval_seconds: int = 900
+    # A *failed* research run (timeout, hermes error, malformed response —
+    # see research.agent's docstring on db.get_cases_needing_research) gets
+    # retried much sooner than a successful one: 24h of "don't bother, we
+    # already have an answer" makes no sense for "we never got an answer."
+    # Without this, a backend-side outage (e.g. a provider rejecting the
+    # request shape — see ops notes from 2026-06-21) silently locks every
+    # case it touches out of research for a full day, even after the
+    # backend recovers. Short enough to self-heal within hours of a
+    # transient/upstream issue, long enough that one chronically-failing
+    # case (bad encoding, truly unresearchable) can't monopolize every
+    # tick — at hermes_research_interval_seconds=900 and 1 case/tick, a 2h
+    # floor still caps one stuck case to ~8 attempts/day, not 96.
+    research_failure_retry_hours: int = 2
     hermes_heal_interval_seconds: int = 3600
     # Investigator-triggered targeted research (POST /api/investigations,
     # research/investigate.py) — drains queued investigations. The interval
@@ -167,9 +180,19 @@ class Settings(BaseSettings):
     embed_backend: str = "local"  # "local" | "openai" | "none"
     # bge-m3: multilingual (100+ languages), 1024-dim, strong general-purpose
     # retrieval quality for its size. Downloaded once via fastembed (ONNX,
-    # ~2GB) and cached under fastembed's model cache dir on first local use —
-    # that first run needs internet even though every run after is offline.
+    # ~2GB) and cached under embed_local_cache_dir on first local use — that
+    # first run needs internet even though every run after is offline.
     embed_local_model: str = "BAAI/bge-m3"
+    # fastembed defaults its cache to the OS temp dir (tempfile.gettempdir())
+    # when this isn't set, which on a systemd-managed deployment with /tmp
+    # mounted as tmpfs means the ~2GB model cache silently lives in RAM
+    # (permanently occupying it, competing with everything else the process
+    # needs) AND gets wiped — forcing a full re-download — on every reboot
+    # (see ops notes from 2026-06-21: this caused a sustained OOM crash loop
+    # combined with the active embedding session's own memory use). Pointing
+    # this at a path under data/ keeps it on persistent disk, alongside
+    # db_path, and survives restarts.
+    embed_local_cache_dir: Path = Path("data/embed_cache")
     embed_base_url: str = ""  # blank = reuse llm_base_url
     embed_api_key: str = ""  # blank = reuse llm_api_key
     embed_model: str = "text-embedding-3-small"  # used only when embed_backend="openai"

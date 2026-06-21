@@ -1887,16 +1887,23 @@ async def count_cases(
 # autonomous OSINT but haven't been researched (recently). research_runs is
 # the log; cases.status tracks where a case is in that lifecycle.
 
-async def get_cases_needing_research(conn: aiosqlite.Connection, *, limit: int, cooldown_iso: str) -> list[dict]:
+async def get_cases_needing_research(
+    conn: aiosqlite.Connection, *, limit: int, cooldown_iso: str, failure_cooldown_iso: str
+) -> list[dict]:
     """Cases worth spending a Hermes research run on: either explicitly
     forced via POST /api/cases/{id}/research (research_requested_at set —
     bypasses both the significance and cooldown gates, since an analyst
     asking for a re-research means "go again right now"), or naturally
-    significant (warn/critical) and not researched since `cooldown_iso` (so
-    a case that didn't yield new information isn't re-researched every tick
-    forever). Forced cases sort first, then critical-before-warn, then
-    oldest-first, so a backlog drains in a stable order rather than
-    thrashing between cases."""
+    significant (warn/critical) and not recently researched. "Recently" is
+    two different windows depending on outcome: a *completed* run blocks
+    re-research for `cooldown_iso` (don't waste a run re-asking a question
+    we already have an answer to) — but a *failed* run only blocks for the
+    much shorter `failure_cooldown_iso` (see settings.research_failure_retry_hours's
+    docstring): a failure means we have no answer at all, so locking the
+    case out for a full cooldown period just because the backend hiccuped
+    wastes the case's slot in the queue for no benefit. Forced cases sort
+    first, then critical-before-warn, then oldest-first, so a backlog
+    drains in a stable order rather than thrashing between cases."""
     rows = await conn.execute_fetchall(
         """
         SELECT * FROM cases
@@ -1905,7 +1912,11 @@ async def get_cases_needing_research(conn: aiosqlite.Connection, *, limit: int, 
              significance IN ('warn', 'critical')
              AND NOT EXISTS (
                SELECT 1 FROM research_runs r
-               WHERE r.case_id = cases.id AND r.started_at >= :cooldown
+               WHERE r.case_id = cases.id
+                 AND (
+                   (r.status = 'completed' AND r.started_at >= :cooldown)
+                   OR (r.status != 'completed' AND r.started_at >= :failure_cooldown)
+                 )
              )
            )
         ORDER BY
@@ -1914,7 +1925,7 @@ async def get_cases_needing_research(conn: aiosqlite.Connection, *, limit: int, 
             last_seen ASC
         LIMIT :limit
         """,
-        {"cooldown": cooldown_iso, "limit": limit},
+        {"cooldown": cooldown_iso, "failure_cooldown": failure_cooldown_iso, "limit": limit},
     )
     out = []
     for r in rows:
@@ -1950,18 +1961,27 @@ async def request_case_research(conn: aiosqlite.Connection, *, case_id: int) -> 
     return cur.rowcount > 0
 
 
-async def count_cases_needing_research(conn: aiosqlite.Connection, *, cooldown_iso: str) -> int:
-    """Queued cases waiting for hermes-agent research — surfaced in /api/status."""
+async def count_cases_needing_research(
+    conn: aiosqlite.Connection, *, cooldown_iso: str, failure_cooldown_iso: str
+) -> int:
+    """Queued cases waiting for hermes-agent research — surfaced in
+    /api/status. Must mirror get_cases_needing_research's eligibility
+    exactly (success vs failure cooldown), or this count would disagree
+    with what the scheduler is actually about to pick up."""
     row = await conn.execute_fetchall(
         """
         SELECT COUNT(*) AS n FROM cases
         WHERE significance IN ('warn', 'critical')
           AND NOT EXISTS (
             SELECT 1 FROM research_runs r
-            WHERE r.case_id = cases.id AND r.started_at >= :cooldown
+            WHERE r.case_id = cases.id
+              AND (
+                (r.status = 'completed' AND r.started_at >= :cooldown)
+                OR (r.status != 'completed' AND r.started_at >= :failure_cooldown)
+              )
           )
         """,
-        {"cooldown": cooldown_iso},
+        {"cooldown": cooldown_iso, "failure_cooldown": failure_cooldown_iso},
     )
     return row[0]["n"] if row else 0
 
