@@ -2691,47 +2691,49 @@ async def stats_trends(
 # frequent original casing, ties broken alphabetically) and a count summed
 # across every casing variant. crime_type is a controlled enum and doesn't
 # need this treatment.
-def _build_casefold_leaderboard_sql(column: str, *, where: str, sub_where: str) -> str:
+#
+# Single pass over `cases` (the `counted` CTE), then window-function ranking
+# over the much smaller per-casing aggregate — avoids a correlated subquery
+# that would re-scan the base table once per distinct lower(column) value.
+def _build_casefold_leaderboard_sql(column: str, *, where: str) -> str:
     return f"""
-        SELECT
-            (SELECT c2.{column} FROM cases c2 {sub_where}
-             GROUP BY c2.{column} ORDER BY COUNT(*) DESC, c2.{column} ASC LIMIT 1) AS value,
-            COUNT(*) AS n
-        FROM cases c
-        {where}
-        GROUP BY lower(c.{column})
+        WITH counted AS (
+            SELECT {column} AS casing, lower({column}) AS key, COUNT(*) AS casing_n
+            FROM cases c
+            {where}
+            GROUP BY {column}
+        ), totals AS (
+            SELECT key, SUM(casing_n) AS n FROM counted GROUP BY key
+        ), ranked AS (
+            SELECT key, casing,
+                   ROW_NUMBER() OVER (PARTITION BY key ORDER BY casing_n DESC, casing ASC) AS rn
+            FROM counted
+        )
+        SELECT ranked.casing AS value, totals.n AS n
+        FROM ranked JOIN totals ON totals.key = ranked.key
+        WHERE ranked.rn = 1
         ORDER BY n DESC
     """
 
 
 async def stats_cases_by_sector(conn: aiosqlite.Connection, *, since_iso: str | None = None) -> list[dict]:
     where = "WHERE c.damaged_party_sector IS NOT NULL AND c.damaged_party_sector != ''"
-    sub_where = (
-        "WHERE c2.damaged_party_sector IS NOT NULL AND c2.damaged_party_sector != '' "
-        "AND lower(c2.damaged_party_sector) = lower(c.damaged_party_sector)"
-    )
     params: dict = {}
     if since_iso:
         where += " AND c.first_seen >= :since"
-        sub_where += " AND c2.first_seen >= :since"
         params["since"] = since_iso
-    sql = _build_casefold_leaderboard_sql("damaged_party_sector", where=where, sub_where=sub_where)
+    sql = _build_casefold_leaderboard_sql("damaged_party_sector", where=where)
     rows = await conn.execute_fetchall(sql, params)
     return [{"sector": r["value"], "n": r["n"]} for r in rows]
 
 
 async def stats_cases_by_country(conn: aiosqlite.Connection, *, since_iso: str | None = None) -> list[dict]:
     where = "WHERE c.damaged_party_country IS NOT NULL AND c.damaged_party_country != ''"
-    sub_where = (
-        "WHERE c2.damaged_party_country IS NOT NULL AND c2.damaged_party_country != '' "
-        "AND lower(c2.damaged_party_country) = lower(c.damaged_party_country)"
-    )
     params: dict = {}
     if since_iso:
         where += " AND c.first_seen >= :since"
-        sub_where += " AND c2.first_seen >= :since"
         params["since"] = since_iso
-    sql = _build_casefold_leaderboard_sql("damaged_party_country", where=where, sub_where=sub_where)
+    sql = _build_casefold_leaderboard_sql("damaged_party_country", where=where)
     rows = await conn.execute_fetchall(sql, params)
     return [{"country": r["value"], "n": r["n"]} for r in rows]
 
@@ -2842,15 +2844,10 @@ async def stats_cases_by_actor(
     Case-insensitive: see _build_casefold_leaderboard_sql's docstring —
     "LockBit5" and "lockbit5" merge into one bar with a summed count."""
     where = "WHERE c.attribution IS NOT NULL AND c.attribution != ''"
-    sub_where = (
-        "WHERE c2.attribution IS NOT NULL AND c2.attribution != '' "
-        "AND lower(c2.attribution) = lower(c.attribution)"
-    )
     params: dict = {"limit": limit}
     if since_iso:
         where += " AND c.first_seen >= :since"
-        sub_where += " AND c2.first_seen >= :since"
         params["since"] = since_iso
-    sql = _build_casefold_leaderboard_sql("attribution", where=where, sub_where=sub_where) + " LIMIT :limit"
+    sql = _build_casefold_leaderboard_sql("attribution", where=where) + " LIMIT :limit"
     rows = await conn.execute_fetchall(sql, params)
     return [{"actor": r["value"], "n": r["n"]} for r in rows]

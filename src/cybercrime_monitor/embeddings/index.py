@@ -58,8 +58,13 @@ async def init_vectors(conn) -> None:
         return
 
     await conn.enable_load_extension(True)
-    await conn.load_extension(sqlite_vec.loadable_path())
-    await conn.enable_load_extension(False)
+    try:
+        await conn.load_extension(sqlite_vec.loadable_path())
+    finally:
+        # Always disable, even if the load itself failed (missing binary,
+        # unsupported platform) — leaving extension loading enabled on this
+        # connection would be a needless attack-surface widening.
+        await conn.enable_load_extension(False)
 
     fp = embed_backend.active_fingerprint()
     rows = await conn.execute_fetchall("SELECT fingerprint FROM embedding_meta WHERE id = 1")

@@ -28,18 +28,21 @@ def _content_hash(*parts: str) -> str:
 
 
 async def _candidates_cases(conn, indexed: dict[int, str], limit: int) -> list[tuple[int, str, str]]:
-    rows = await conn.execute_fetchall("SELECT id, title, summary FROM cases ORDER BY id")
+    # Streamed (not execute_fetchall) so a large cases table isn't fully
+    # materialized in memory every tick just to find `limit` candidates —
+    # the loop below stops the cursor early once it has enough.
     out: list[tuple[int, str, str]] = []
-    for r in rows:
-        h = _content_hash(r["title"] or "", r["summary"] or "")
-        if indexed.get(r["id"]) == h:
-            continue
-        text = f"{r['title'] or ''}\n\n{r['summary'] or ''}".strip()
-        if not text:
-            continue
-        out.append((r["id"], text, h))
-        if len(out) >= limit:
-            break
+    async with conn.execute("SELECT id, title, summary FROM cases ORDER BY id") as cursor:
+        async for r in cursor:
+            h = _content_hash(r["title"] or "", r["summary"] or "")
+            if indexed.get(r["id"]) == h:
+                continue
+            text = f"{r['title'] or ''}\n\n{r['summary'] or ''}".strip()
+            if not text:
+                continue
+            out.append((r["id"], text, h))
+            if len(out) >= limit:
+                break
     return out
 
 
@@ -47,19 +50,20 @@ async def _candidates_items(conn, indexed: dict[int, str], limit: int) -> list[t
     # Snippet is truncated the same way llm/backend.py truncates it for
     # extraction (~800 chars) — embedding the full raw snippet buys little
     # semantic signal beyond that for a short news/forum item and costs
-    # more per call.
-    rows = await conn.execute_fetchall("SELECT id, title, snippet FROM items ORDER BY id")
+    # more per call. Streamed for the same reason as _candidates_cases above
+    # — items is the larger of the two tables.
     out: list[tuple[int, str, str]] = []
-    for r in rows:
-        h = _content_hash(r["title"] or "", r["snippet"] or "")
-        if indexed.get(r["id"]) == h:
-            continue
-        text = f"{r['title'] or ''}\n\n{(r['snippet'] or '')[:800]}".strip()
-        if not text:
-            continue
-        out.append((r["id"], text, h))
-        if len(out) >= limit:
-            break
+    async with conn.execute("SELECT id, title, snippet FROM items ORDER BY id") as cursor:
+        async for r in cursor:
+            h = _content_hash(r["title"] or "", r["snippet"] or "")
+            if indexed.get(r["id"]) == h:
+                continue
+            text = f"{r['title'] or ''}\n\n{(r['snippet'] or '')[:800]}".strip()
+            if not text:
+                continue
+            out.append((r["id"], text, h))
+            if len(out) >= limit:
+                break
     return out
 
 

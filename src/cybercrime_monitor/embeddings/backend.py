@@ -164,7 +164,11 @@ def active_fingerprint() -> str:
     if settings.embed_backend == "local":
         key = f"local:{settings.embed_local_model}"
     elif settings.embed_backend == "openai":
-        base = settings.embed_base_url or settings.llm_base_url
+        # Normalized the same way _embed_openai() builds the request URL —
+        # otherwise a trailing-slash-only config edit would churn the
+        # fingerprint (and force a full re-index) despite hitting the exact
+        # same endpoint.
+        base = (settings.embed_base_url or settings.llm_base_url).rstrip("/")
         key = f"openai:{base}:{settings.embed_model}"
     else:
         key = "none"

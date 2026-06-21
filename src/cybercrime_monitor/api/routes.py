@@ -173,7 +173,7 @@ async def api_items(
     since: str | None = Query(default=None),
     until: str | None = Query(default=None),
     extra_key: str | None = Query(default=None),
-    mode: str = Query(default="keyword"),  # "keyword" | "semantic"
+    mode: str = Query(default="keyword", pattern="^(keyword|semantic)$"),  # "keyword" | "semantic"
     x_admin_token: str | None = Header(default=None),
 ):
     # show_filtered reveals classifier-flagged false positives — admin-gated
@@ -564,7 +564,7 @@ async def api_cases(
     ioc: str | None = Query(default=None),
     since: str | None = Query(default=None),
     until: str | None = Query(default=None),
-    mode: str = Query(default="keyword"),  # "keyword" | "semantic"
+    mode: str = Query(default="keyword", pattern="^(keyword|semantic)$"),  # "keyword" | "semantic"
 ):
     since_norm = _normalize_date_filter(since, end_of_day=False)
     until_norm = _normalize_date_filter(until, end_of_day=True)
