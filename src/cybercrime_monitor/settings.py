@@ -110,9 +110,37 @@ class Settings(BaseSettings):
     # cost of a sustained outage.
     hermes_max_retries: int = 1
     hermes_retry_backoff_seconds: float = 5.0
-    # 0 disables both agentic jobs entirely (research_runs/source-healing
-    # never dispatch) without touching llm_backend.
-    hermes_research_interval_seconds: int = 900
+    # Global cap on concurrently-running hermes-agent subprocesses, shared
+    # across research/agent.py, research/investigate.py and research/heal.py
+    # (all three funnel through hermes/runner.py's run_agent) — they all hit
+    # the same primary backend, so this is the one knob that actually
+    # protects it regardless of which job is dispatching. Sized for the
+    # NVIDIA NIM primary's published limits (2026-06-21): 0.83 req/s (~50/min)
+    # and 1M tokens/min. Tokens are not the binding constraint — a research
+    # turn runs a few thousand tokens, nowhere near 1M/min even at this
+    # concurrency. Requests/sec is: each concurrent run is a multi-turn
+    # hermes-agent loop (web search + page fetches between LLM calls), not a
+    # tight request loop, so observed per-run request rate is well under
+    # 1 req/s; 2 concurrent runs keeps sustained aggregate load under the
+    # 0.83 req/s ceiling with headroom for bursts, while still being a large
+    # improvement over the previous fully-serial (1 at a time) dispatch.
+    # Raise cautiously — and only after confirming actual request-rate
+    # headroom — since exceeding the cap just trades research throughput for
+    # 429s that burn the fallback_providers chain (kimi-coding -> devstral-2512)
+    # instead.
+    hermes_max_concurrent_runs: int = 2
+    # 0 disables this job only (research_runs never dispatch) without
+    # touching llm_backend. heal/investigate/discover are gated by their own
+    # *_interval_seconds settings below, independently.
+    hermes_research_interval_seconds: int = 120
+    # How many eligible cases get pulled per tick and dispatched concurrently
+    # (bounded by hermes_max_concurrent_runs, not run in lockstep with this
+    # number) — see research/agent.py's run_research_batch. Larger than the
+    # concurrency cap on purpose: while hermes_max_concurrent_runs workers are
+    # busy, the rest of the batch just queues for the next free slot within
+    # the same tick, so the job stays continuously busy instead of going idle
+    # between short ticks.
+    hermes_research_batch_size: int = 8
     # A *failed* research run (timeout, hermes error, malformed response —
     # see research.agent's docstring on db.get_cases_needing_research) gets
     # retried much sooner than a successful one: 24h of "don't bother, we
@@ -123,8 +151,8 @@ class Settings(BaseSettings):
     # backend recovers. Short enough to self-heal within hours of a
     # transient/upstream issue, long enough that one chronically-failing
     # case (bad encoding, truly unresearchable) can't monopolize every
-    # tick — at hermes_research_interval_seconds=900 and 1 case/tick, a 2h
-    # floor still caps one stuck case to ~8 attempts/day, not 96.
+    # tick — at hermes_max_concurrent_runs=2, a 2h floor still caps one stuck
+    # case to a handful of attempts/day, not one per tick.
     research_failure_retry_hours: int = 2
     hermes_heal_interval_seconds: int = 3600
     # Investigator-triggered targeted research (POST /api/investigations,

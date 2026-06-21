@@ -1,9 +1,10 @@
 """Autonomous OSINT research, delegated to hermes-agent — see
 hermes/runner.py's docstring for the verified `hermes -z` contract this
 builds on. Hermes drives its own web search/scrape/browser toolsets; this
-module's job is only to build the prompt, dispatch one case per tick (bounded
-load — a research run can legitimately take minutes), and parse the
-structured result back into the case.
+module's job is only to build the prompt, dispatch a bounded batch of cases
+per tick concurrently (actual parallelism capped by runner.py's
+process-wide semaphore, not here — a research run can legitimately take
+minutes), and parse the structured result back into each case.
 
 Runs on its own APScheduler interval (scheduler.py's "_research" job),
 fully decoupled from ingest/extraction/correlation — a slow or hung Hermes
@@ -94,10 +95,6 @@ async def _log_activity(
 # every tick forever — this cooldown bounds how often the same case can be
 # picked up again (see db.get_cases_needing_research).
 _RESEARCH_COOLDOWN_HOURS = 24
-# Process at most this many cases per tick — each one can take minutes
-# (hermes_timeout_seconds), and the job runs with max_instances=1, so a
-# larger batch would just delay the next tick rather than parallelizing.
-_CASES_PER_TICK = 1
 
 _RESEARCH_PROMPT_TEMPLATE = """\
 You are assisting a cybercrime intelligence monitor. Research the following \
@@ -183,12 +180,21 @@ def _build_prompt(case: dict) -> str:
 
 async def run_research_batch(db_conn) -> int:
     """One tick: dispatch hermes-agent research for a bounded number of
-    significant, not-recently-researched cases. Returns the number of cases
-    processed (regardless of outcome — a failed/timed-out run still counts,
-    since it consumed a research_runs row and won't be retried until its
-    cooldown elapses — the full 24h for a completed run, but only
-    settings.research_failure_retry_hours for a failed one; see
-    db.get_cases_needing_research's docstring)."""
+    significant, not-recently-researched cases, concurrently. Returns the
+    number of cases processed (regardless of outcome — a failed/timed-out
+    run still counts, since it consumed a research_runs row and won't be
+    retried until its cooldown elapses — the full 24h for a completed run,
+    but only settings.research_failure_retry_hours for a failed one; see
+    db.get_cases_needing_research's docstring).
+
+    Cases are fetched settings.hermes_research_batch_size at a time and
+    dispatched together via asyncio.gather, but actual parallelism is capped
+    by hermes/runner.py's process-wide semaphore
+    (settings.hermes_max_concurrent_runs) — the batch size just needs to be
+    large enough that the semaphore's workers always have a next case ready
+    rather than the tick going idle. See settings.py for why the concurrency
+    cap, not this batch size, is what's sized against the upstream rate
+    limit."""
     if settings.hermes_research_interval_seconds <= 0:
         return 0
 
@@ -197,17 +203,21 @@ async def run_research_batch(db_conn) -> int:
     cooldown_iso = (now - timedelta(hours=_RESEARCH_COOLDOWN_HOURS)).isoformat()
     failure_cooldown_iso = (now - timedelta(hours=settings.research_failure_retry_hours)).isoformat()
     cases = await db.get_cases_needing_research(
-        db_conn, limit=_CASES_PER_TICK, cooldown_iso=cooldown_iso, failure_cooldown_iso=failure_cooldown_iso
+        db_conn, limit=settings.hermes_research_batch_size,
+        cooldown_iso=cooldown_iso, failure_cooldown_iso=failure_cooldown_iso,
     )
 
-    processed = 0
+    async def _one(case: dict) -> bool:
+        try:
+            await _research_one(db_conn, case)
+            return True
+        except Exception as exc:
+            log.error("[research] case %s failed: %s", case["id"], exc)
+            return False
+
     try:
-        for case in cases:
-            try:
-                await _research_one(db_conn, case)
-                processed += 1
-            except Exception as exc:
-                log.error("[research] case %s failed: %s", case["id"], exc)
+        results = await asyncio.gather(*(_one(case) for case in cases))
+        processed = sum(results)
 
         if processed:
             log.info("[research] processed %d case(s)", processed)
