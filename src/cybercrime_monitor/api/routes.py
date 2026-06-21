@@ -24,6 +24,7 @@ from ..db import (
     count_uncorrelated_extracted_items,
     count_unextracted,
     create_investigation,
+    cases_country_counts,
     fetch_cases,
     fetch_items,
     get_actor_profile,
@@ -571,6 +572,7 @@ async def api_cases(
     ioc: str | None = Query(default=None),
     since: str | None = Query(default=None),
     until: str | None = Query(default=None),
+    country: str | None = Query(default=None),
     mode: str = Query(default="keyword", pattern="^(keyword|semantic)$"),  # "keyword" | "semantic"
 ):
     since_norm = _normalize_date_filter(since, end_of_day=False)
@@ -594,6 +596,7 @@ async def api_cases(
             ioc=ioc,
             since=since_norm,
             until=until_norm,
+            country=country,
             id_in=ranked_ids,
         )
         by_id = {case["id"]: case for case in candidates}
@@ -612,6 +615,7 @@ async def api_cases(
         ioc=ioc,
         since=since_norm,
         until=until_norm,
+        country=country,
     )
     total = await count_cases(
         db,
@@ -623,8 +627,41 @@ async def api_cases(
         ioc=ioc,
         since=since_norm,
         until=until_norm,
+        country=country,
     )
     return {"total": total, "cases": cases, "mode": "keyword"}
+
+
+@router.get("/api/cases/by-country")
+async def api_cases_by_country(
+    db=Depends(get_db),
+    min_significance: str | None = Query(default=None),
+    crime_type: str | None = Query(default=None),
+    in_kev: bool | None = Query(default=None),
+    search: str | None = Query(default=None),
+    cve_id: str | None = Query(default=None),
+    ioc: str | None = Query(default=None),
+    since: str | None = Query(default=None),
+    until: str | None = Query(default=None),
+):
+    """Per-country case counts for the Cases tab's map — honors the same
+    filters as GET /api/cases (last_seen-based since/until) rather than
+    Landscape's first_seen window, so the map always matches what's in the
+    filtered case list."""
+    since_norm = _normalize_date_filter(since, end_of_day=False)
+    until_norm = _normalize_date_filter(until, end_of_day=True)
+    by_country = await cases_country_counts(
+        db,
+        min_significance=min_significance,
+        crime_type=crime_type,
+        in_kev=in_kev,
+        search=search,
+        cve_id=cve_id,
+        ioc=ioc,
+        since=since_norm,
+        until=until_norm,
+    )
+    return {"by_country": by_country}
 
 
 async def _load_case_bundle(db, case_id: int) -> tuple[dict, list[dict], list[dict], list[dict]]:

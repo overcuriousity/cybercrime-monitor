@@ -173,7 +173,8 @@ When you are done, respond with ONLY a single-line JSON object as your \
 final message, no markdown fencing, no commentary, exactly these keys:
 {{"found": true|false, "confidence": <0.0-1.0>, "title": <string|null>, \
 "crime_type": <string|null>, "victim": <string|null>, \
-"victim_sector": <string|null>, "victim_country": <string|null>, \
+"victim_sector": <string|null>, \
+"victim_country": <ISO 3166-1 alpha-2 country code of the victim, or null>, \
 "attribution": <string|null>, "summary": "<2-3 sentence summary>", \
 "cve_ids": [<string>...], "iocs": [<string>...], \
 "items": [{{"title": "<string>", "url": "<string>", "snippet": "<string>", \

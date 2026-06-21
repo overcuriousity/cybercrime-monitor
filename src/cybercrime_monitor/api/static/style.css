@@ -690,10 +690,18 @@ mark { background: var(--prio-warn-bg); color: var(--prio-warn); padding: 0 2px;
 .inv-status-failed    { color: var(--prio-critical); border-color: var(--prio-critical); }
 
 /* ── Cases tab ───────────────────────────────────────────────────────────── */
-#tab-cases.active { flex-direction: column; }
+/* Overrides the shared `.tab-content.active { overflow: hidden }` (other
+   tabs use a fixed-viewport two-pane layout) — the map needs to scroll out
+   of view with the page instead of being a flex-shrink:0 sibling that
+   permanently steals height from case-body's list/detail panes. The
+   toolbar stays reachable via position: sticky rather than a hard clip. */
+#tab-cases.active { flex-direction: column; overflow-y: auto; }
 
 .case-toolbar {
   flex-shrink: 0;
+  position: sticky;
+  top: 0;
+  z-index: 5;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -767,7 +775,92 @@ mark { background: var(--prio-warn-bg); color: var(--prio-warn); padding: 0 2px;
 .btn-merge-case:hover { color: var(--prio-critical); text-decoration: underline; }
 .btn-merge-case:disabled { opacity: 0.5; cursor: default; }
 
-.case-body { flex: 1; display: flex; min-height: 0; }
+.case-map-section {
+  padding: 10px 16px 14px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.case-map-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.case-map-header h3 {
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  margin: 0;
+}
+.case-map-legend {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.case-map-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+.case-map-legend-swatch {
+  width: 11px;
+  height: 11px;
+  border-radius: 2px;
+  display: inline-block;
+}
+.case-map {
+  width: 100%;
+  max-height: 260px;
+  overflow: hidden;
+}
+.case-map svg {
+  width: 100%;
+  height: 260px;
+  display: block;
+}
+.case-map svg path {
+  stroke: var(--border);
+  stroke-width: 0.5;
+  cursor: pointer;
+  transition: fill 0.15s ease;
+}
+.case-map svg path.q0 { fill: var(--surface3); cursor: default; }
+.case-map svg path.q1 { fill: var(--prio-warn-bg); fill-opacity: 1; fill: #4a3a2c; }
+.case-map svg path.q2 { fill: #8a5a2c; }
+.case-map svg path.q3 { fill: #c47e2c; }
+.case-map svg path.q4 { fill: var(--accent); }
+.case-map svg path:hover { stroke: var(--accent-hover); stroke-width: 1.2; }
+.case-map svg path.map-active-filter { stroke: var(--accent); stroke-width: 1.6; }
+
+@keyframes case-map-flash {
+  0%, 100% { fill: var(--prio-critical); }
+  50% { fill: var(--accent-hover); }
+}
+.case-map svg path.flash {
+  animation: case-map-flash 0.9s ease-in-out 3;
+  stroke: var(--prio-critical);
+  stroke-width: 1.6;
+}
+
+.case-map-credit {
+  margin-top: 4px;
+  font-size: 0.68rem;
+  color: var(--text-muted);
+}
+.case-map-credit a { color: var(--text-muted); }
+.case-map-credit a:hover { color: var(--accent); }
+
+/* Sized to a generous minimum rather than flex:1 against the (now
+   scrolling) tab — flex:1 would compute against whatever's left after the
+   toolbar/map/pivot banner, shrinking the list/detail panes every time the
+   map took space. With a real min-height the panes keep their own
+   overflow-y:auto scroll, and the page scrolls past the map to reach them
+   on short viewports. */
+.case-body { flex: 1; display: flex; min-height: 70vh; }
 
 .case-rail {
   width: 340px;

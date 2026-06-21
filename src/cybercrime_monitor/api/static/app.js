@@ -1508,7 +1508,8 @@ const casesState = {
   pageSize: 50,
   hasMore: false,
   selectedId: null,
-  filters: { search: '', searchMode: 'keyword', significance: '', kevOnly: false, crimeType: '', since: '', until: '', cveId: '', ioc: '' },
+  countryCounts: {},
+  filters: { search: '', searchMode: 'keyword', significance: '', kevOnly: false, crimeType: '', since: '', until: '', cveId: '', ioc: '', country: '' },
 };
 const CASE_FILTERS_DEFAULT = { ...casesState.filters };
 
@@ -1521,11 +1522,32 @@ const caseSearchModeHint   = document.getElementById('case-search-mode-hint');
 const caseKevOnlyCb    = document.getElementById('case-kev-only');
 const caseSignificanceSelect = document.getElementById('case-significance-select');
 const caseCrimeTypeSelect    = document.getElementById('case-crime-type-select');
+const caseCountrySelect      = document.getElementById('case-country-select');
 const caseSinceInput   = document.getElementById('case-since-input');
 const caseUntilInput   = document.getElementById('case-until-input');
 const caseFiltersClear = document.getElementById('case-filters-clear');
 const caseDetailPane   = document.getElementById('case-detail');
 const caseDetailEmpty  = document.getElementById('case-detail-empty');
+const casesMapEl       = document.getElementById('cases-map');
+const casesMapLegendEl = document.getElementById('cases-map-legend');
+
+// Native, zero-data country-code -> English-name lookup (avoids shipping a
+// second name table alongside country.py's server-side one).
+const countryDisplayNames = (() => {
+  try {
+    return new Intl.DisplayNames(['en'], { type: 'region' });
+  } catch (e) {
+    return null;
+  }
+})();
+function countryLabel(code) {
+  if (!code) return code;
+  try {
+    return (countryDisplayNames && countryDisplayNames.of(code)) || code;
+  } catch (e) {
+    return code;
+  }
+}
 
 function initCases() {
   caseSearchInput.addEventListener('input', debounce(() => {
@@ -1544,6 +1566,10 @@ function initCases() {
     casesState.filters.crimeType = caseCrimeTypeSelect.value;
     applyCaseFilters();
   });
+  caseCountrySelect.addEventListener('change', () => {
+    casesState.filters.country = caseCountrySelect.value;
+    applyCaseFilters();
+  });
   caseSinceInput.addEventListener('change', () => {
     casesState.filters.since = caseSinceInput.value;
     applyCaseFilters();
@@ -1558,6 +1584,7 @@ function initCases() {
     caseKevOnlyCb.checked = false;
     caseSignificanceSelect.value = '';
     caseCrimeTypeSelect.value = '';
+    caseCountrySelect.value = '';
     caseSinceInput.value = '';
     caseUntilInput.value = '';
     syncSearchModeToggle(caseSearchModeToggle, casesState.filters.searchMode);
@@ -1589,6 +1616,7 @@ function caseQueryParams(extra = {}) {
   if (casesState.filters.significance) params.set('min_significance', casesState.filters.significance);
   if (casesState.filters.kevOnly) params.set('in_kev', 'true');
   if (casesState.filters.crimeType) params.set('crime_type', casesState.filters.crimeType);
+  if (casesState.filters.country) params.set('country', casesState.filters.country);
   if (casesState.filters.since) params.set('since', casesState.filters.since);
   if (casesState.filters.until) params.set('until', casesState.filters.until);
   if (casesState.filters.cveId) params.set('cve_id', casesState.filters.cveId);
@@ -1607,6 +1635,7 @@ function pivotCasesByIndicator(kind, value) {
   caseKevOnlyCb.checked = false;
   caseSignificanceSelect.value = '';
   caseCrimeTypeSelect.value = '';
+  caseCountrySelect.value = '';
   caseSinceInput.value = '';
   caseUntilInput.value = '';
   syncSearchModeToggle(caseSearchModeToggle, casesState.filters.searchMode);
@@ -1636,6 +1665,7 @@ async function applyCaseFilters() {
     casesState.cases = data.cases;
     casesState.hasMore = data.cases.length === casesState.pageSize && data.total > casesState.pageSize;
     renderCasesList();
+    loadCasesMap();
   } catch (e) {
     console.error('Failed to load cases', e);
   }
@@ -1690,6 +1720,133 @@ function populateFeedCrimeTypeDropdown(byCrimeType) {
     crimeTypeInput.appendChild(opt);
   });
   crimeTypeInput.value = current || '';
+}
+
+// ── Cases world map ─────────────────────────────────────────────────────
+// Vendored inline SVG (see static/world.svg, CC BY-SA 3.0 — credited in
+// index.html) with <path id="xx"> keyed by lowercase ISO 3166-1 alpha-2,
+// matching the canonical codes country.py normalizes into
+// damaged_party_country. Choropleth buckets + the "flash on select" effect
+// are plain CSS classes toggled on those paths — no charting/map library
+// needed, consistent with the rest of this vanilla-JS app.
+let casesMapSvgPromise = null;
+
+function ensureCasesMapSvg() {
+  if (!casesMapSvgPromise) {
+    casesMapSvgPromise = fetch('/world.svg')
+      .then(r => r.text())
+      .then(svgText => {
+        casesMapEl.innerHTML = svgText;
+        const svg = casesMapEl.querySelector('svg');
+        if (svg) {
+          svg.removeAttribute('width');
+          svg.removeAttribute('height');
+          svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+        }
+        casesMapEl.addEventListener('click', onCasesMapClick);
+      })
+      .catch(e => console.error('Failed to load world map', e));
+  }
+  return casesMapSvgPromise;
+}
+
+function onCasesMapClick(e) {
+  const path = e.target.closest('path[id]');
+  if (!path) return;
+  const code = path.id.toUpperCase();
+  if (code.length !== 2) return; // skip non-ISO "_named" territories
+  const next = casesState.filters.country === code ? '' : code;
+  casesState.filters.country = next;
+  caseCountrySelect.value = next;
+  applyCaseFilters();
+}
+
+const CASES_MAP_BUCKETS = 4;
+
+async function loadCasesMap() {
+  try {
+    const data = await api('/api/cases/by-country?' + caseQueryParams());
+    const counts = {};
+    (data.by_country || []).forEach(({ country, n }) => { counts[country] = n; });
+    casesState.countryCounts = counts;
+    populateCaseCountrySelect(counts);
+    await ensureCasesMapSvg();
+    renderCasesMap();
+  } catch (e) {
+    console.error('Failed to load cases map', e);
+  }
+}
+
+function populateCaseCountrySelect(counts) {
+  const current = casesState.filters.country;
+  const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  caseCountrySelect.innerHTML = '<option value="">All countries</option>';
+  entries.forEach(([code, n]) => {
+    const opt = document.createElement('option');
+    opt.value = code;
+    opt.textContent = `${countryLabel(code)} (${n})`;
+    caseCountrySelect.appendChild(opt);
+  });
+  caseCountrySelect.value = current || '';
+}
+
+function renderCasesMap() {
+  const svg = casesMapEl.querySelector('svg');
+  if (!svg) return;
+  const counts = casesState.countryCounts;
+  const max = Math.max(0, ...Object.values(counts));
+
+  svg.querySelectorAll('path[id]').forEach(path => {
+    path.classList.remove('q0', 'q1', 'q2', 'q3', 'q4', 'map-active-filter');
+    const code = path.id.toUpperCase();
+    const n = counts[code] || 0;
+    const bucket = n === 0 ? 0 : Math.min(CASES_MAP_BUCKETS, Math.ceil((n / max) * CASES_MAP_BUCKETS));
+    path.classList.add('q' + bucket);
+    if (n > 0) {
+      path.classList.toggle('map-active-filter', casesState.filters.country === code);
+      const title = path.querySelector('title') || path.appendChild(document.createElementNS('http://www.w3.org/2000/svg', 'title'));
+      title.textContent = `${countryLabel(code)} — ${n} case${n === 1 ? '' : 's'}`;
+    } else {
+      const title = path.querySelector('title');
+      if (title) title.remove();
+    }
+  });
+
+  // Re-apply the flash to the selected case's country, if any, after the
+  // map re-renders (e.g. filters changed while a case stays selected).
+  if (casesMapFlashCode) flashCasesMapCountry(casesMapFlashCode);
+
+  renderCasesMapLegend(max);
+}
+
+function renderCasesMapLegend(max) {
+  casesMapLegendEl.innerHTML = '';
+  if (max === 0) return;
+  const swatches = [0, 1, 2, 3, 4];
+  swatches.forEach(bucket => {
+    const item = document.createElement('span');
+    item.className = 'case-map-legend-item';
+    const swatch = document.createElement('span');
+    swatch.className = 'case-map-legend-swatch q' + bucket;
+    item.appendChild(swatch);
+    const label = document.createElement('span');
+    label.textContent = bucket === 0 ? '0' : Math.ceil((bucket / CASES_MAP_BUCKETS) * max);
+    item.appendChild(label);
+    casesMapLegendEl.appendChild(item);
+  });
+}
+
+let casesMapFlashCode = null;
+
+async function flashCasesMapCountry(code) {
+  casesMapFlashCode = code || null;
+  await ensureCasesMapSvg();
+  const svg = casesMapEl.querySelector('svg');
+  if (!svg) return;
+  svg.querySelectorAll('path.flash').forEach(p => p.classList.remove('flash'));
+  if (!code) return;
+  const path = svg.querySelector(`path[id="${code.toLowerCase()}"]`);
+  if (path) path.classList.add('flash');
 }
 
 function renderCasesList() {
@@ -1777,6 +1934,7 @@ async function selectCase(id) {
   try {
     const { case: c, items, research_runs, related_cases } = await api(`/api/cases/${id}`);
     renderCaseDetail(c, items, research_runs || [], related_cases || []);
+    flashCasesMapCountry(c.damaged_party_country);
   } catch (e) {
     console.error('Failed to load case detail', e);
   }
