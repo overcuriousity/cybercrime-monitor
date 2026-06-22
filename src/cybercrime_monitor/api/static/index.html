@@ -382,6 +382,21 @@
         <button id="activity-filters-clear" class="link-button" type="button">Clear</button>
       </div>
     </div>
+
+    <section class="chart-row source-overview-row">
+      <div class="chart-card">
+        <h3>Sources by region</h3>
+        <div class="chart-canvas"><canvas id="chart-source-region"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <h3>Sources by media kind</h3>
+        <div class="chart-canvas"><canvas id="chart-source-media-kind"></canvas></div>
+      </div>
+      <div class="chart-card chart-card-wide emerging-panel" id="source-leaderboard">
+        <h3>Source leaderboard <span class="hint" style="margin:0;">(investigation value)</span></h3>
+      </div>
+    </section>
+
     <main class="activity-list-wrap">
       <div id="activity-new-banner" class="hidden">
         <button onclick="applyActivityFilters()">▲ Load new activity</button>

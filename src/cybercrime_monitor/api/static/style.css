@@ -1075,6 +1075,12 @@ mark { background: var(--prio-warn-bg); color: var(--prio-warn); padding: 0 2px;
 .emerging-delta { font-weight: 700; font-size: 0.78rem; font-family: var(--font-mono); }
 .emerging-delta.trend-emerging { color: var(--prio-critical); }
 .emerging-delta.trend-rising   { color: var(--prio-warn); }
+
+/* Source overview (Activity tab, issue #17) — the leaderboard panel reuses
+   .emerging-panel/.emerging-row but can list many sources, so it scrolls
+   instead of stretching the whole chart-row taller than its neighboring
+   distribution charts. */
+.source-overview-row #source-leaderboard { max-height: 200px; overflow-y: auto; }
 .emerging-delta.trend-flat     { color: var(--text-muted); }
 .emerging-delta.trend-declining { color: var(--prio-info); }
 
