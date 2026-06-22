@@ -217,9 +217,14 @@ async def run_research_batch(db_conn) -> int:
     significant, not-recently-researched cases, concurrently. Returns the
     number of cases processed (regardless of outcome — a failed/timed-out
     run still counts, since it consumed a research_runs row and won't be
-    retried until its cooldown elapses — the full 24h for a completed run,
-    but only settings.research_failure_retry_hours for a failed one; see
-    db.get_cases_needing_research's docstring).
+    retried until its cooldown elapses). The cooldown is significance-scaled,
+    not a flat window: a completed run blocks re-research for
+    settings.research_critical_interval_seconds (critical, daily by default)
+    or settings.research_warn_interval_seconds (warn, weekly by default), and
+    an info case is researched exactly once and never again automatically.
+    A *failed* run instead uses the much shorter
+    settings.research_failure_retry_hours, regardless of level — see
+    db._research_eligibility_sql's docstring for the exact predicate.
 
     Cases are fetched settings.hermes_research_batch_size at a time and
     dispatched together via asyncio.gather, but actual parallelism is capped
