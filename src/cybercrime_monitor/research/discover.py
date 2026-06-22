@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 from selectolax.parser import HTMLParser
 
 from .. import db
+from .. import prompts
 from ..api.sse import broadcaster
 from ..hermes.runner import run_agent
 from ..http import clearnet_client, tor_client
@@ -112,93 +113,6 @@ async def _log_activity(
     except Exception as exc:
         log.error("[discover] activity log failed: %s", exc)
 
-
-_DISCOVER_PROMPT_TEMPLATE = """\
-You are assisting in expanding a cybercrime OSINT monitor's data sources. \
-The monitor currently tracks these topics: {topics}. It already has these \
-sources (do not suggest duplicates of these domains): {existing_domains}.
-
-{underrepresented}
-
-Search for new sources, in this priority order:
-1. Darknet forums, marketplaces, or leak sites (.onion addresses) — find \
-   these via clearnet darknet directories/mirror lists (e.g. dark.fail, \
-   Tor.taxi) or via cybersecurity write-ups and CTI reports that publish \
-   onion addresses for ransomware leak sites or cybercrime forums. You do \
-   not need to be able to browse the .onion address yourself — reporting \
-   the address and what it is, as found in clearnet text, is enough. This \
-   is always the single most valuable kind of source this monitor can add \
-   — first-hand actor chatter, not someone else's writeup of it — so \
-   actively look for one even when the balance note above doesn't call \
-   for it.
-2. Cybersecurity researcher feeds/blogs that publish their own incident \
-   analysis or threat intel (vendor blogs, independent researchers).
-3. General press/news feeds that cover data breaches and cybercrime \
-   promptly (e.g. heise, KrebsOnSecurity, and similar outlets).
-
-Within that priority order, prefer candidates that help fill the \
-under-represented regions/media kinds noted above over ones that pile \
-onto an already well-covered bucket.
-
-For each candidate, determine its "kind":
-- "rss": you found a working RSS/Atom feed URL for it (NOT a general web \
-  page — the feed_url must return valid RSS/Atom XML).
-- "tor_forum": a darknet (.onion) forum/marketplace/leak-site with no \
-  feed — give its listing_url (the page that lists threads/posts/leaks).
-- "html_forum": a clearnet forum/leak-site with no feed — give its \
-  listing_url likewise.
-
-Also classify each candidate's region (where its primary operator/\
-publisher is based or oriented: "eu", "us", "ru_cn" for Russia/China or \
-that sphere including Russian-language cybercrime forums, or "other") and \
-media_kind ("darknet_forum" for first-hand forum/marketplace data, \
-"forensic" for incident-response/malware-analysis writeups, "press" for \
-mainstream news, "blog" for independent researcher/hobbyist blogs, or \
-"feed" for government/vendor advisory or alert feeds).
-
-Find up to {batch_size} candidate(s) total, prioritized as above (darknet \
-first). Prefer sites with a track record of being first to report \
-incidents over general security news aggregators.
-
-When you are done, respond with ONLY a single-line JSON object as your \
-final message, no markdown fencing, no commentary, exactly these keys:
-{{"candidates": [{{"name": "<short site name>", "kind": "rss"|"tor_forum"|"html_forum", \
-"feed_url": <"<RSS/Atom feed URL>"|null>, "listing_url": <"<forum listing page URL>"|null>, \
-"region": "eu"|"us"|"ru_cn"|"other", \
-"media_kind": "darknet_forum"|"forensic"|"press"|"blog"|"feed", \
-"reason": "<why this is a good fit>"}}, ...]}}
-Use an empty "candidates" array if you find nothing suitable.
-"""
-
-# Second, tool-free leg for forum candidates: given the actual fetched HTML
-# of a listing page, ask Hermes to propose selectors — same no-tools/JSON
-# contract as llm/backend.py's adjudicate_merge (_NO_TOOLS_TOOLSET="memory"),
-# reused here so selector generation doesn't need its own LLM integration.
-_SELECTOR_PROMPT_TEMPLATE = """\
-You are helping configure a CSS-selector-based scraper for a forum/listing \
-page. Below is the raw HTML of the page (truncated). Identify the repeating \
-row/item that represents one thread, post, or listing, and propose CSS \
-selectors:
-- row_selector: selects each repeating row/item element.
-- title_selector: within a row, selects the element containing the \
-  title/subject text.
-- url_selector: within a row, selects the <a> element whose href points to \
-  the individual thread/post/listing.
-- date_selector: within a row, selects the element containing a \
-  post/listing date, or null if none is reliably present.
-
-URL: {url}
-
-HTML (truncated):
-{html}
-
-Respond with ONLY a single-line JSON object as your final message, no \
-markdown fencing, no commentary, exactly these keys:
-{{"row_selector": "<css>", "title_selector": "<css>", "url_selector": "<css>", \
-"date_selector": <"<css>"|null>}}
-Do not search the web, browse, or use any tools for this task — base your \
-answer ONLY on the HTML given above and respond immediately.
-"""
 
 # A validated selector set must extract at least this many usable rows
 # (title + url both present) from the listing page before it's trusted
@@ -309,7 +223,7 @@ async def run_discover_batch(db_conn, scheduler=None, sse_broadcaster=None) -> i
         if batch_size == 0:
             record_success(0)
             return 0
-        prompt = _DISCOVER_PROMPT_TEMPLATE.format(
+        prompt = prompts.DISCOVER_PROMPT_TEMPLATE.format(
             topics=await _topics(db_conn),
             existing_domains=", ".join(sorted(_existing_domains(existing))) or "none",
             underrepresented=_underrepresented_summary(existing),
@@ -371,7 +285,7 @@ def _candidate_url(cand: dict, kind: str) -> str:
 async def _try_add_candidate(
     db_conn, cand: dict, existing_domains: set[str], existing_ids: set[str], scheduler, sse_broadcaster
 ) -> bool:
-    """Dispatch by candidate kind — see _DISCOVER_PROMPT_TEMPLATE's contract.
+    """Dispatch by candidate kind — see prompts.DISCOVER_PROMPT_TEMPLATE's contract.
     Unrecognized/missing kind defaults to "rss" for backward compatibility
     with any in-flight proposal shaped by the old prompt."""
     if not isinstance(cand, dict):
@@ -477,9 +391,9 @@ async def _fetch_listing_html(url: str, *, kind: str) -> str | None:
 async def _propose_selectors(url: str, html: str) -> dict | None:
     """Tool-free Hermes leg: given the already-fetched HTML, propose CSS
     selectors. Uses toolsets="memory" (see llm/backend.py's
-    _NO_TOOLS_TOOLSET) since this is a closed-form text-in/JSON-out task —
+    llm/backend.py's _NO_TOOLS_TOOLSET) since this is a closed-form text-in/JSON-out task —
     no need to re-spend a browsing budget on a page we already have."""
-    prompt = _SELECTOR_PROMPT_TEMPLATE.format(url=url, html=html[:_SELECTOR_HTML_CHARS])
+    prompt = prompts.SELECTOR_PROMPT_TEMPLATE.format(url=url, html=html[:_SELECTOR_HTML_CHARS])
     result = await run_agent(prompt, toolsets="memory", timeout=settings.hermes_timeout_seconds,
                               model=settings.hermes_model or None, expect_json=True)
     if not result.ok or not isinstance(result.data, dict):

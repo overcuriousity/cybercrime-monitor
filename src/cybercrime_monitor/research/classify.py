@@ -18,6 +18,7 @@ Runs on its own APScheduler interval (scheduler.py's "_classify" job).
 import logging
 
 from .. import db
+from .. import prompts
 from ..hermes.runner import run_agent
 from ..scheduler import load_sources
 from ..settings import settings
@@ -30,44 +31,6 @@ log = logging.getLogger(__name__)
 # unclassified sources just sit out of the diversity/media-prior components
 # until their turn comes up.
 _SOURCES_PER_TICK = 3
-
-_CLASSIFY_PROMPT_TEMPLATE = """\
-You are cataloguing a source feed for a cybercrime OSINT monitor. Classify \
-the following source along two dimensions, using your knowledge of the \
-domain/publisher and, if useful, a quick look at the URL.
-
-SOURCE:
-id: {source_id}
-name: {name}
-type: {type}
-url: {url}
-tags: {tags}
-
-Dimension 1 — region: where is the source's PRIMARY operator/publisher \
-based or oriented?
-  - "eu": European Union based or EU-focused
-  - "us": United States based or US-focused
-  - "ru_cn": Russia or China based, or primarily covering that sphere \
-(includes Russian-language darknet/cybercrime forums)
-  - "other": anywhere else, or genuinely international/no clear base
-
-Dimension 2 — media_kind — what KIND of content does this source produce?
-  - "darknet_forum": first-hand posts from a darknet/cybercrime forum or \
-marketplace (the highest-value kind — direct actor chatter, not someone \
-else's writeup of it)
-  - "forensic": incident-response/forensic writeups, malware analysis, \
-breach post-mortems from security researchers or vendors
-  - "press": mainstream news/journalism coverage
-  - "blog": independent researcher or hobbyist blog, not a press outlet \
-and not a first-hand forensic writeup
-  - "feed": a government/vendor advisory feed, structured alert feed, or \
-similar low-editorial aggregation (e.g. CISA advisories, paste-site dumps)
-
-When you are done, respond with ONLY a single-line JSON object as your \
-final message, no markdown fencing, no commentary, exactly these keys:
-{{"region": "eu"|"us"|"ru_cn"|"other", "media_kind": "darknet_forum"|"forensic"|"press"|"blog"|"feed"}}
-"""
-
 
 def _candidates() -> list[dict]:
     return [
@@ -110,7 +73,7 @@ async def run_classify_batch(db_conn, scheduler=None, sse_broadcaster=None) -> i
 
 
 async def _classify_one(db_conn, source: dict) -> bool:
-    prompt = _CLASSIFY_PROMPT_TEMPLATE.format(
+    prompt = prompts.CLASSIFY_PROMPT_TEMPLATE.format(
         source_id=source["id"],
         name=source.get("name", source["id"]),
         type=source.get("type", "unknown"),

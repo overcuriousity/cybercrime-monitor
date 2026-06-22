@@ -6,8 +6,8 @@ selected by settings.llm_backend:
     extract_batch's docstring).
   - "hermes_cli": shells out to the locally-installed hermes-agent CLI via
     hermes/runner.run_agent, scoped to a narrow toolset (see
-    _NO_TOOLS_TOOLSET) plus a prompt instruction (_NO_TOOLS_NOTE) — this is
-    plain text-in/JSON-out extraction, not agentic research, so it should
+    _NO_TOOLS_TOOLSET) plus a prompt instruction (prompts.NO_TOOLS_NOTE) —
+    this is plain text-in/JSON-out extraction, not agentic research, so it should
     never need to search the web or touch the filesystem. Useful when
     there's no separate OpenAI-compatible endpoint running but `hermes` is
     already configured and working (see settings.hermes_model).
@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 
 import httpx
 
+from .. import prompts
 from .. import significance as sig
 from ..hermes.runner import run_agent
 from ..settings import settings
@@ -94,16 +95,6 @@ def _maybe_exit_fallback_cooldown() -> None:
         llm_health.set_using_fallback(False)
         log.info("[llm] retrying openai-compatible endpoint %s after fallback cooldown", settings.llm_base_url)
 
-# Appended to every hermes_cli prompt — without this, a model with web/browser
-# toolsets available may "helpfully" search for corroborating info on a
-# per-item extraction call, which is slow, costly, and unnecessary: the
-# extraction task is closed-form (read the given text, fill the schema), not
-# research (that's research/agent.py's job, dispatched separately and only
-# for cases that warrant it).
-_NO_TOOLS_NOTE = (
-    "\n\nDo not search the web, browse, or use any tools for this task — "
-    "base your answer ONLY on the text given above and respond immediately."
-)
 # Passed as hermes_cli's -t value to scope the call down from whatever
 # toolsets are globally enabled (which may include browser/terminal/file/
 # code_execution — real risk surface to expose to a call that processes
@@ -112,63 +103,6 @@ _NO_TOOLS_NOTE = (
 # abort with no output instead of running tool-free, so this can't just be
 # "" (see hermes/runner.run_agent's docstring).
 _NO_TOOLS_TOOLSET = "memory"
-
-_SYSTEM_PROMPT = """\
-You are a triage and structured-extraction analyst for a real-time cybercrime \
-monitoring feed (data breaches, ransomware, fraud, exploitation of \
-vulnerabilities, and related cybercrime). The goal is to turn one noisy \
-scraped item into a structured, specific incident record — or flag it as \
-noise. You will be shown one scraped item (title, snippet, source).
-
-Extract these fields:
-- crime_type: a short label such as "data-breach", "ransomware", "data-sale", \
-  "fraud", "exploitation", "ddos", "defacement", "other" — pick the closest fit.
-- victim: the named organization/individual harmed, or null if none is named.
-- victim_sector: e.g. "finance", "healthcare", "government", "retail", \
-  "technology", null if unknown.
-- victim_country: ISO 3166-1 alpha-2 country code of the victim if \
-  determinable, else null.
-- actor: the named threat actor / group / seller, or null if none is named.
-- cve_ids: array of any CVE identifiers mentioned (e.g. "CVE-2024-12345"), \
-  empty array if none.
-- iocs: array of any concrete indicators of compromise mentioned (domains, \
-  hashes, IPs, onion addresses, leak-site URLs, cryptocurrency wallet \
-  addresses used for ransom/extortion payments) — empty array if none.
-
-Assess significance (about THIS single report):
-- "critical": evidence of an ONGOING crime — a named victim AND the harm is \
-  still in progress: an active data-for-sale offering (a price, a \
-  marketplace or forum, a leak sample, or an explicit "for sale"/"selling" \
-  claim), an actively-exploited vulnerability against a named victim, or an \
-  incident the report itself describes as still unfolding (a live \
-  extortion countdown, ongoing exfiltration, the attacker still inside).
-- "warn": a clear, named victim with a concrete act — a confirmed \
-  exfiltration/breach/ransomware/fraud incident, a leak-site posting, or a \
-  named exploited vulnerability/CVE — but the report does NOT establish \
-  that it's still ongoing (it reads as a past/closed incident or a \
-  disclosure after the fact).
-- "info": cybercrime-related but stale, insignificant, or unconfirmed — \
-  names no clear victim, or is too vague/unverified to act on. This is \
-  still a real, specific-enough item to keep in the pipeline — distinct \
-  from false_positive below, which is for items that aren't a specific \
-  incident at all.
-
-Set false_positive=true for anything that is NOT a specific, identifiable \
-incident: generic security/cybercrime news, industry trend pieces, opinion \
-or analysis articles, vague "X were breached" mentions you can't pin to an \
-incident, or empty/uninformative posts. The bar: would a reader learn \
-*which* victim and/or *which* actor this is about? If not, it's noise — \
-eliminate it. (Contrast with "info" above: an item can name a real, \
-specific incident — and so NOT be a false_positive — while still being low \
-significance because it's stale, minor, or unconfirmed.)
-
-Respond with ONLY a single-line JSON object, no markdown fencing, no \
-commentary, exactly these keys:
-{"crime_type": "<label>", "victim": <string|null>, "victim_sector": <string|null>, \
-"victim_country": <string|null>, "actor": <string|null>, "cve_ids": [<string>...], \
-"iocs": [<string>...], "significance": "info"|"warn"|"critical", \
-"false_positive": true|false, "confidence": <0.0-1.0>, "reasoning": "<one short sentence>"}
-"""
 
 
 @dataclass
@@ -256,64 +190,6 @@ def _auth_headers() -> dict[str, str]:
     return headers
 
 
-_EXTRACTION_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "crime_type": {"type": "string"},
-        "victim": {"type": ["string", "null"]},
-        "victim_sector": {"type": ["string", "null"]},
-        "victim_country": {"type": ["string", "null"]},
-        "actor": {"type": ["string", "null"]},
-        "cve_ids": {"type": "array", "items": {"type": "string"}},
-        "iocs": {"type": "array", "items": {"type": "string"}},
-        "significance": {"type": "string", "enum": list(sig.SIGNIFICANCE_LEVELS)},
-        "false_positive": {"type": "boolean"},
-        "confidence": {"type": "number"},
-        "reasoning": {"type": "string"},
-    },
-    "required": [
-        "crime_type", "victim", "victim_sector", "victim_country", "actor",
-        "cve_ids", "iocs", "significance", "false_positive", "confidence", "reasoning",
-    ],
-    "additionalProperties": False,
-}
-
-# Same fields as _EXTRACTION_SCHEMA plus "index" — the model echoes back which
-# input item (0-based, matching the order items were listed in the prompt)
-# each extraction belongs to. More robust than relying on output-array
-# position matching input-array position: a model that skips/reorders one
-# item under batch load still produces extractions we can correctly
-# attribute, instead of silently misclassifying item N+1 as item N's verdict.
-_BATCH_EXTRACTION_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "extractions": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {"index": {"type": "integer"}, **_EXTRACTION_SCHEMA["properties"]},
-                "required": ["index", *_EXTRACTION_SCHEMA["required"]],
-                "additionalProperties": False,
-            },
-        },
-    },
-    "required": ["extractions"],
-    "additionalProperties": False,
-}
-
-_BATCH_SYSTEM_PROMPT = _SYSTEM_PROMPT + (
-    "\n\nYou will be shown MULTIPLE items, each prefixed with its index "
-    "(e.g. \"[2] Title: ...\"). Extract from EVERY item independently — they are "
-    "unrelated incidents, not a single story. Respond with ONLY a single-line "
-    "JSON object, no markdown fencing, no commentary, exactly this shape:\n"
-    '{"extractions": [{"index": <int>, "crime_type": "<label>", "victim": <string|null>, '
-    '"victim_sector": <string|null>, "victim_country": <string|null>, "actor": <string|null>, '
-    '"cve_ids": [<string>...], "iocs": [<string>...], "significance": "info"|"warn"|"critical", '
-    '"false_positive": true|false, "confidence": <0.0-1.0>, "reasoning": "<one short sentence>"}, ...]}\n'
-    "Include exactly one extraction object per item shown, using its given index."
-)
-
-
 def _build_batch_user_prompt(items: list[dict]) -> str:
     blocks = []
     for i, it in enumerate(items):
@@ -387,7 +263,7 @@ async def _extract_batch_via_openai(items: list[dict]) -> list[Extraction | None
     payload = {
         "model": settings.llm_model or "local-model",
         "messages": [
-            {"role": "system", "content": _BATCH_SYSTEM_PROMPT},
+            {"role": "system", "content": prompts.BATCH_SYSTEM_PROMPT},
             {"role": "user", "content": _build_batch_user_prompt(items)},
         ],
         "temperature": 0,
@@ -399,7 +275,7 @@ async def _extract_batch_via_openai(items: list[dict]) -> list[Extraction | None
         # request; with it, well-formed results came back immediately).
         "response_format": {
             "type": "json_schema",
-            "json_schema": {"name": "batch_extraction", "strict": True, "schema": _BATCH_EXTRACTION_SCHEMA},
+            "json_schema": {"name": "batch_extraction", "strict": True, "schema": prompts.BATCH_EXTRACTION_SCHEMA},
         },
     }
 
@@ -423,7 +299,7 @@ async def _extract_batch_via_openai(items: list[dict]) -> list[Extraction | None
 
 
 async def _extract_batch_via_hermes(items: list[dict]) -> list[Extraction | None]:
-    prompt = _BATCH_SYSTEM_PROMPT + "\n\n" + _build_batch_user_prompt(items) + _NO_TOOLS_NOTE
+    prompt = prompts.BATCH_SYSTEM_PROMPT + "\n\n" + _build_batch_user_prompt(items) + prompts.NO_TOOLS_NOTE
     result = await run_agent(
         prompt,
         toolsets=_NO_TOOLS_TOOLSET,
@@ -468,14 +344,14 @@ async def _extract_one_via_openai(title: str, snippet: str, source_name: str) ->
     payload = {
         "model": settings.llm_model or "local-model",
         "messages": [
-            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "system", "content": prompts.SYSTEM_PROMPT},
             {"role": "user", "content": _build_user_prompt(title, snippet, source_name)},
         ],
         "temperature": 0,
         "max_tokens": 400,
         "response_format": {
             "type": "json_schema",
-            "json_schema": {"name": "extraction", "strict": True, "schema": _EXTRACTION_SCHEMA},
+            "json_schema": {"name": "extraction", "strict": True, "schema": prompts.EXTRACTION_SCHEMA},
         },
     }
 
@@ -501,7 +377,7 @@ async def _extract_one_via_openai(title: str, snippet: str, source_name: str) ->
 
 
 async def _extract_one_via_hermes(title: str, snippet: str, source_name: str) -> Extraction | None:
-    prompt = _SYSTEM_PROMPT + "\n\n" + _build_user_prompt(title, snippet, source_name) + _NO_TOOLS_NOTE
+    prompt = prompts.SYSTEM_PROMPT + "\n\n" + _build_user_prompt(title, snippet, source_name) + prompts.NO_TOOLS_NOTE
     result = await run_agent(
         prompt, toolsets=_NO_TOOLS_TOOLSET, timeout=settings.llm_timeout_seconds, model=settings.hermes_model or None
     )
@@ -523,31 +399,6 @@ async def _extract_one_via_hermes(title: str, snippet: str, source_name: str) ->
 # unclear whether they're the same underlying incident (e.g. a victim
 # named once but reported by two sources with different actor names, or two
 # items sharing one CVE among several).
-
-_MERGE_SYSTEM_PROMPT = """\
-You are deciding whether two cybercrime incident reports describe the SAME \
-underlying real-world incident, or two DIFFERENT incidents that merely share \
-a victim, actor, or CVE. Be conservative: only say "same" when the victim, \
-timeframe, and nature of the incident are consistent with a single event. \
-Two different breaches of the same company, or two different victims of the \
-same ransomware group, are NOT the same incident.
-
-Respond with ONLY a single-line JSON object, no markdown fencing, no \
-commentary, exactly these keys:
-{"same_incident": true|false, "confidence": <0.0-1.0>, "reasoning": "<one short sentence>"}
-"""
-
-_MERGE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "same_incident": {"type": "boolean"},
-        "confidence": {"type": "number"},
-        "reasoning": {"type": "string"},
-    },
-    "required": ["same_incident", "confidence", "reasoning"],
-    "additionalProperties": False,
-}
-
 
 def _build_merge_prompt(case: dict, item: dict) -> str:
     return (
@@ -590,14 +441,14 @@ async def _adjudicate_merge_via_openai(case: dict, item: dict) -> tuple[bool, fl
     payload = {
         "model": settings.llm_model or "local-model",
         "messages": [
-            {"role": "system", "content": _MERGE_SYSTEM_PROMPT},
+            {"role": "system", "content": prompts.MERGE_SYSTEM_PROMPT},
             {"role": "user", "content": _build_merge_prompt(case, item)},
         ],
         "temperature": 0,
         "max_tokens": 200,
         "response_format": {
             "type": "json_schema",
-            "json_schema": {"name": "merge_verdict", "strict": True, "schema": _MERGE_SCHEMA},
+            "json_schema": {"name": "merge_verdict", "strict": True, "schema": prompts.MERGE_SCHEMA},
         },
     }
 
@@ -617,7 +468,7 @@ async def _adjudicate_merge_via_openai(case: dict, item: dict) -> tuple[bool, fl
 
 
 async def _adjudicate_merge_via_hermes(case: dict, item: dict) -> tuple[bool, float] | None:
-    prompt = _MERGE_SYSTEM_PROMPT + "\n\n" + _build_merge_prompt(case, item) + _NO_TOOLS_NOTE
+    prompt = prompts.MERGE_SYSTEM_PROMPT + "\n\n" + _build_merge_prompt(case, item) + prompts.NO_TOOLS_NOTE
     result = await run_agent(
         prompt, toolsets=_NO_TOOLS_TOOLSET, timeout=settings.llm_timeout_seconds, model=settings.hermes_model or None
     )
