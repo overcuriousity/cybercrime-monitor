@@ -157,6 +157,10 @@ async function loadSources() {
       renderSourceLegend(); // static — render once, not on every health refresh
     }
     renderSourceFilters(data);
+    // Cheap, sync re-render from the data we already have — keeps the
+    // Activity tab's source leaderboard (issue #17) in step with this
+    // existing 30s health refresh instead of needing its own poll loop.
+    renderSourceLeaderboard();
   } catch (e) {
     console.error('Failed to load sources', e);
   }
@@ -2380,6 +2384,85 @@ function initActivity() {
   });
   activityLoadMoreBtn.addEventListener('click', loadMoreActivity);
   applyActivityFilters();
+  refreshSourceOverview();
+}
+
+// ── Source overview (issue #17) ─────────────────────────────────────────────
+// A leaderboard + region/media_kind distribution for every configured
+// source, surfaced in the Activity tab per the issue's "could be integrated
+// into the activity tab" steer. The leaderboard renders straight from
+// state.sources (already refreshed every 30s by loadSources — see
+// app.js:76), so it stays current without its own poll loop; the
+// distribution charts pull GET /api/stats/sources, a thin wrapper around
+// sources/value.py's bucket_counts() already computed for the scoring
+// engine's diversity component.
+const SOURCE_VALUE_COLORS = { valuable: 'var(--prio-info)', marginal: 'var(--prio-warn)', dead: 'var(--prio-critical)' };
+const SOURCE_BUCKET_COLORS = ['#f4a261', '#2a9d8f', '#e63946', '#9d4edd', '#64dfdf', '#c77dff'];
+
+async function refreshSourceOverview() {
+  renderSourceLeaderboard();
+  try {
+    const buckets = await api('/api/stats/sources');
+    renderSourceBucketChart('chart-source-region', buckets.region);
+    renderSourceBucketChart('chart-source-media-kind', buckets.media_kind);
+  } catch (e) {
+    console.error('Failed to load source distribution', e);
+  }
+}
+
+function renderSourceLeaderboard() {
+  const panel = document.getElementById('source-leaderboard');
+  if (!panel) return;
+  panel.querySelectorAll('.emerging-row, p.hint').forEach(el => el.remove());
+
+  const ranked = [...state.sources]
+    .filter(s => s.enabled)
+    .sort((a, b) => (b.value_score ?? -1) - (a.value_score ?? -1));
+
+  if (!ranked.length) {
+    const empty = document.createElement('p');
+    empty.className = 'hint';
+    empty.textContent = state.sources.length ? 'No enabled sources.' : 'No sources configured.';
+    panel.appendChild(empty);
+    return;
+  }
+
+  ranked.forEach(src => {
+    const row = document.createElement('div');
+    row.className = 'emerging-row';
+
+    const label = document.createElement('span');
+    label.className = 'emerging-label';
+    label.textContent = src.name;
+    row.appendChild(label);
+
+    const badge = document.createElement('span');
+    const cls = src.value_classification;
+    badge.className = 'emerging-delta';
+    badge.style.color = SOURCE_VALUE_COLORS[cls] || 'var(--text-muted)';
+    const scoreText = src.value_score != null ? src.value_score.toFixed(2) : '—';
+    badge.textContent = cls ? `${cls} (${scoreText})` : 'unscored';
+    row.appendChild(badge);
+
+    panel.appendChild(row);
+  });
+}
+
+function renderSourceBucketChart(canvasId, counts) {
+  const labels = Object.keys(counts);
+  const data = labels.map(l => counts[l]);
+  upsertChart(canvasId, {
+    type: 'doughnut',
+    data: {
+      labels,
+      datasets: [{ data, backgroundColor: labels.map((_, i) => SOURCE_BUCKET_COLORS[i % SOURCE_BUCKET_COLORS.length]) }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: true, position: 'bottom' } },
+    },
+  });
 }
 
 function activityQueryParams(extra = {}) {

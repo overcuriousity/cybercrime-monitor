@@ -57,6 +57,7 @@ from ..research import heal as heal_health
 from ..research import investigate as investigate_health
 from ..scheduler import load_sources
 from ..settings import settings
+from ..sources import value as source_value
 from .sse import TooManySubscribers, broadcaster
 
 log = logging.getLogger(__name__)
@@ -321,6 +322,15 @@ async def api_sources(request: Request, db=Depends(get_db)):
                 # (e.g. "dead" vs a human's manual "# needs:" disable, which
                 # has no classification yet).
                 "value_classification": value.get("classification") if value else None,
+                # Numeric score + component breakdown (see value.py's
+                # _WEIGHTS) and the editorial region/media_kind backfilled by
+                # research/classify.py — surfaced for the source-overview
+                # dashboard (issue #17); None until a value-refresh tick or
+                # classify tick has run for this source.
+                "value_score": value.get("score") if value else None,
+                "value_components": value.get("components") if value else None,
+                "region": s.get("region"),
+                "media_kind": s.get("media_kind"),
             }
         )
     return result
@@ -356,6 +366,15 @@ async def api_stats_by_source(db=Depends(get_db)):
         r["consecutive_errors"] = h.consecutive_errors if h else 0
         r["last_success_at"] = h.last_success_at if h else None
     return {"sources": rows}
+
+
+@router.get("/api/stats/sources")
+async def api_stats_sources():
+    """Region/media_kind distribution across enabled sources — backs the
+    source-overview dashboard's diversity charts (issue #17). Wraps
+    sources/value.py's bucket_counts(), already computed for the diversity
+    scoring component, so this is a free read with no new aggregation."""
+    return source_value.bucket_counts(load_sources())
 
 
 @router.get("/api/stats/by_priority")
