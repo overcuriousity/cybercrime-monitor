@@ -1006,6 +1006,8 @@ mark { background: var(--prio-warn-bg); color: var(--prio-warn); padding: 0 2px;
   height: 6px;
   background: var(--accent);
 }
+.case-timeline-item a { color: var(--text); text-decoration: none; }
+.case-timeline-item a:hover { text-decoration: underline; color: var(--accent); }
 
 .settings-actions {
   display: flex;
