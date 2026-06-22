@@ -1957,6 +1957,38 @@ async function selectCase(id) {
   }
 }
 
+// Standard CVSS v3 qualitative severity bands — mirrors
+// api/routes.py's _cvss_severity_label (cases.cvss_max stores only the
+// numeric max, so the label is derived client-side for display).
+function cvssSeverityLabel(score) {
+  if (score >= 9.0) return 'Critical';
+  if (score >= 7.0) return 'High';
+  if (score >= 4.0) return 'Medium';
+  if (score > 0.0) return 'Low';
+  return 'None';
+}
+
+// Plain (non-pivotable) chip row for case-detail fields that don't have a
+// backend filter to pivot through yet (CWE/MITRE — contrast with the CVE
+// row below, which pivots via pivotCasesByIndicator).
+function buildStaticChipRow(label, values) {
+  const row = document.createElement('div');
+  row.className = 'hint';
+  const labelEl = document.createElement('b');
+  labelEl.textContent = label + ': ';
+  row.appendChild(labelEl);
+  const chipWrap = document.createElement('span');
+  chipWrap.className = 'ioc-chip-row inline-chip-row';
+  values.forEach(v => {
+    const chip = document.createElement('span');
+    chip.className = 'ioc-chip';
+    chip.textContent = v;
+    chipWrap.appendChild(chip);
+  });
+  row.appendChild(chipWrap);
+  return row;
+}
+
 function renderCaseDetail(c, items, researchRuns, relatedCases) {
   caseDetailEmpty.classList.add('hidden');
   caseDetailPane.classList.remove('hidden');
@@ -2008,6 +2040,8 @@ function renderCaseDetail(c, items, researchRuns, relatedCases) {
     ['Attribution', c.attribution],
     ['Status', c.status],
     ['In KEV', c.in_kev ? 'yes' : 'no'],
+    ['CVSS (max)', c.cvss_max != null ? `${c.cvss_max} (${cvssSeverityLabel(c.cvss_max)})` : null],
+    ['EPSS (max)', c.epss_max != null ? c.epss_max.toFixed(3) : null],
     ['First seen', fmtTime(c.first_seen)],
     ['Last seen', fmtTime(c.last_seen)],
     ['Sources', String(c.source_count)],
@@ -2041,6 +2075,13 @@ function renderCaseDetail(c, items, researchRuns, relatedCases) {
     });
     cveRow.appendChild(chipWrap);
     grid.appendChild(cveRow);
+  }
+
+  if (c.cwe_ids && c.cwe_ids.length) {
+    grid.appendChild(buildStaticChipRow('CWE', c.cwe_ids));
+  }
+  if (c.mitre_techniques && c.mitre_techniques.length) {
+    grid.appendChild(buildStaticChipRow('MITRE ATT&CK', c.mitre_techniques));
   }
 
   caseDetailPane.appendChild(grid);

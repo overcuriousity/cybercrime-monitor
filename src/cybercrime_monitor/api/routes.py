@@ -715,6 +715,11 @@ async def _load_case_bundle(db, case_id: int) -> tuple[dict, list[dict], list[di
     case["cve_ids"] = json.loads(case["cve_ids"]) if case["cve_ids"] else []
     case["iocs"] = json.loads(case["iocs"]) if case["iocs"] else []
     case["in_kev"] = bool(case["in_kev"])
+    # CVSS/CWE/EPSS/MITRE aggregates (issue #18) — see pipeline/correlate.py's
+    # _resolve_cve_meta/_resolve_mitre. cvss_max/epss_max stay None until
+    # enrichment has resolved at least one of the case's CVEs.
+    case["cwe_ids"] = json.loads(case["cwe_ids"]) if case["cwe_ids"] else []
+    case["mitre_techniques"] = json.loads(case["mitre_techniques"]) if case["mitre_techniques"] else []
     items = await get_case_items(db, case_id)
     research_runs = await get_research_runs_for_case(db, case_id)
     related = await get_case_links(db, case_id)
@@ -736,6 +741,22 @@ def _escape_markdown(text: str) -> str:
     return _MD_ESCAPE_RE.sub(r"\\\1", str(text))
 
 
+def _cvss_severity_label(score: float) -> str:
+    """Standard CVSS v3 qualitative severity bands — cases.cvss_max stores
+    only the numeric max (a single label doesn't cleanly aggregate across
+    multiple CVEs with different severities), so the label is derived here
+    for display rather than persisted."""
+    if score >= 9.0:
+        return "Critical"
+    if score >= 7.0:
+        return "High"
+    if score >= 4.0:
+        return "Medium"
+    if score > 0.0:
+        return "Low"
+    return "None"
+
+
 def _case_to_markdown(case: dict, items: list[dict], research_runs: list[dict], related: list[dict]) -> str:
     lines = [f"# {_escape_markdown(case['title'])}", ""]
     lines.append(f"- **Significance:** {case.get('significance', 'unknown')}")
@@ -755,6 +776,15 @@ def _case_to_markdown(case: dict, items: list[dict], research_runs: list[dict], 
     lines.append(f"- **Sources:** {case.get('source_count', 0)}")
     if case.get("cve_ids"):
         lines.append(f"- **CVEs:** {', '.join(_escape_markdown(c) for c in case['cve_ids'])}")
+    if case.get("cvss_max") is not None:
+        severity = _cvss_severity_label(case["cvss_max"])
+        lines.append(f"- **CVSS (max):** {case['cvss_max']} ({severity})")
+    if case.get("epss_max") is not None:
+        lines.append(f"- **EPSS (max):** {case['epss_max']}")
+    if case.get("cwe_ids"):
+        lines.append(f"- **CWE:** {', '.join(_escape_markdown(c) for c in case['cwe_ids'])}")
+    if case.get("mitre_techniques"):
+        lines.append(f"- **MITRE ATT&CK:** {', '.join(_escape_markdown(t) for t in case['mitre_techniques'])}")
     lines.append("")
 
     if case.get("summary"):

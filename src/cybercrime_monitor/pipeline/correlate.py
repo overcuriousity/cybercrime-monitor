@@ -27,8 +27,10 @@ from .. import db
 from .. import significance as sig
 from ..api.sse import broadcaster
 from ..enrich import cve as cve_enrich
+from ..enrich import cve_meta as cve_meta_enrich
 from ..enrich import ioc as ioc_enrich
 from ..enrich import kev as kev_enrich
+from ..enrich import mitre as mitre_enrich
 from ..llm import backend as llm_backend
 from ..settings import settings
 
@@ -166,6 +168,27 @@ async def _resolve_cve_kev(db_conn, item: dict) -> tuple[list[str], bool]:
     return all_cves, bool(kev_hits)
 
 
+async def _resolve_cve_meta(db_conn, cve_ids: list[str]) -> tuple[float | None, list[str], float | None]:
+    """CVSS/CWE/EPSS for this item's CVEs (issue #18) — deterministic,
+    token-free HTTP enrichment via enrich/cve_meta.py, cached per-CVE.
+    Returns (cvss_max, cwe_ids, epss_max) across all of `cve_ids`; values are
+    None/[] when there's nothing cached yet (e.g. a brand-new CVE whose
+    lookup is still pending — see get_or_fetch's per-call fetch cap)."""
+    if not cve_ids:
+        return None, [], None
+    meta = await cve_meta_enrich.get_or_fetch(db_conn, cve_ids)
+    scores = [m["cvss_score"] for m in meta.values() if m.get("cvss_score") is not None]
+    epss = [m["epss"] for m in meta.values() if m.get("epss") is not None]
+    cwe_ids = list(dict.fromkeys(c for m in meta.values() for c in (m.get("cwe_ids") or [])))
+    return (max(scores) if scores else None, cwe_ids, max(epss) if epss else None)
+
+
+def _resolve_mitre(item: dict) -> list[str]:
+    """ATT&CK technique IDs mentioned in this item's text (issue #18) —
+    deterministic regex backstop, same reasoning as _resolve_iocs."""
+    return mitre_enrich.extract_mitre_ids(item.get("title", ""), item.get("snippet", ""))
+
+
 def _resolve_iocs(item: dict) -> list[str]:
     """LLM-extracted iocs unioned with a deterministic regex backstop over
     title+snippet — same don't-trust-one-source-alone reasoning as
@@ -206,6 +229,8 @@ async def run_correlation_batch(db_conn) -> int:
 
 async def _correlate_one(db_conn, item: dict) -> None:
     cve_ids, in_kev = await _resolve_cve_kev(db_conn, item)
+    cvss_max, cwe_ids, epss_max = await _resolve_cve_meta(db_conn, cve_ids)
+    mitre_techniques = _resolve_mitre(item)
     case_key = _case_key_for(item)
 
     iocs = _resolve_iocs(item)
@@ -231,10 +256,17 @@ async def _correlate_one(db_conn, item: dict) -> None:
             damaged_party_country=item.get("victim_country"),
             event_at=event_at,
             iocs=iocs,
+            cvss_max=cvss_max,
+            cwe_ids=cwe_ids,
+            epss_max=epss_max,
+            mitre_techniques=mitre_techniques,
         )
         return
 
-    merged = await _try_fuzzy_merge(db_conn, item, cve_ids=cve_ids, in_kev=in_kev, event_at=event_at, iocs=iocs)
+    merged = await _try_fuzzy_merge(
+        db_conn, item, cve_ids=cve_ids, in_kev=in_kev, event_at=event_at, iocs=iocs,
+        cvss_max=cvss_max, cwe_ids=cwe_ids, epss_max=epss_max, mitre_techniques=mitre_techniques,
+    )
     if merged:
         return
 
@@ -257,6 +289,10 @@ async def _correlate_one(db_conn, item: dict) -> None:
         item_id=item["id"],
         event_at=event_at,
         iocs=iocs,
+        cvss_max=cvss_max,
+        cwe_ids=cwe_ids,
+        epss_max=epss_max,
+        mitre_techniques=mitre_techniques,
     )
     await _log_activity(
         db_conn, action="case_created",
@@ -270,7 +306,9 @@ async def _correlate_one(db_conn, item: dict) -> None:
 
 
 async def _try_fuzzy_merge(
-    db_conn, item: dict, *, cve_ids: list[str], in_kev: bool, event_at: str, iocs: list[str]
+    db_conn, item: dict, *, cve_ids: list[str], in_kev: bool, event_at: str, iocs: list[str],
+    cvss_max: float | None = None, cwe_ids: list[str] | None = None,
+    epss_max: float | None = None, mitre_techniques: list[str] | None = None,
 ) -> bool:
     since_iso = (datetime.now(timezone.utc) - timedelta(days=_CANDIDATE_WINDOW_DAYS)).isoformat()
     candidates = await db.find_candidate_cases(
@@ -313,6 +351,10 @@ async def _try_fuzzy_merge(
                 damaged_party_country=item.get("victim_country"),
                 event_at=event_at,
                 iocs=iocs,
+                cvss_max=cvss_max,
+                cwe_ids=cwe_ids,
+                epss_max=epss_max,
+                mitre_techniques=mitre_techniques,
             )
             await _log_activity(
                 db_conn, action="item_merged",

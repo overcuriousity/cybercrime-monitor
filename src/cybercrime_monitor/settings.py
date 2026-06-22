@@ -301,6 +301,36 @@ class Settings(BaseSettings):
     )
     kev_refresh_interval_seconds: int = 86400
 
+    # CVE metadata (CVSS/CWE) enrichment — see enrich/cve_meta.py. Token-free,
+    # deterministic HTTP enrichment (issue #18), cached per-CVE in the
+    # cve_meta table. Defaults to NVD's public API (no account required); set
+    # cve_meta_base_url to a self-hosted or OpenCVE-compatible instance (same
+    # query-by-cveId contract) to use that instead. cve_meta_api_key is
+    # optional — NVD allows unauthenticated use at a lower rate limit (5
+    # req/30s vs 50 req/30s with a free API key).
+    cve_meta_base_url: str = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+    cve_meta_api_key: str = ""
+    # How long a cached cve_meta row is trusted before being re-fetched. CVSS/
+    # CWE rarely change once published, so a week-long cache is plenty fresh
+    # without re-hitting the API for every correlation tick that sees the
+    # same recurring CVE (e.g. a widely-exploited one mentioned in many items).
+    cve_meta_cache_ttl_hours: int = 168
+    # Bounds how many missing-or-stale CVEs a single correlation call will
+    # fetch/refresh metadata for (see enrich/cve_meta.get_or_fetch) — keeps
+    # pipeline/correlate.py's per-item latency bounded even when an item
+    # mentions many CVEs at once. A CVE that's already cached but didn't win
+    # a fetch slot is still returned with its last-known (possibly stale)
+    # values (stale-while-revalidate); only a CVE that's never been cached
+    # AND beyond the cap is absent this round, picking up its metadata next
+    # time it's seen (e.g. the next corroborating item).
+    cve_meta_fetch_limit_per_call: int = 5
+    # FIRST.org EPSS (Exploit Prediction Scoring System) — free, no auth,
+    # supports batched lookups (unlike NVD's per-CVE contract) so it's fetched
+    # alongside cve_meta in the same pass. Set epss_enabled=False to skip it
+    # entirely (e.g. fully offline deployments).
+    epss_enabled: bool = True
+    epss_base_url: str = "https://api.first.org/data/v1/epss"
+
     # Items older than this are pruned (see db.py:prune_old_items, wired as a
     # daily job in scheduler.py) to keep the DB from growing unbounded.
     # Effective-critical cases/items are NEVER pruned regardless of age.
