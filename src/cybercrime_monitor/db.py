@@ -8,6 +8,7 @@ from typing import AsyncIterator
 
 import aiosqlite
 
+from .country import normalize_country
 from .models import Item
 from .settings import settings
 
@@ -464,6 +465,40 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         if col not in inv_cols:
             await conn.execute(ddl)
             log.info("Migrated investigations table: added %s column", col)
+
+    await _migrate_normalize_countries(conn)
+
+
+async def _migrate_normalize_countries(conn: aiosqlite.Connection) -> None:
+    """One-time retrograde backfill: rewrite damaged_party_country/
+    victim_country to canonical ISO alpha-2 codes (see country.py). Values
+    came from free-form LLM extraction before write-side normalization was
+    added (upsert_extraction/create_case/merge_item_into_case), so existing
+    rows may hold full names ("Germany") instead of codes ("DE"). Gated by
+    PRAGMA user_version so this only runs once per DB rather than re-scanning
+    on every startup."""
+    version_row = await conn.execute_fetchall("PRAGMA user_version")
+    if (version_row[0][0] if version_row else 0) >= 1:
+        return
+
+    rewritten = 0
+    for table, column in (("cases", "damaged_party_country"), ("extractions", "victim_country")):
+        rows = await conn.execute_fetchall(
+            f"SELECT DISTINCT {column} AS v FROM {table} WHERE {column} IS NOT NULL AND TRIM({column}) != ''"
+        )
+        for r in rows:
+            old = r["v"]
+            new = normalize_country(old)
+            if new and new != old:
+                await conn.execute(
+                    f"UPDATE {table} SET {column} = :new WHERE {column} = :old",
+                    {"new": new, "old": old},
+                )
+                rewritten += 1
+
+    await conn.execute("PRAGMA user_version = 1")
+    if rewritten:
+        log.info("Migrated country values: normalized %d distinct value(s) to ISO alpha-2", rewritten)
 
 async def insert_item(conn: aiosqlite.Connection, item: Item) -> int | None:
     """Insert item; returns new row id or None if duplicate. Deliberately
@@ -1010,7 +1045,7 @@ async def upsert_extraction(
             "crime_type": crime_type,
             "victim": victim,
             "victim_sector": victim_sector,
-            "victim_country": victim_country,
+            "victim_country": normalize_country(victim_country),
             "actor": actor,
             "cve_ids": json.dumps(cve_ids),
             "iocs": json.dumps(iocs),
@@ -1521,7 +1556,7 @@ async def create_case(
             "attribution_confidence": attribution_confidence,
             "damaged_party": damaged_party,
             "damaged_party_sector": damaged_party_sector,
-            "damaged_party_country": damaged_party_country,
+            "damaged_party_country": normalize_country(damaged_party_country),
             "significance": significance,
             "significance_score": significance_score,
             "cve_ids": json.dumps(cve_ids),
@@ -1625,7 +1660,7 @@ async def merge_item_into_case(
             "attribution": attribution,
             "attribution_confidence": attribution_confidence,
             "damaged_party_sector": damaged_party_sector,
-            "damaged_party_country": damaged_party_country,
+            "damaged_party_country": normalize_country(damaged_party_country),
             "event_at": event_at,
             "source_count": source_count,
         },
@@ -1770,6 +1805,7 @@ def _build_cases_where(
     ioc: str | None = None,
     since: str | None = None,
     until: str | None = None,
+    country: str | None = None,
     id_in: list[int] | None = None,
 ) -> tuple[str, dict]:
     parts = []
@@ -1807,6 +1843,12 @@ def _build_cases_where(
     if until:
         parts.append("last_seen <= :until")
         params["until"] = until
+    if country:
+        # Accepts either a code or a free-form name — normalize so
+        # ?country=Germany and ?country=DE both match the canonical
+        # alpha-2 codes stored in damaged_party_country.
+        parts.append("damaged_party_country = :country")
+        params["country"] = normalize_country(country) or country
     if id_in is not None:
         # Semantic search mode — see _build_items_where's id_in for the
         # same pattern: scope to the vector-search candidate set, let every
@@ -1836,6 +1878,7 @@ async def fetch_cases(
     ioc: str | None = None,
     since: str | None = None,
     until: str | None = None,
+    country: str | None = None,
     id_in: list[int] | None = None,
 ) -> list[dict]:
     """Case-centric counterpart to fetch_items — see that function's
@@ -1844,10 +1887,12 @@ async def fetch_cases(
     investigator can land on a case from an indicator alone. `since`/`until`
     bound on last_seen — a timeframe search ("what happened last week").
     `cve_id`/`ioc` back the case detail pane's indicator-pivot chips (click
-    a CVE/IoC -> every case sharing it)."""
+    a CVE/IoC -> every case sharing it). `country` narrows to a single
+    victim country (the Cases-tab map's click-to-filter)."""
     where, params = _build_cases_where(
         min_significance=min_significance, crime_type=crime_type, in_kev=in_kev,
-        search=search, cve_id=cve_id, ioc=ioc, since=since, until=until, id_in=id_in,
+        search=search, cve_id=cve_id, ioc=ioc, since=since, until=until,
+        country=country, id_in=id_in,
     )
     rows = await conn.execute_fetchall(
         f"""
@@ -1880,13 +1925,14 @@ async def count_cases(
     ioc: str | None = None,
     since: str | None = None,
     until: str | None = None,
+    country: str | None = None,
 ) -> int:
     """Landscape's "cases opened in window" count (first_seen-based via
     since_iso) can be combined with the same last_seen filters used by
     fetch_cases so callers always get a consistent, filter-aware total."""
     where, params = _build_cases_where(
         min_significance=min_significance, crime_type=crime_type, in_kev=in_kev,
-        search=search, cve_id=cve_id, ioc=ioc, since=since, until=until,
+        search=search, cve_id=cve_id, ioc=ioc, since=since, until=until, country=country,
     )
     if since_iso:
         if where:
@@ -2798,7 +2844,7 @@ async def stats_cases_by_sector(conn: aiosqlite.Connection, *, since_iso: str | 
 
 
 async def stats_cases_by_country(conn: aiosqlite.Connection, *, since_iso: str | None = None) -> list[dict]:
-    where = "WHERE c.damaged_party_country IS NOT NULL AND c.damaged_party_country != ''"
+    where = "WHERE c.damaged_party_country IS NOT NULL AND TRIM(c.damaged_party_country) != ''"
     params: dict = {}
     if since_iso:
         where += " AND c.first_seen >= :since"
@@ -2806,6 +2852,48 @@ async def stats_cases_by_country(conn: aiosqlite.Connection, *, since_iso: str |
     sql = _build_casefold_leaderboard_sql("damaged_party_country", where=where)
     rows = await conn.execute_fetchall(sql, params)
     return [{"country": r["value"], "n": r["n"]} for r in rows]
+
+
+async def cases_country_counts(
+    conn: aiosqlite.Connection,
+    *,
+    min_significance: str | None = None,
+    crime_type: str | None = None,
+    in_kev: bool | None = None,
+    search: str | None = None,
+    cve_id: str | None = None,
+    ioc: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    id_in: list[int] | None = None,
+) -> list[dict]:
+    """Per-country case counts honoring the same Cases-tab filters as
+    fetch_cases (last_seen-based since/until, not Landscape's first_seen
+    window) — backs the Cases tab's victim-country dropdown. Deliberately
+    has no `country` parameter, unlike fetch_cases: this *is* the
+    country breakdown, so filtering it down to one already-selected
+    country would collapse the dropdown to a single option. Values are
+    normalized ISO alpha-2 codes (see country.py), so a plain GROUP BY is
+    enough — no casefold leaderboard needed here. `id_in` scopes to a
+    semantic-search candidate set, mirroring fetch_cases' same parameter."""
+    where, params = _build_cases_where(
+        min_significance=min_significance, crime_type=crime_type, in_kev=in_kev,
+        search=search, cve_id=cve_id, ioc=ioc, since=since, until=until,
+        id_in=id_in,
+    )
+    country_clause = "damaged_party_country IS NOT NULL AND TRIM(damaged_party_country) != ''"
+    where = f"{where} AND {country_clause}" if where else f"WHERE {country_clause}"
+    rows = await conn.execute_fetchall(
+        f"""
+        SELECT damaged_party_country AS country, COUNT(*) AS n
+        FROM cases
+        {where}
+        GROUP BY damaged_party_country
+        ORDER BY n DESC
+        """,
+        params,
+    )
+    return [{"country": r["country"], "n": r["n"]} for r in rows]
 
 
 async def stats_cases_timeseries(

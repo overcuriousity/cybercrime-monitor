@@ -137,3 +137,7 @@ systemctl --user enable --now cybercrime-monitor.service
 ## License
 
 MIT
+
+`src/cybercrime_monitor/api/static/world.svg` is vendored from
+[flekschas/simple-world-map](https://github.com/flekschas/simple-world-map)
+(Author: Al MacDonald, Editor: Fritz Lekschas), licensed CC BY-SA 3.0.

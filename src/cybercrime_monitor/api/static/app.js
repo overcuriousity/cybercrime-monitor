@@ -1129,6 +1129,8 @@ const ACTOR_BAR_COLOR = '#c77dff';
 
 const landscapeWindowSelect = document.getElementById('landscape-window-select');
 const landscapeExportBtn = document.getElementById('landscape-export-btn');
+const landscapeMapEl = document.getElementById('landscape-map');
+const landscapeMapLegendEl = document.getElementById('landscape-map-legend');
 const actorProfileOverlay = document.getElementById('actor-profile-overlay');
 const actorProfileContent = document.getElementById('actor-profile-content');
 const actorProfileClose = document.getElementById('actor-profile-close');
@@ -1179,6 +1181,7 @@ async function loadLandscape() {
     renderLandscapeCountry(stats.by_country);
     renderLandscapeSector(stats.by_sector);
     renderLandscapeActors(stats.by_actor);
+    renderLandscapeMap(stats.by_country);
     renderEmergingPanels();
   } catch (e) {
     console.error('Failed to load landscape', e);
@@ -1508,7 +1511,7 @@ const casesState = {
   pageSize: 50,
   hasMore: false,
   selectedId: null,
-  filters: { search: '', searchMode: 'keyword', significance: '', kevOnly: false, crimeType: '', since: '', until: '', cveId: '', ioc: '' },
+  filters: { search: '', searchMode: 'keyword', significance: '', kevOnly: false, crimeType: '', since: '', until: '', cveId: '', ioc: '', country: '' },
 };
 const CASE_FILTERS_DEFAULT = { ...casesState.filters };
 
@@ -1521,11 +1524,30 @@ const caseSearchModeHint   = document.getElementById('case-search-mode-hint');
 const caseKevOnlyCb    = document.getElementById('case-kev-only');
 const caseSignificanceSelect = document.getElementById('case-significance-select');
 const caseCrimeTypeSelect    = document.getElementById('case-crime-type-select');
+const caseCountrySelect      = document.getElementById('case-country-select');
 const caseSinceInput   = document.getElementById('case-since-input');
 const caseUntilInput   = document.getElementById('case-until-input');
 const caseFiltersClear = document.getElementById('case-filters-clear');
 const caseDetailPane   = document.getElementById('case-detail');
 const caseDetailEmpty  = document.getElementById('case-detail-empty');
+
+// Native, zero-data country-code -> English-name lookup (avoids shipping a
+// second name table alongside country.py's server-side one).
+const countryDisplayNames = (() => {
+  try {
+    return new Intl.DisplayNames(['en'], { type: 'region' });
+  } catch (e) {
+    return null;
+  }
+})();
+function countryLabel(code) {
+  if (!code) return code;
+  try {
+    return (countryDisplayNames && countryDisplayNames.of(code)) || code;
+  } catch (e) {
+    return code;
+  }
+}
 
 function initCases() {
   caseSearchInput.addEventListener('input', debounce(() => {
@@ -1544,6 +1566,10 @@ function initCases() {
     casesState.filters.crimeType = caseCrimeTypeSelect.value;
     applyCaseFilters();
   });
+  caseCountrySelect.addEventListener('change', () => {
+    casesState.filters.country = caseCountrySelect.value;
+    applyCaseFilters();
+  });
   caseSinceInput.addEventListener('change', () => {
     casesState.filters.since = caseSinceInput.value;
     applyCaseFilters();
@@ -1558,6 +1584,7 @@ function initCases() {
     caseKevOnlyCb.checked = false;
     caseSignificanceSelect.value = '';
     caseCrimeTypeSelect.value = '';
+    caseCountrySelect.value = '';
     caseSinceInput.value = '';
     caseUntilInput.value = '';
     syncSearchModeToggle(caseSearchModeToggle, casesState.filters.searchMode);
@@ -1589,6 +1616,7 @@ function caseQueryParams(extra = {}) {
   if (casesState.filters.significance) params.set('min_significance', casesState.filters.significance);
   if (casesState.filters.kevOnly) params.set('in_kev', 'true');
   if (casesState.filters.crimeType) params.set('crime_type', casesState.filters.crimeType);
+  if (casesState.filters.country) params.set('country', casesState.filters.country);
   if (casesState.filters.since) params.set('since', casesState.filters.since);
   if (casesState.filters.until) params.set('until', casesState.filters.until);
   if (casesState.filters.cveId) params.set('cve_id', casesState.filters.cveId);
@@ -1607,6 +1635,7 @@ function pivotCasesByIndicator(kind, value) {
   caseKevOnlyCb.checked = false;
   caseSignificanceSelect.value = '';
   caseCrimeTypeSelect.value = '';
+  caseCountrySelect.value = '';
   caseSinceInput.value = '';
   caseUntilInput.value = '';
   syncSearchModeToggle(caseSearchModeToggle, casesState.filters.searchMode);
@@ -1636,6 +1665,7 @@ async function applyCaseFilters() {
     casesState.cases = data.cases;
     casesState.hasMore = data.cases.length === casesState.pageSize && data.total > casesState.pageSize;
     renderCasesList();
+    loadCaseCountryOptions();
   } catch (e) {
     console.error('Failed to load cases', e);
   }
@@ -1690,6 +1720,147 @@ function populateFeedCrimeTypeDropdown(byCrimeType) {
     crimeTypeInput.appendChild(opt);
   });
   crimeTypeInput.value = current || '';
+}
+
+// ── Cases country dropdown ──────────────────────────────────────────────
+// The Cases tab keeps only the <select> filter; the choropleth map itself
+// now lives on the Landscape tab (see "Landscape world map" below).
+async function loadCaseCountryOptions() {
+  try {
+    const data = await api('/api/cases/by-country?' + caseQueryParams());
+    const counts = {};
+    (data.by_country || []).forEach(({ country, n }) => { counts[country] = n; });
+    populateCaseCountrySelect(counts);
+  } catch (e) {
+    console.error('Failed to load case country counts', e);
+  }
+}
+
+function populateCaseCountrySelect(counts) {
+  const current = casesState.filters.country;
+  const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  // Keep the active filter selectable even if it now matches zero cases
+  // (e.g. combined with a search term) — otherwise the <select> silently
+  // resets to "All countries" while casesState.filters.country is still set.
+  if (current && !(current in counts)) entries.unshift([current, 0]);
+  caseCountrySelect.innerHTML = '<option value="">All countries</option>';
+  entries.forEach(([code, n]) => {
+    const opt = document.createElement('option');
+    opt.value = code;
+    opt.textContent = `${countryLabel(code)} (${n})`;
+    caseCountrySelect.appendChild(opt);
+  });
+  caseCountrySelect.value = current || '';
+}
+
+// Jump to the Cases tab filtered to a single victim country — used by the
+// Landscape map's click-to-filter below.
+function pivotCasesByCountry(code) {
+  casesState.filters = { ...CASE_FILTERS_DEFAULT, country: code };
+  caseSearchInput.value = '';
+  caseKevOnlyCb.checked = false;
+  caseSignificanceSelect.value = '';
+  caseCrimeTypeSelect.value = '';
+  caseSinceInput.value = '';
+  caseUntilInput.value = '';
+  syncSearchModeToggle(caseSearchModeToggle, casesState.filters.searchMode);
+  caseSearchModeHint.classList.add('hidden');
+  updateIndicatorPivotBanner();
+  document.querySelector('.tab[data-tab="cases"]').click();
+  applyCaseFilters();
+}
+
+// ── Landscape world map ──────────────────────────────────────────────────
+// Vendored inline SVG (see static/world.svg, CC BY-SA 3.0 — credited in
+// index.html) with <path id="xx">/<g id="xx"> keyed by lowercase ISO 3166-1
+// alpha-2, matching the canonical codes country.py normalizes into
+// damaged_party_country. Choropleth buckets are plain CSS classes toggled
+// on those shapes — no charting/map library needed, consistent with the
+// rest of this vanilla-JS app. Counts come from the same /api/stats/cases
+// by_country breakdown that already feeds the "Victims by country" bar
+// chart, so the map honors the Landscape window filter automatically.
+// Clicking a country jumps to the Cases tab filtered to it (see
+// pivotCasesByCountry above) rather than filtering in place.
+let landscapeMapSvgPromise = null;
+const LANDSCAPE_MAP_BUCKETS = 4;
+let landscapeMapCounts = {};
+
+function ensureLandscapeMapSvg() {
+  if (!landscapeMapSvgPromise) {
+    landscapeMapSvgPromise = fetch('/world.svg')
+      .then(r => r.text())
+      .then(svgText => {
+        landscapeMapEl.innerHTML = svgText;
+        const svg = landscapeMapEl.querySelector('svg');
+        if (svg) {
+          svg.removeAttribute('width');
+          svg.removeAttribute('height');
+          svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+        }
+        landscapeMapEl.addEventListener('click', onLandscapeMapClick);
+      })
+      .catch(e => console.error('Failed to load world map', e));
+  }
+  return landscapeMapSvgPromise;
+}
+
+function onLandscapeMapClick(e) {
+  const el = e.target.closest('path[id], g[id]');
+  if (!el) return;
+  const code = el.id.toUpperCase();
+  if (code.length !== 2) return; // skip non-ISO "_named" territories
+  if (!landscapeMapCounts[code]) return;
+  pivotCasesByCountry(code);
+}
+
+async function renderLandscapeMap(byCountry) {
+  const counts = {};
+  (byCountry || []).forEach(({ country, n }) => { counts[country] = n; });
+  landscapeMapCounts = counts;
+  await ensureLandscapeMapSvg();
+  const svg = landscapeMapEl.querySelector('svg');
+  if (!svg) return;
+  const max = Math.max(0, ...Object.values(counts));
+
+  svg.querySelectorAll('path[id], g[id]').forEach(el => {
+    const code = el.id.toUpperCase();
+    if (code.length !== 2) return; // skip non-ISO "_named" territories
+    // Some countries (e.g. AU/CA/CN/US) are <g id="xx"> groups of multiple
+    // child <path>s rather than a single <path id="xx">; style every child
+    // path so the whole country gets colored/hover-highlighted consistently.
+    const paths = el.tagName.toLowerCase() === 'path' ? [el] : Array.from(el.querySelectorAll('path'));
+    paths.forEach(path => path.classList.remove('q0', 'q1', 'q2', 'q3', 'q4'));
+    const n = counts[code] || 0;
+    const bucket = n === 0 ? 0 : Math.min(LANDSCAPE_MAP_BUCKETS, Math.ceil((n / max) * LANDSCAPE_MAP_BUCKETS));
+    const title = el.querySelector(':scope > title');
+    if (n > 0) {
+      paths.forEach(path => path.classList.add('q' + bucket));
+      const t = title || el.appendChild(document.createElementNS('http://www.w3.org/2000/svg', 'title'));
+      t.textContent = `${countryLabel(code)} — ${n} case${n === 1 ? '' : 's'}`;
+    } else {
+      paths.forEach(path => path.classList.add('q' + bucket));
+      if (title) title.remove();
+    }
+  });
+
+  renderLandscapeMapLegend(max);
+}
+
+function renderLandscapeMapLegend(max) {
+  landscapeMapLegendEl.innerHTML = '';
+  if (max === 0) return;
+  const swatches = [0, 1, 2, 3, 4];
+  swatches.forEach(bucket => {
+    const item = document.createElement('span');
+    item.className = 'case-map-legend-item';
+    const swatch = document.createElement('span');
+    swatch.className = 'case-map-legend-swatch q' + bucket;
+    item.appendChild(swatch);
+    const label = document.createElement('span');
+    label.textContent = bucket === 0 ? '0' : Math.ceil((bucket / LANDSCAPE_MAP_BUCKETS) * max);
+    item.appendChild(label);
+    landscapeMapLegendEl.appendChild(item);
+  });
 }
 
 function renderCasesList() {
