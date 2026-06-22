@@ -100,8 +100,9 @@ async def _log_activity(
 
 _EVALUATE_PROMPT_TEMPLATE = """\
 You are reviewing a cybercrime intelligence case the way a human analyst \
-would when triaging incoming reports. Below is a case and every item \
-(article/post/feed entry) that was linked to it. For EACH item, judge \
+would when triaging incoming reports. Below is a case and a batch of items \
+(article/post/feed entry) linked to it — possibly a subset if the case has \
+many items. For EACH item, judge \
 whether it is genuinely useful, on-topic, real information about this \
 case — exactly as a human analyst clicking a "useful" / "noise" feedback \
 button would.

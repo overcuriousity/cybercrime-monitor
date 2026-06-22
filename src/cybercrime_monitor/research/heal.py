@@ -438,7 +438,13 @@ async def _convergence_prune(
     first; under-represented/darknet sources naturally float clear of the
     cut. No separate "last of its bucket" guard — diversity is a scoring
     nudge here, not a hard rule (matches research/discover.py's symmetric
-    steer on the add side)."""
+    steer on the add side).
+
+    Only sources with a cached value AND _min_history are rankable — a
+    source with no track record yet shouldn't be killed just because it's
+    untested, so it's left alone here. If too many enabled sources are
+    still too new to rank, this pass prunes as many as it safely can and
+    the rest converges on a later tick once they've earned an opinion."""
     enabled = [
         s for sid, s in sources_by_id.items()
         if sid not in already_disabled and s.get("enabled", True)
@@ -449,7 +455,7 @@ async def _convergence_prune(
 
     ranked = sorted(
         (
-            (sid, values[sid]["score"])
+            (sid, values[sid].get("score", 0.0))
             for sid in (s["id"] for s in enabled)
             if values.get(sid) is not None and _min_history(sid)
         ),

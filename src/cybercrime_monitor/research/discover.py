@@ -284,6 +284,8 @@ def _discover_batch_size(existing: list[dict]) -> int:
     source via convergence pruning (research/heal.py), rather than freezing
     the corpus solid once it hits the number."""
     enabled_count = sum(1 for s in existing if s.get("enabled", True))
+    if enabled_count >= settings.source_target_count + settings.source_target_band:
+        return 0
     gap = settings.source_target_count - enabled_count
     if gap >= settings.source_target_band:
         return min(5, max(1, gap))
@@ -304,6 +306,9 @@ async def run_discover_batch(db_conn, scheduler=None, sse_broadcaster=None) -> i
     try:
         existing = load_sources()
         batch_size = _discover_batch_size(existing)
+        if batch_size == 0:
+            record_success(0)
+            return 0
         prompt = _DISCOVER_PROMPT_TEMPLATE.format(
             topics=await _topics(db_conn),
             existing_domains=", ".join(sorted(_existing_domains(existing))) or "none",

@@ -1084,8 +1084,8 @@ async def api_investigation_detail(investigation_id: int, db=Depends(get_db)):
 
 # ── AI activity log ───────────────────────────────────────────────────────────
 # Deliberately public, no admin token — every subsystem here (discover/heal/
-# prune/research/classifier/correlator/cross_correlator) already acts fully
-# autonomously with no human approval gate; this is the transparency
+# prune/research/classify/classifier/correlator/cross_correlator/evaluator)
+# already acts fully autonomously with no human approval gate; this is the transparency
 # counterpart, not an admin control surface. See db.py's ai_activity table
 # docstring and db.log_ai_activity.
 
