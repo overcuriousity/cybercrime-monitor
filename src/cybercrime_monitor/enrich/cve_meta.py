@@ -30,7 +30,7 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _is_stale(fetched_at: str, *, now: datetime) -> bool:
+def _is_stale(fetched_at: str | None, *, now: datetime) -> bool:
     try:
         fetched = datetime.fromisoformat(fetched_at)
     except (TypeError, ValueError):
@@ -108,12 +108,21 @@ async def _fetch_epss(client, cve_ids: list[str]) -> dict[str, float]:
 
 
 async def get_or_fetch(db_conn, cve_ids: list[str]) -> dict[str, dict]:
-    """Cached metadata for the given CVE ids, fetching whatever's missing or
-    stale (bounded to settings.cve_meta_fetch_limit_per_call new lookups per
-    call — see that setting's docstring). Returns a dict keyed by cve_id;
-    CVEs beyond the per-call cap, or whose fetch failed, are simply absent
-    this round and pick up their metadata next time they're seen (e.g. the
-    next corroborating item)."""
+    """Cached metadata for the given CVE ids. Of the CVEs that are missing
+    or stale, up to settings.cve_meta_fetch_limit_per_call are fetched and
+    (re)cached this call — see that setting's docstring for why this is
+    bounded. Returns a dict keyed by cve_id.
+
+    Stale-while-revalidate, not strict TTL: a CVE that's cached but past its
+    TTL and didn't win a fetch slot this call is still returned with its
+    last-known (stale) values, rather than being dropped — for a slowly-
+    changing field like CVSS this is far preferable to a case's cvss_max
+    flickering to a lower/None value purely because of cache aging under
+    fetch-cap pressure. It will be refreshed on a later call once it gets a
+    slot. A CVE that has *never* been fetched and is also beyond this call's
+    cap is simply absent from the result and picks up its metadata next time
+    it's seen (e.g. the next corroborating item) — there's no stale value to
+    fall back to yet."""
     if not cve_ids:
         return {}
 

@@ -315,11 +315,14 @@ class Settings(BaseSettings):
     # without re-hitting the API for every correlation tick that sees the
     # same recurring CVE (e.g. a widely-exploited one mentioned in many items).
     cve_meta_cache_ttl_hours: int = 168
-    # Bounds how many *new* (uncached) CVEs a single correlation call will
-    # fetch metadata for — keeps pipeline/correlate.py's per-item latency
-    # bounded even when an item mentions many CVEs at once; any beyond the
-    # cap simply pick up their metadata next time they're seen (e.g. the next
-    # corroborating item, or a later pass once cached).
+    # Bounds how many missing-or-stale CVEs a single correlation call will
+    # fetch/refresh metadata for (see enrich/cve_meta.get_or_fetch) — keeps
+    # pipeline/correlate.py's per-item latency bounded even when an item
+    # mentions many CVEs at once. A CVE that's already cached but didn't win
+    # a fetch slot is still returned with its last-known (possibly stale)
+    # values (stale-while-revalidate); only a CVE that's never been cached
+    # AND beyond the cap is absent this round, picking up its metadata next
+    # time it's seen (e.g. the next corroborating item).
     cve_meta_fetch_limit_per_call: int = 5
     # FIRST.org EPSS (Exploit Prediction Scoring System) — free, no auth,
     # supports batched lookups (unlike NVD's per-CVE contract) so it's fetched

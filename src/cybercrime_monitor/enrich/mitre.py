@@ -7,9 +7,12 @@ enrich/ioc.py.
 """
 import re
 
-# ATT&CK (Enterprise + Mobile + ICS) technique IDs are all "T" followed by
-# 4 digits, with an optional ".NNN" sub-technique suffix (e.g. "T1059.001").
-# No upper bound enforced — MITRE periodically adds new top-level IDs.
+# ATT&CK technique IDs are "T" followed by 4 digits, with an optional
+# ".NNN" sub-technique suffix (e.g. "T1059.001"). Deliberately restricted to
+# the current T1xxx range (every published Enterprise/Mobile/ICS technique
+# ID as of this writing) rather than "T\d{4}", to avoid false-positive
+# matches on arbitrary "T####" tokens (order numbers, ticket IDs, etc.) in
+# free text. Widen this if/when MITRE ever publishes a T2xxx+ id.
 _MITRE_PATTERN = re.compile(r"\bT1\d{3}(?:\.\d{3})?\b", re.IGNORECASE)
 
 
@@ -30,7 +33,7 @@ def extract_mitre_ids(*texts: str) -> list[str]:
     return seen
 
 
-def merge_mitre_ids(*lists: list[str]) -> list[str]:
+def merge_mitre_ids(*lists: list[str] | None) -> list[str]:
     """Union multiple technique-id lists, normalized and deduplicated,
     first-seen order preserved — same convention as enrich/cve.merge_cve_ids."""
     seen: list[str] = []
