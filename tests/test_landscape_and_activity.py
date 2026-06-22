@@ -277,50 +277,130 @@ async def test_stats_trends_actor(db_conn):
     assert by_actor["ActorB"]["status"] == "declining"
 
 
+async def _add_run(conn, case_id: int, *, status: str, hours_ago: float):
+    run_id = await db_module.start_research_run(conn, case_id=case_id, model=None)
+    await conn.execute(
+        "UPDATE research_runs SET started_at = :ts WHERE id = :id",
+        {"ts": _iso(hours_ago / 24), "id": run_id},
+    )
+    await db_module.finish_research_run(
+        conn, run_id=run_id, status=status, findings={}, sources=[], error=None
+    )
+
+
 @pytest.mark.asyncio
-async def test_research_eligibility_uses_separate_cooldowns_for_completed_vs_failed(db_conn):
-    """A completed research run blocks natural re-research for the full
-    (24h-equivalent) cooldown; a failed run only blocks for the much
-    shorter failure cooldown — see db.get_cases_needing_research's
-    docstring and the 2026-06-21 production incident that motivated this
-    (a backend-side failure was locking cases out of research for a full
-    day with no answer ever produced)."""
-    completed_case = await _make_case(db_conn, significance="critical", title="completed 3h ago")
-    failed_recent_case = await _make_case(db_conn, significance="critical", title="failed 1h ago")
-    failed_stale_case = await _make_case(db_conn, significance="critical", title="failed 3h ago")
-    untouched_case = await _make_case(db_conn, significance="critical", title="never researched")
+async def test_research_eligibility_failure_retry_applies_across_levels(db_conn):
+    """A *failed* research run only blocks re-research for the much shorter
+    research_failure_retry_hours, regardless of significance level — see
+    db._research_eligibility_sql's docstring and the 2026-06-21 production
+    incident that motivated this (a backend-side failure was locking cases
+    out of research for a full cooldown with no answer ever produced)."""
+    failed_recent = await _make_case(db_conn, significance="critical", title="failed 1h ago")
+    failed_stale = await _make_case(db_conn, significance="critical", title="failed 3h ago")
 
-    async def _add_run(case_id: int, *, status: str, hours_ago: float):
-        run_id = await db_module.start_research_run(db_conn, case_id=case_id, model=None)
-        await db_conn.execute(
-            "UPDATE research_runs SET started_at = :ts WHERE id = :id",
-            {"ts": _iso(hours_ago / 24), "id": run_id},
-        )
-        await db_module.finish_research_run(
-            db_conn, run_id=run_id, status=status, findings={}, sources=[], error=None
-        )
+    await _add_run(db_conn, failed_recent, status="failed", hours_ago=1)
+    await _add_run(db_conn, failed_stale, status="failed", hours_ago=3)
 
-    await _add_run(completed_case, status="completed", hours_ago=3)
-    await _add_run(failed_recent_case, status="failed", hours_ago=1)
-    await _add_run(failed_stale_case, status="failed", hours_ago=3)
+    now = datetime.now(timezone.utc)  # default research_failure_retry_hours=2
+    eligible_ids = {c["id"] for c in await db_module.get_cases_needing_research(db_conn, limit=10, now=now)}
 
-    cooldown_iso = _iso(1)  # 24h-equivalent: anything from "1 day ago" onward is in-cooldown
-    failure_cooldown_iso = _iso(2 / 24)  # 2h failure cooldown
+    assert failed_recent not in eligible_ids  # within 2h failure cooldown -> blocked
+    assert failed_stale in eligible_ids  # past the 2h failure cooldown -> eligible
 
-    eligible = await db_module.get_cases_needing_research(
-        db_conn, limit=10, cooldown_iso=cooldown_iso, failure_cooldown_iso=failure_cooldown_iso
-    )
-    eligible_ids = {c["id"] for c in eligible}
 
-    assert completed_case not in eligible_ids  # completed 3h ago: still within 24h cooldown -> blocked
-    assert failed_recent_case not in eligible_ids  # failed 1h ago: still within 2h failure cooldown -> blocked
-    assert failed_stale_case in eligible_ids  # failed 3h ago: past the 2h failure cooldown -> eligible
-    assert untouched_case in eligible_ids  # never researched -> eligible
+@pytest.mark.asyncio
+async def test_research_eligibility_info_researched_exactly_once(db_conn):
+    """INFO cases are eligible iff they have zero completed runs ever — one
+    pass, then never again automatically (token-economy goal)."""
+    never_researched = await _make_case(db_conn, significance="info", title="fresh info")
+    completed_once = await _make_case(db_conn, significance="info", title="already researched")
+    failed_then_retryable = await _make_case(db_conn, significance="info", title="failed long ago")
 
-    count = await db_module.count_cases_needing_research(
-        db_conn, cooldown_iso=cooldown_iso, failure_cooldown_iso=failure_cooldown_iso
-    )
-    assert count == len(eligible_ids)
+    await _add_run(db_conn, completed_once, status="completed", hours_ago=100000)  # ages ago, still blocks
+    await _add_run(db_conn, failed_then_retryable, status="failed", hours_ago=100)  # past failure retry
+
+    now = datetime.now(timezone.utc)
+    eligible_ids = {c["id"] for c in await db_module.get_cases_needing_research(db_conn, limit=10, now=now)}
+
+    assert never_researched in eligible_ids
+    assert completed_once not in eligible_ids  # one completed run -> never again
+    assert failed_then_retryable in eligible_ids  # only a failure on record -> still eligible
+
+
+@pytest.mark.asyncio
+async def test_research_eligibility_warn_weekly_cadence(db_conn):
+    recent = await _make_case(db_conn, significance="warn", title="researched 3 days ago")
+    stale = await _make_case(db_conn, significance="warn", title="researched 8 days ago")
+
+    await _add_run(db_conn, recent, status="completed", hours_ago=3 * 24)
+    await _add_run(db_conn, stale, status="completed", hours_ago=8 * 24)
+
+    now = datetime.now(timezone.utc)  # default research_warn_interval_seconds=604800 (7d)
+    eligible_ids = {c["id"] for c in await db_module.get_cases_needing_research(db_conn, limit=10, now=now)}
+
+    assert recent not in eligible_ids
+    assert stale in eligible_ids
+
+
+@pytest.mark.asyncio
+async def test_research_eligibility_critical_daily_cadence(db_conn):
+    recent = await _make_case(db_conn, significance="critical", title="researched 12h ago")
+    stale = await _make_case(db_conn, significance="critical", title="researched 30h ago")
+
+    await _add_run(db_conn, recent, status="completed", hours_ago=12)
+    await _add_run(db_conn, stale, status="completed", hours_ago=30)
+
+    now = datetime.now(timezone.utc)  # default research_critical_interval_seconds=86400 (1d)
+    eligible_ids = {c["id"] for c in await db_module.get_cases_needing_research(db_conn, limit=10, now=now)}
+
+    assert recent not in eligible_ids
+    assert stale in eligible_ids
+
+
+@pytest.mark.asyncio
+async def test_research_eligibility_forced_bypasses_everything_and_sorts_first(db_conn):
+    blocked_critical = await _make_case(db_conn, significance="critical", title="researched 1h ago")
+    await _add_run(db_conn, blocked_critical, status="completed", hours_ago=1)
+    await db_module.request_case_research(db_conn, case_id=blocked_critical)
+
+    await _make_case(db_conn, significance="critical", title="never researched")
+
+    now = datetime.now(timezone.utc)
+    eligible = await db_module.get_cases_needing_research(db_conn, limit=10, now=now)
+    eligible_ids = [c["id"] for c in eligible]
+
+    assert blocked_critical in eligible_ids  # forced bypasses the daily cooldown
+    assert eligible_ids[0] == blocked_critical  # forced sorts first
+
+
+@pytest.mark.asyncio
+async def test_research_eligibility_orders_critical_before_warn_before_info(db_conn):
+    info_case = await _make_case(db_conn, significance="info", title="info", days_ago=3)
+    warn_case = await _make_case(db_conn, significance="warn", title="warn", days_ago=2)
+    critical_case = await _make_case(db_conn, significance="critical", title="critical", days_ago=1)
+
+    now = datetime.now(timezone.utc)
+    eligible = await db_module.get_cases_needing_research(db_conn, limit=10, now=now)
+    eligible_ids = [c["id"] for c in eligible]
+
+    assert eligible_ids.index(critical_case) < eligible_ids.index(warn_case) < eligible_ids.index(info_case)
+
+
+@pytest.mark.asyncio
+async def test_count_cases_needing_research_matches_get_for_same_now(db_conn):
+    """Drift canary: count_cases_needing_research must always agree with
+    len(get_cases_needing_research(...)) for the same `now` — they share
+    db._research_eligibility_sql by construction."""
+    await _make_case(db_conn, significance="critical", title="c1")
+    await _make_case(db_conn, significance="warn", title="c2")
+    await _make_case(db_conn, significance="info", title="c3")
+    blocked = await _make_case(db_conn, significance="info", title="c4 blocked")
+    await _add_run(db_conn, blocked, status="completed", hours_ago=1)
+
+    now = datetime.now(timezone.utc)
+    eligible = await db_module.get_cases_needing_research(db_conn, limit=100, now=now)
+    count = await db_module.count_cases_needing_research(db_conn, now=now)
+    assert count == len(eligible)
 
 
 # ── Route tests ─────────────────────────────────────────────────────────────
