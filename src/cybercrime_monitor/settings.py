@@ -82,6 +82,19 @@ class Settings(BaseSettings):
     # dedupes raw items into cases; this links already-distinct cases that
     # share victim/actor/CVE/IoC overlap, surfaced as "Related cases".
     cross_correlate_interval_seconds: int = 600
+    # Cross-correlation → escalation (quick win C2) — when a new high-score
+    # case_link attaches a case to a more-severe peer (confirmed status,
+    # critical significance, or in_kev), nudge the less-severe case toward
+    # research (db.nudge_case) and, optionally, bump its significance one
+    # rung. min_score is deliberately well above _MIN_LINK_SCORE (0.3) so a
+    # single weak link can't trigger escalation. The significance bump
+    # defaults off — boosting toward research is the conservative default;
+    # auto-raising significance is reversible (run_significance_decay) but
+    # still gated separately until proven out.
+    cross_correlate_escalation_enabled: bool = True
+    cross_correlate_escalation_min_score: float = 0.6
+    cross_correlate_escalation_boost: float = 2.0
+    cross_correlate_escalation_bump_enabled: bool = False
 
     # ── hermes-agent integration ────────────────────────────────────────────
     # hermes-agent (Nous Research's self-improving agent CLI — NOT the Hermes
@@ -164,6 +177,19 @@ class Settings(BaseSettings):
     # info matters most while a crime is still unfolding.
     research_critical_interval_seconds: int = 86400  # daily
     research_warn_interval_seconds: int = 604800  # weekly
+    # Generalized nudge primitive (agentic-coordination foundation F1, see
+    # db.nudge_case) — a backstop eligibility floor for cases.priority_boost
+    # in db._research_eligibility_sql, for nudgers that raise the boost
+    # without also forcing research_requested_at. Most current nudgers
+    # (cross-correlation escalation, feedback re-analysis) set both, so this
+    # floor is rarely the deciding factor — it's a safety net.
+    research_priority_boost_floor: float = 1.0
+    # Per-tick geometric decay applied to priority_boost on the
+    # significance-decay job's cadence (db._decay_priority_boost) — keeps an
+    # unconsumed nudge from pinning a case at the front of the research
+    # queue forever. 1.0 disables decay (boost only clears when research
+    # completes/fails the case).
+    priority_boost_decay_factor: float = 0.5
     # Mechanical staleness safety-net (db.run_significance_decay), independent
     # of any research pass: a case with no new corroborating item AND no
     # completed research run within this window is treated as no longer
@@ -210,6 +236,13 @@ class Settings(BaseSettings):
     source_autoapply_enabled: bool = True
     # 0 disables the discovery job entirely (independent of hermes_heal_*).
     hermes_discover_interval_seconds: int = 21600  # 6h — discovery is a slow, exploratory Hermes run
+    # Research → discovery hand-off (quick win B1) — discovery additionally
+    # mines domains cited in recent completed research_runs.sources as
+    # pre-warmed candidates (the research agent already vouched for their
+    # relevance), run through the same RSS-probe/forum-scrape validation as
+    # any other candidate. False disables the hand-off; discovery still runs
+    # its normal Hermes-proposed search.
+    research_handoff_enabled: bool = True
     # A newly-discovered source is tagged "probationary" and given this many
     # days to prove itself (sources/value.py needs real run history before
     # it can judge a source) before the prune path is allowed to act on it.
@@ -223,6 +256,26 @@ class Settings(BaseSettings):
     # gets a recovery attempt every _HEAL_COOLDOWN_HOURS before this elapses.
     source_prune_grace_days: int = 5
     source_value_refresh_interval_seconds: int = 1800
+    # Cross-case actor knowledge base refresh (agentic-coordination
+    # foundation F3, pipeline/actor_profiles.py) — mirrors
+    # source_value_refresh_interval_seconds' cadence/kill-switch shape. 0
+    # disables the job; get_actor_profile then only returns whatever was
+    # last materialized (or 404s if it never ran).
+    actor_profiles_refresh_interval_seconds: int = 1800
+    # Value-driven adaptive polling (quick win A1) — after each
+    # _value_refresh tick, a source's *effective* poll interval is derived
+    # from its cached sources/value.py classification instead of staying
+    # pinned to sources.yaml's static interval_seconds forever: "valuable"
+    # sources poll faster, "marginal" ones slower, clamped to
+    # [adaptive_poll_min_seconds, adaptive_poll_max_seconds]. "dead" sources
+    # are left alone here — they're heal/prune's job, not a polling-speed
+    # problem. False disables the whole block (sources keep their static
+    # configured interval).
+    adaptive_polling_enabled: bool = True
+    adaptive_poll_valuable_factor: float = 0.5
+    adaptive_poll_marginal_factor: float = 2.0
+    adaptive_poll_min_seconds: int = 300
+    adaptive_poll_max_seconds: int = 7200
     # Target size of the managed source population — discovery and pruning
     # both steer toward this number instead of running as independent,
     # unbounded loops (see research/discover.py's gap-based batch sizing and
@@ -240,6 +293,12 @@ class Settings(BaseSettings):
     # of a human verdict's weight (sources/value.py._component_feedback) —
     # synthetic signal is useful but shouldn't outrank a real analyst's call.
     feedback_agent_weight: float = 0.5
+    # Feedback-triggered re-analysis (quick win C3) — a "wrong_attribution"
+    # or "not_useful" verdict on a case (the strongest "the AI got this case
+    # wrong" signal available) nudges the case toward research
+    # (db.nudge_case) instead of only updating source scoring, so the next
+    # research tick re-digs via the existing _gap_note machinery.
+    feedback_reanalysis_enabled: bool = True
     # Quality prior by media kind (sources/value.py._component_media_prior) —
     # first-hand darknet-forum data is the most valuable signal this system
     # can find, ahead of forensic writeups, feeds, press and blogs.
@@ -293,6 +352,15 @@ class Settings(BaseSettings):
     embed_model: str = "text-embedding-3-small"  # used only when embed_backend="openai"
     embed_batch_size: int = 32
     embed_interval_seconds: int = 60
+    # Embedding-assisted correlation blocking (quick win C1) — widens
+    # pipeline/correlate.py's fuzzy-merge candidate set with the top-k
+    # nearest vec_cases neighbors of the item being correlated, in addition
+    # to the existing exact/fuzzy-victim blocking. The same conservative
+    # adjudicate_merge LLM gate (>= _MERGE_MIN_CONFIDENCE) still decides
+    # every merge — this only affects which cases get a chance to be
+    # adjudicated. No-ops automatically when embed_backend == "none".
+    correlate_embedding_candidates_enabled: bool = True
+    correlate_embedding_topk: int = 5
 
     # CISA KEV (Known Exploited Vulnerabilities) catalog — refreshed daily
     # into the kev_catalog table; see enrich/kev.py.

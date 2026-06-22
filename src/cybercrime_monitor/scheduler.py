@@ -442,11 +442,72 @@ def build_scheduler(db_conn, sse_broadcaster) -> AsyncIOScheduler:
 
     from .sources.value import compute_all
 
+    # Value-driven adaptive polling (quick win A1) — tracks the last interval
+    # this process applied per source so a tick whose computed interval
+    # hasn't changed skips reschedule_source entirely (avoids resetting the
+    # staggered next_run_time on every refresh). Process-local and
+    # intentionally not persisted: a restart just re-derives it on the next
+    # tick from sources.yaml's static interval as the baseline.
+    _adaptive_last_interval: dict[str, int] = {}
+
+    async def _apply_adaptive_polling(conn, value_results: dict) -> None:
+        if not settings.adaptive_polling_enabled:
+            return
+        adjustments: dict[str, dict] = {}
+        for src in load_sources():
+            if not src.get("enabled", True):
+                continue
+            source_id = src["id"]
+            info = value_results.get(source_id)
+            if not info:
+                continue
+            classification = info.get("classification")
+            if classification == "valuable":
+                factor = settings.adaptive_poll_valuable_factor
+            elif classification == "marginal":
+                factor = settings.adaptive_poll_marginal_factor
+            else:
+                # "dead" sources are heal/prune's concern, not a polling-speed one.
+                continue
+            base = src.get("interval_seconds", 600)
+            new_interval = int(round(base * factor))
+            new_interval = max(
+                settings.adaptive_poll_min_seconds,
+                min(settings.adaptive_poll_max_seconds, new_interval),
+            )
+            previous = _adaptive_last_interval.get(source_id, base)
+            if new_interval == previous:
+                continue
+            src_copy = dict(src)
+            src_copy["interval_seconds"] = new_interval
+            reschedule_source(scheduler, conn, sse_broadcaster, src_copy)
+            adjustments[source_id] = {"from": previous, "to": new_interval, "classification": classification}
+            _adaptive_last_interval[source_id] = new_interval
+
+        if adjustments:
+            log.info("[adaptive_polling] adjusted %d source interval(s)", len(adjustments))
+            try:
+                event = await db_module.log_ai_activity(
+                    conn,
+                    subsystem="scheduler",
+                    action="interval_adjusted",
+                    summary=f"Adjusted polling interval for {len(adjustments)} source(s) based on investigation value",
+                    detail=adjustments,
+                )
+                await sse_broadcaster.broadcast_activity(event)
+            except Exception as exc:
+                log.error("[adaptive_polling] activity log failed: %s", exc)
+
     async def _refresh_values(conn) -> None:
         try:
-            await compute_all(conn)
+            results = await compute_all(conn)
         except Exception as exc:
             log.error("[value] refresh failed: %s", exc)
+            return
+        try:
+            await _apply_adaptive_polling(conn, results)
+        except Exception as exc:
+            log.error("[adaptive_polling] failed: %s", exc)
 
     scheduler.add_job(
         _refresh_values,
@@ -460,6 +521,33 @@ def build_scheduler(db_conn, sse_broadcaster) -> AsyncIOScheduler:
         kwargs={"conn": db_conn},
     )
     log.info("Scheduled source investigation-value scoring job")
+
+    if settings.actor_profiles_refresh_interval_seconds > 0:
+        from .pipeline.actor_profiles import refresh_actor_profiles
+
+        async def _refresh_actor_profiles(conn) -> None:
+            if settings.actor_profiles_refresh_interval_seconds <= 0:
+                return
+            try:
+                n = await refresh_actor_profiles(conn)
+                log.info("[actor_profiles] refreshed %d actor profile(s)", n)
+            except Exception as exc:
+                log.error("[actor_profiles] refresh failed: %s", exc)
+
+        scheduler.add_job(
+            _refresh_actor_profiles,
+            trigger=IntervalTrigger(seconds=settings.actor_profiles_refresh_interval_seconds),
+            id="_actor_profiles",
+            name="Cross-case actor knowledge base refresh",
+            next_run_time=_offset_now(50),
+            misfire_grace_time=settings.actor_profiles_refresh_interval_seconds,
+            max_instances=1,
+            coalesce=True,
+            kwargs={"conn": db_conn},
+        )
+        log.info("Scheduled actor profiles refresh job")
+    else:
+        log.info("Actor profiles refresh disabled (actor_profiles_refresh_interval_seconds <= 0)")
 
     from .pipeline.cross_correlate import run_cross_correlation
 

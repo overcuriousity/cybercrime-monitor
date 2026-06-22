@@ -25,6 +25,7 @@ similarity score with no visible symptom. embeddings/job.py's normal
 incremental-indexing pass then rebuilds the index from scratch.
 """
 import logging
+import struct
 from datetime import datetime, timezone
 
 import sqlite_vec
@@ -140,6 +141,28 @@ async def search(conn, kind: str, query_vec: list[float], *, k: int = 50) -> lis
         {"q": sqlite_vec.serialize_float32(query_vec), "k": k},
     )
     return [(r["ref_id"], r["distance"]) for r in rows]
+
+
+async def get_vector(conn, kind: str, ref_id: int) -> list[float] | None:
+    """Fetch one already-indexed vector back out of vec_cases/vec_items by
+    ref_id (agentic-coordination quick win C1) — lets
+    pipeline/correlate.py's embedding-assisted candidate channel reuse an
+    item's own indexed vector as its case-similarity query vector instead
+    of always re-embedding on the fuzzy-merge path. None if `kind`'s vec
+    table doesn't exist yet or `ref_id` isn't indexed."""
+    table = _VEC_TABLES[kind]
+    if not await _table_exists(conn, table):
+        return None
+    rows = await conn.execute_fetchall(
+        f"SELECT embedding FROM {table} WHERE ref_id = :id", {"id": ref_id}
+    )
+    if not rows:
+        return None
+    raw = rows[0]["embedding"]
+    # Inverse of sqlite_vec.serialize_float32 (pack("%sf" % len(vector), ...))
+    # — native byte order/size, same process family that wrote it.
+    count = len(raw) // 4
+    return list(struct.unpack("%sf" % count, raw))
 
 
 async def get_indexed_hashes(conn, kind: str) -> dict[int, str]:

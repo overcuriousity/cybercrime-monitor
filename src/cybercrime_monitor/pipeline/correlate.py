@@ -26,6 +26,8 @@ from datetime import timedelta, timezone, datetime
 from .. import db
 from .. import significance as sig
 from ..api.sse import broadcaster
+from ..embeddings import backend as embed_backend
+from ..embeddings import index as vec_index
 from ..enrich import cve as cve_enrich
 from ..enrich import cve_meta as cve_meta_enrich
 from ..enrich import ioc as ioc_enrich
@@ -305,6 +307,48 @@ async def _correlate_one(db_conn, item: dict) -> None:
     )
 
 
+async def _embedding_candidates(db_conn, item: dict, *, exclude_ids: set[int]) -> list[dict]:
+    """Embedding-assisted correlation blocking (quick win C1) — top-k
+    nearest vec_cases neighbors of this item, as ADDITIONAL fuzzy-merge
+    candidates alongside db.find_candidate_cases' exact/fuzzy-victim
+    blocking. Catches paraphrased/differently-spelled victims ("Acme Corp"
+    vs "Acme Corporation Inc") that string blocking misses — the same
+    conservative adjudicate_merge LLM gate still decides every merge, this
+    only widens which cases get a chance to be adjudicated.
+
+    Reuses the item's own already-indexed vec_items vector when available
+    (the embed job runs on its own tick, so this is usually a free cache
+    hit); falls back to embedding the item's title+snippet on demand
+    otherwise (one embedding call, not an LLM call — cheap relative to
+    adjudicate_merge, and only happens on this already-ambiguous fuzzy
+    path). No-ops cleanly when disabled or embed_backend == "none"."""
+    if not settings.correlate_embedding_candidates_enabled or settings.embed_backend == "none":
+        return []
+    try:
+        qvec = await vec_index.get_vector(db_conn, "items", item["id"])
+        if qvec is None:
+            text = f"{item.get('title') or ''}\n\n{(item.get('snippet') or '')[:800]}".strip()
+            if not text:
+                return []
+            vectors = await embed_backend.embed_texts([text])
+            qvec = vectors[0] if vectors else None
+        if not qvec:
+            return []
+        hits = await vec_index.search(db_conn, "cases", qvec, k=settings.correlate_embedding_topk)
+    except Exception as exc:
+        log.info("[correlate] embedding candidate lookup failed: %s", exc)
+        return []
+
+    out = []
+    for case_id, _distance in hits:
+        if case_id in exclude_ids:
+            continue
+        case = await db.get_case_by_id(db_conn, case_id)
+        if case is not None:
+            out.append(case)
+    return out
+
+
 async def _try_fuzzy_merge(
     db_conn, item: dict, *, cve_ids: list[str], in_kev: bool, event_at: str, iocs: list[str],
     cvss_max: float | None = None, cwe_ids: list[str] | None = None,
@@ -323,6 +367,13 @@ async def _try_fuzzy_merge(
         iocs=iocs,
         since_iso=since_iso,
     )
+
+    embedding_candidate_ids: set[int] = set()
+    extra = await _embedding_candidates(db_conn, item, exclude_ids={c["id"] for c in candidates})
+    for case in extra:
+        candidates.append(case)
+        embedding_candidate_ids.add(case["id"])
+
     if not candidates:
         return False
 
@@ -359,7 +410,11 @@ async def _try_fuzzy_merge(
             await _log_activity(
                 db_conn, action="item_merged",
                 summary=f"Merged item #{item['id']} into case #{case['id']} ({case.get('title', '')})",
-                detail={"confidence": confidence, "item_title": item.get("title")},
+                detail={
+                    "confidence": confidence,
+                    "item_title": item.get("title"),
+                    "candidate_source": "embedding" if case["id"] in embedding_candidate_ids else "fuzzy",
+                },
                 ref_id=case["id"],
             )
             return True
