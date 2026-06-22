@@ -1,9 +1,10 @@
 """Autonomous feedback generation, delegated to hermes-agent — same dispatch
 pattern as research/agent.py and research/heal.py. Periodically picks a case
 (db.get_case_for_evaluation, biased toward recent/under-covered cases),
-hands Hermes every one of its items, and asks it to judge each one the way
-a human analyst clicking the feedback buttons would: is this item genuinely
-on-topic and does it carry real information, or is it noise/misattributed?
+hands Hermes up to settings.evaluator_items_per_run of its items, and asks
+it to judge each one the way a human analyst clicking the feedback buttons
+would: is this item genuinely on-topic and does it carry real information,
+or is it noise/misattributed?
 
 The verdicts are written to the same `feedback` table the UI's feedback
 buttons write to, tagged origin="agent" (db.add_feedback) so

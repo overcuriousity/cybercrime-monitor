@@ -2521,10 +2521,15 @@ async def get_case_for_evaluation(conn: aiosqlite.Connection) -> dict | None:
     candidates so the agent doesn't loop on the same single case forever."""
     rows = await conn.execute_fetchall(
         """
-        SELECT c.id, c.title, COUNT(f.id) AS feedback_count
+        SELECT c.id, c.title,
+               (
+                   SELECT COUNT(*) FROM feedback f WHERE f.case_id = c.id
+               ) + (
+                   SELECT COUNT(*) FROM feedback f
+                   JOIN case_items ci ON ci.item_id = f.item_id
+                   WHERE ci.case_id = c.id AND f.item_id IS NOT NULL
+               ) AS feedback_count
         FROM cases c
-        LEFT JOIN feedback f ON f.case_id = c.id
-        GROUP BY c.id
         ORDER BY feedback_count ASC, c.first_seen DESC
         LIMIT 20
         """

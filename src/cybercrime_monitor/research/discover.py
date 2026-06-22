@@ -251,8 +251,12 @@ def _underrepresented_summary(sources: list[dict]) -> str:
     ranks on)."""
     buckets = source_value.bucket_counts(sources)
     notes = []
-    if buckets["region_total"]:
-        even_share = buckets["region_total"] / len(_TARGET_REGIONS)
+    # Baseline only over the target regions (excludes "other") — otherwise a
+    # corpus heavy on "other" sources would inflate region_total and falsely
+    # mark every target region as under-represented.
+    target_total = sum(buckets["region"].get(r, 0) for r in _TARGET_REGIONS)
+    if target_total:
+        even_share = target_total / len(_TARGET_REGIONS)
         thin = [r for r in _TARGET_REGIONS if buckets["region"].get(r, 0) < even_share]
         if thin:
             notes.append(f"under-represented regions: {', '.join(thin)}")
