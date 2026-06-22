@@ -20,12 +20,15 @@ Two consumption shapes, matching the two LLM call paths in this codebase
     below the "research/*.py" heading. Note these embed literal JSON braces
     escaped as `{{` / `}}` for str.format() — preserve that when editing.
 
-Controlled vocabularies referenced by some of these templates (region/
-media_kind in sources/value.py's VALID_REGIONS/VALID_MEDIA_KINDS, and the
-significance levels below) are intentionally NOT cross-imported here to
-avoid a circular import through sources.value -> scheduler -> research.* ->
-prompts. If you change those vocabularies, grep this file for the matching
-prose (e.g. "eu"|"us"|"ru_cn"|"other") and update it by hand.
+Significance levels (info/warn/critical) are imported from .significance
+below, since that module has no imports of its own and so carries no
+circular-import risk. Region/media_kind, by contrast (sources/value.py's
+VALID_REGIONS/VALID_MEDIA_KINDS, referenced as prose in the classify/
+discover templates below), are intentionally NOT cross-imported here —
+sources.value imports scheduler, which imports research.*, which would
+import prompts, completing a cycle. If you change those two vocabularies,
+grep this file for the matching prose (e.g. "eu"|"us"|"ru_cn"|"other") and
+update it by hand.
 """
 from .significance import SIGNIFICANCE_LEVELS
 

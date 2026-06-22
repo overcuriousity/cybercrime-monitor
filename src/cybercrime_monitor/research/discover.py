@@ -391,7 +391,7 @@ async def _fetch_listing_html(url: str, *, kind: str) -> str | None:
 async def _propose_selectors(url: str, html: str) -> dict | None:
     """Tool-free Hermes leg: given the already-fetched HTML, propose CSS
     selectors. Uses toolsets="memory" (see llm/backend.py's
-    llm/backend.py's _NO_TOOLS_TOOLSET) since this is a closed-form text-in/JSON-out task —
+    _NO_TOOLS_TOOLSET) since this is a closed-form text-in/JSON-out task —
     no need to re-spend a browsing budget on a page we already have."""
     prompt = prompts.SELECTOR_PROMPT_TEMPLATE.format(url=url, html=html[:_SELECTOR_HTML_CHARS])
     result = await run_agent(prompt, toolsets="memory", timeout=settings.hermes_timeout_seconds,
