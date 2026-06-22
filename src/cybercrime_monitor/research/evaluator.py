@@ -31,8 +31,10 @@ log = logging.getLogger(__name__)
 
 
 # ── Runtime health registry ───────────────────────────────────────────────────
-# Surfaced via /api/status, same shape as research/agent.py and
-# research/heal.py's registries.
+# Same shape as research/agent.py and research/heal.py's registries, but
+# unlike those it is NOT currently surfaced via /api/status — only via the
+# "evaluator" SSE status broadcast (_emit below). Add it to api_status if/when
+# it needs to show up in the unified status payload too.
 
 @dataclass
 class EvaluatorHealth:
@@ -129,8 +131,8 @@ def _items_block(items: list[dict]) -> str:
     for item in items:
         lines.append(
             f"- item_id={item['id']} source={item.get('source_name') or item.get('source_id')} "
-            f"title=\"{(item.get('title') or '').strip()}\" "
-            f"snippet=\"{(item.get('snippet') or '').strip()[:300]}\""
+            f"title={(item.get('title') or '').strip()!r} "
+            f"snippet={(item.get('snippet') or '').strip()[:300]!r}"
         )
     return "\n".join(lines)
 

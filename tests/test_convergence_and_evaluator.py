@@ -135,6 +135,24 @@ def test_bucket_counts_and_media_prior(monkeypatch):
     assert diversity_darknet is not None
 
 
+def test_bucket_counts_and_components_ignore_invalid_values():
+    # A typo'd region/media_kind (hand-edited sources.yaml isn't validated on
+    # load) must not silently skew the bucket tallies, get a media prior, or
+    # earn a free maximal diversity bonus for being absent from every bucket.
+    sources = [
+        {"id": "a", "enabled": True, "region": "eu", "media_kind": "darknet_forum"},
+        {"id": "typo", "enabled": True, "region": "europe", "media_kind": "forum"},
+    ]
+    buckets = source_value.bucket_counts(sources)
+    assert buckets["region"] == {"eu": 1}
+    assert buckets["media_kind"] == {"darknet_forum": 1}
+
+    assert source_value._component_media_prior({"media_kind": "forum"}) is None
+    assert source_value._component_diversity(
+        {"id": "typo", "region": "europe", "media_kind": "forum"}, buckets
+    ) is None
+
+
 @pytest.mark.asyncio
 async def test_add_feedback_with_agent_origin_and_aggregation(db_conn):
     # Set up a source-bearing item and a case-linked item, then write both

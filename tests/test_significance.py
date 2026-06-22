@@ -61,12 +61,6 @@ def test_max_significance_picks_higher_rank():
     assert sig.max_significance("warn", "warn") == "warn"
 
 
-def test_degrade_steps_down_one_level_and_floors_at_info():
-    assert sig.degrade("critical") == "warn"
-    assert sig.degrade("warn") == "info"
-    assert sig.degrade("info") == "info"
-
-
 def test_significance_score_matches_rank_over_three():
     assert sig.significance_score("info") == pytest.approx(1 / 3)
     assert sig.significance_score("warn") == pytest.approx(2 / 3)

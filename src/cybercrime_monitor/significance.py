@@ -50,10 +50,3 @@ def max_significance(a: str, b: str) -> str:
     docstrings for the caveat that this no longer applies once a case has
     been researched (research/agent.py then owns the level)."""
     return RANK_SIG[max(SIG_RANK.get(a, 1), SIG_RANK.get(b, 1))]
-
-
-def degrade(sig: str) -> str:
-    """One step down the ladder (critical->warn->info->info). Used by the
-    mechanical staleness-decay job (db.py's run_significance_decay) to cap a
-    quiet case's level without needing a researcher verdict."""
-    return RANK_SIG[max(1, SIG_RANK.get(sig, 1) - 1)]

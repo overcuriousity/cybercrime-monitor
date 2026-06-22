@@ -138,7 +138,7 @@ def _component_media_prior(src: dict) -> float | None:
     most valuable signal this system can find. None (no opinion) for
     sources not yet classified by research/classify.py."""
     media_kind = src.get("media_kind")
-    if not media_kind:
+    if media_kind not in VALID_MEDIA_KINDS:
         return None
     return settings.media_kind_prior.get(media_kind, 0.6)
 
@@ -147,18 +147,20 @@ def bucket_counts(sources: list[dict]) -> dict:
     """Enabled-source counts per region and per media_kind — the shared
     input for the diversity component below, research/discover.py's
     under-represented-bucket prompt steer, and (implicitly, via the score)
-    research/heal.py's convergence pruning. Sources missing the field are
-    excluded from that dimension's tally, not lumped into a fake bucket."""
+    research/heal.py's convergence pruning. Sources missing the field, or
+    carrying an invalid one (e.g. a typo from hand-editing sources.yaml —
+    these fields aren't otherwise validated on load), are excluded from
+    that dimension's tally rather than lumped into a fake bucket."""
     region: dict[str, int] = {}
     media_kind: dict[str, int] = {}
     for src in sources:
         if not src.get("enabled", True):
             continue
         r = src.get("region")
-        if r:
+        if r in VALID_REGIONS:
             region[r] = region.get(r, 0) + 1
         m = src.get("media_kind")
-        if m:
+        if m in VALID_MEDIA_KINDS:
             media_kind[m] = media_kind.get(m, 0) + 1
     return {
         "region": region,
@@ -173,14 +175,17 @@ def _component_diversity(src: dict, buckets: dict) -> float | None:
     the managed population — a soft nudge (not a hard prune guard, per the
     explicit steer) so convergence pruning naturally leaves under-represented
     geographies/media types alone in favor of trimming over-represented
-    ones. None for sources not yet classified."""
+    ones. None for sources not yet classified (or carrying an invalid
+    region/media_kind — see bucket_counts' docstring; an invalid value must
+    not get a free maximal bonus just because it's absent from every
+    bucket)."""
     shares = []
     region = src.get("region")
-    if region and buckets.get("region_total"):
+    if region in VALID_REGIONS and buckets.get("region_total"):
         share = buckets["region"].get(region, 0) / buckets["region_total"]
         shares.append(max(0.0, min(1.0, 1.0 - share)))
     media_kind = src.get("media_kind")
-    if media_kind and buckets.get("media_kind_total"):
+    if media_kind in VALID_MEDIA_KINDS and buckets.get("media_kind_total"):
         share = buckets["media_kind"].get(media_kind, 0) / buckets["media_kind_total"]
         shares.append(max(0.0, min(1.0, 1.0 - share)))
     if not shares:
