@@ -2413,7 +2413,7 @@ async function refreshSourceOverview() {
 function renderSourceLeaderboard() {
   const panel = document.getElementById('source-leaderboard');
   if (!panel) return;
-  panel.querySelectorAll('.emerging-row').forEach(el => el.remove());
+  panel.querySelectorAll('.emerging-row, p.hint').forEach(el => el.remove());
 
   const ranked = [...state.sources]
     .filter(s => s.enabled)
@@ -2422,7 +2422,7 @@ function renderSourceLeaderboard() {
   if (!ranked.length) {
     const empty = document.createElement('p');
     empty.className = 'hint';
-    empty.textContent = 'No sources configured.';
+    empty.textContent = state.sources.length ? 'No enabled sources.' : 'No sources configured.';
     panel.appendChild(empty);
     return;
   }
