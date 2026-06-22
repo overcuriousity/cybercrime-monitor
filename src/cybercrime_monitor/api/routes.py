@@ -643,6 +643,7 @@ async def api_cases_by_country(
     ioc: str | None = Query(default=None),
     since: str | None = Query(default=None),
     until: str | None = Query(default=None),
+    mode: str = Query(default="keyword", pattern="^(keyword|semantic)$"),
 ):
     """Per-country case counts for the Cases tab's map — honors the same
     filters as GET /api/cases (last_seen-based since/until) rather than
@@ -650,6 +651,27 @@ async def api_cases_by_country(
     filtered case list."""
     since_norm = _normalize_date_filter(since, end_of_day=False)
     until_norm = _normalize_date_filter(until, end_of_day=True)
+
+    if mode == "semantic" and search:
+        try:
+            ranked_ids = await _semantic_rank(db, "cases", search)
+        except embed_backend.EmbeddingUnavailable:
+            return {"by_country": []}
+        if not ranked_ids:
+            return {"by_country": []}
+        by_country = await cases_country_counts(
+            db,
+            min_significance=min_significance,
+            crime_type=crime_type,
+            in_kev=in_kev,
+            cve_id=cve_id,
+            ioc=ioc,
+            since=since_norm,
+            until=until_norm,
+            id_in=ranked_ids,
+        )
+        return {"by_country": by_country}
+
     by_country = await cases_country_counts(
         db,
         min_significance=min_significance,

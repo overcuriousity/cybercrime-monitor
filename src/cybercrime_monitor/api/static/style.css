@@ -812,6 +812,11 @@ mark { background: var(--prio-warn-bg); color: var(--prio-warn); padding: 0 2px;
   border-radius: 2px;
   display: inline-block;
 }
+.case-map-legend-swatch.q0 { background: var(--surface3); }
+.case-map-legend-swatch.q1 { background: #4a3a2c; }
+.case-map-legend-swatch.q2 { background: #8a5a2c; }
+.case-map-legend-swatch.q3 { background: #c47e2c; }
+.case-map-legend-swatch.q4 { background: var(--accent); }
 .case-map {
   width: 100%;
   max-height: 260px;
@@ -829,7 +834,7 @@ mark { background: var(--prio-warn-bg); color: var(--prio-warn); padding: 0 2px;
   transition: fill 0.15s ease;
 }
 .case-map svg path.q0 { fill: var(--surface3); cursor: default; }
-.case-map svg path.q1 { fill: var(--prio-warn-bg); fill-opacity: 1; fill: #4a3a2c; }
+.case-map svg path.q1 { fill: #4a3a2c; }
 .case-map svg path.q2 { fill: #8a5a2c; }
 .case-map svg path.q3 { fill: #c47e2c; }
 .case-map svg path.q4 { fill: var(--accent); }

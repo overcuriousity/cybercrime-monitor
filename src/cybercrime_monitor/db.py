@@ -2865,16 +2865,19 @@ async def cases_country_counts(
     ioc: str | None = None,
     since: str | None = None,
     until: str | None = None,
+    id_in: list[int] | None = None,
 ) -> list[dict]:
     """Per-country case counts honoring the same Cases-tab filters as
     fetch_cases (last_seen-based since/until, not Landscape's first_seen
     window) — backs the Cases tab's map, which must reflect exactly what's
     in the filtered case list rather than a separate stats window. Values
     are normalized ISO alpha-2 codes (see country.py), so a plain GROUP BY
-    is enough — no casefold leaderboard needed here."""
+    is enough — no casefold leaderboard needed here. `id_in` scopes to a
+    semantic-search candidate set, mirroring fetch_cases' same parameter."""
     where, params = _build_cases_where(
         min_significance=min_significance, crime_type=crime_type, in_kev=in_kev,
         search=search, cve_id=cve_id, ioc=ioc, since=since, until=until,
+        id_in=id_in,
     )
     country_clause = "damaged_party_country IS NOT NULL AND damaged_party_country != ''"
     where = f"{where} AND {country_clause}" if where else f"WHERE {country_clause}"

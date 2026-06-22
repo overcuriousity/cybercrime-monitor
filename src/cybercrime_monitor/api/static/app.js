@@ -1751,9 +1751,9 @@ function ensureCasesMapSvg() {
 }
 
 function onCasesMapClick(e) {
-  const path = e.target.closest('path[id]');
-  if (!path) return;
-  const code = path.id.toUpperCase();
+  const el = e.target.closest('path[id], g[id]');
+  if (!el) return;
+  const code = el.id.toUpperCase();
   if (code.length !== 2) return; // skip non-ISO "_named" territories
   const next = casesState.filters.country === code ? '' : code;
   casesState.filters.country = next;
@@ -1796,18 +1796,26 @@ function renderCasesMap() {
   const counts = casesState.countryCounts;
   const max = Math.max(0, ...Object.values(counts));
 
-  svg.querySelectorAll('path[id]').forEach(path => {
-    path.classList.remove('q0', 'q1', 'q2', 'q3', 'q4', 'map-active-filter');
-    const code = path.id.toUpperCase();
+  svg.querySelectorAll('path[id], g[id]').forEach(el => {
+    const code = el.id.toUpperCase();
+    if (code.length !== 2) return; // skip non-ISO "_named" territories
+    // Some countries (e.g. AU/CA/CN/US) are <g id="xx"> groups of multiple
+    // child <path>s rather than a single <path id="xx">; style every child
+    // path so the whole country gets colored/hover-highlighted consistently.
+    const paths = el.tagName.toLowerCase() === 'path' ? [el] : Array.from(el.querySelectorAll('path'));
+    paths.forEach(path => path.classList.remove('q0', 'q1', 'q2', 'q3', 'q4', 'map-active-filter'));
     const n = counts[code] || 0;
     const bucket = n === 0 ? 0 : Math.min(CASES_MAP_BUCKETS, Math.ceil((n / max) * CASES_MAP_BUCKETS));
-    path.classList.add('q' + bucket);
+    const title = el.querySelector(':scope > title');
     if (n > 0) {
-      path.classList.toggle('map-active-filter', casesState.filters.country === code);
-      const title = path.querySelector('title') || path.appendChild(document.createElementNS('http://www.w3.org/2000/svg', 'title'));
-      title.textContent = `${countryLabel(code)} — ${n} case${n === 1 ? '' : 's'}`;
+      paths.forEach(path => {
+        path.classList.add('q' + bucket);
+        path.classList.toggle('map-active-filter', casesState.filters.country === code);
+      });
+      const t = title || el.appendChild(document.createElementNS('http://www.w3.org/2000/svg', 'title'));
+      t.textContent = `${countryLabel(code)} — ${n} case${n === 1 ? '' : 's'}`;
     } else {
-      const title = path.querySelector('title');
+      paths.forEach(path => path.classList.add('q' + bucket));
       if (title) title.remove();
     }
   });
@@ -1845,8 +1853,10 @@ async function flashCasesMapCountry(code) {
   if (!svg) return;
   svg.querySelectorAll('path.flash').forEach(p => p.classList.remove('flash'));
   if (!code) return;
-  const path = svg.querySelector(`path[id="${code.toLowerCase()}"]`);
-  if (path) path.classList.add('flash');
+  const el = svg.querySelector(`path[id="${code.toLowerCase()}"], g[id="${code.toLowerCase()}"]`);
+  if (!el) return;
+  const paths = el.tagName.toLowerCase() === 'path' ? [el] : Array.from(el.querySelectorAll('path'));
+  paths.forEach(p => p.classList.add('flash'));
 }
 
 function renderCasesList() {
