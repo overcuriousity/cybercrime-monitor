@@ -396,6 +396,7 @@ async def _prune_pass(db_conn, *, scheduler, sse_broadcaster) -> None:
     values = await db.get_all_source_values(db_conn)
     sources_by_id = {s["id"]: s for s in load_sources()}
 
+    disabled_this_pass: set[str] = set()
     for source_id, src in sources_by_id.items():
         value = values.get(source_id)
 
@@ -417,10 +418,61 @@ async def _prune_pass(db_conn, *, scheduler, sse_broadcaster) -> None:
         if not source_value.should_prune(value=value, min_history=min_history):
             continue
         await _disable_source(db_conn, src, value, scheduler=scheduler, sse_broadcaster=sse_broadcaster)
+        disabled_this_pass.add(source_id)
+
+    await _convergence_prune(
+        db_conn, sources_by_id, values, disabled_this_pass, scheduler=scheduler, sse_broadcaster=sse_broadcaster
+    )
 
 
-async def _disable_source(db_conn, source: dict, value: dict, *, scheduler, sse_broadcaster) -> None:
-    reason = f"investigation-value classification={value['classification']} (auto-prune)"
+async def _convergence_prune(
+    db_conn, sources_by_id: dict[str, dict], values: dict[str, dict], already_disabled: set[str],
+    *, scheduler, sse_broadcaster,
+) -> None:
+    """Beyond the dead/marginal prune above: once the managed population has
+    grown past settings.source_target_count (+ band), trim the lowest-
+    scoring sources until back near the target. Ranked purely by
+    source_value score ascending — that score already embeds the
+    media-kind prior and under-representation bonus (sources/value.py), so
+    weak AND over-represented sources sink to the bottom and get trimmed
+    first; under-represented/darknet sources naturally float clear of the
+    cut. No separate "last of its bucket" guard — diversity is a scoring
+    nudge here, not a hard rule (matches research/discover.py's symmetric
+    steer on the add side)."""
+    enabled = [
+        s for sid, s in sources_by_id.items()
+        if sid not in already_disabled and s.get("enabled", True)
+    ]
+    overage = len(enabled) - (settings.source_target_count + settings.source_target_band)
+    if overage <= 0:
+        return
+
+    ranked = sorted(
+        (
+            (sid, values[sid]["score"])
+            for sid in (s["id"] for s in enabled)
+            if values.get(sid) is not None and _min_history(sid)
+        ),
+        key=lambda pair: pair[1],
+    )
+    for source_id, score in ranked[:overage]:
+        src = sources_by_id[source_id]
+        value = values[source_id]
+        reason = (
+            f"convergence prune — enabled count {len(enabled)} exceeds target "
+            f"{settings.source_target_count}+{settings.source_target_band}, "
+            f"lowest-ranked (score={score:.3f})"
+        )
+        log.info("[heal] %s: %s", source_id, reason)
+        await _disable_source(
+            db_conn, src, value, scheduler=scheduler, sse_broadcaster=sse_broadcaster, reason=reason
+        )
+
+
+async def _disable_source(
+    db_conn, source: dict, value: dict, *, scheduler, sse_broadcaster, reason: str | None = None
+) -> None:
+    reason = reason or f"investigation-value classification={value['classification']} (auto-prune)"
     try:
         before, after = source_writer.disable(source["id"], reason=reason)
     except source_writer.SourceWriteError as exc:

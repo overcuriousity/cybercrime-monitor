@@ -368,6 +368,54 @@ def build_scheduler(db_conn, sse_broadcaster) -> AsyncIOScheduler:
     else:
         log.info("hermes-agent source discovery disabled (hermes_discover_interval_seconds <= 0)")
 
+    if settings.hermes_evaluator_interval_seconds > 0:
+        from .research.evaluator import run_evaluator_batch
+
+        # No scheduler/sse_broadcaster wiring needed (unlike heal/discover):
+        # the evaluator only writes feedback rows, it never touches
+        # sources.yaml or the live collector set directly.
+        scheduler.add_job(
+            run_evaluator_batch,
+            trigger=IntervalTrigger(seconds=settings.hermes_evaluator_interval_seconds),
+            id="_evaluator",
+            name="hermes-agent feedback evaluator",
+            next_run_time=_offset_now(180),
+            misfire_grace_time=settings.hermes_evaluator_interval_seconds,
+            max_instances=1,
+            coalesce=True,
+            kwargs={"db_conn": db_conn},
+        )
+        log.info("Scheduled hermes-agent feedback evaluator job")
+    else:
+        log.info("hermes-agent feedback evaluator disabled (hermes_evaluator_interval_seconds <= 0)")
+
+    if settings.hermes_heal_interval_seconds > 0 or settings.hermes_discover_interval_seconds > 0:
+        from .research.classify import run_classify_batch
+
+        # Backfills region/media_kind on existing sources so value.py's
+        # diversity/media-prior components and discover.py's
+        # under-represented-bucket steer have data from day one — runs
+        # whenever either the heal or discover loop is active, on the
+        # shorter of their two intervals (capped) since it's cheap to no-op
+        # once every source is classified. Tied to those settings rather
+        # than getting its own always-on interval so disabling the whole
+        # autonomous source loop also disables this.
+        classify_interval = min(
+            i for i in (settings.hermes_heal_interval_seconds, settings.hermes_discover_interval_seconds) if i > 0
+        )
+        scheduler.add_job(
+            run_classify_batch,
+            trigger=IntervalTrigger(seconds=classify_interval),
+            id="_classify",
+            name="hermes-agent source region/media_kind classification",
+            next_run_time=_offset_now(30),
+            misfire_grace_time=classify_interval,
+            max_instances=1,
+            coalesce=True,
+            kwargs={"db_conn": db_conn},
+        )
+        log.info("Scheduled hermes-agent source classification job (interval=%ds)", classify_interval)
+
     from .sources.value import compute_all
 
     async def _refresh_values(conn) -> None:

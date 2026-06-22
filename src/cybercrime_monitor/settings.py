@@ -202,6 +202,33 @@ class Settings(BaseSettings):
     # gets a recovery attempt every _HEAL_COOLDOWN_HOURS before this elapses.
     source_prune_grace_days: int = 5
     source_value_refresh_interval_seconds: int = 1800
+    # Target size of the managed source population — discovery and pruning
+    # both steer toward this number instead of running as independent,
+    # unbounded loops (see research/discover.py's gap-based batch sizing and
+    # research/heal.py's _prune_pass overage trim). A deadband around the
+    # target avoids thrashing (one source added/removed every cycle).
+    source_target_count: int = 25
+    source_target_band: int = 3
+    # 0 disables the evaluator job. A periodic Hermes agent (research/
+    # evaluator.py) that reads a case's items like a human analyst would and
+    # writes its own feedback rows (origin="agent") — gives source scoring an
+    # actionable signal even when no one has clicked a feedback button.
+    hermes_evaluator_interval_seconds: int = 7200
+    evaluator_items_per_run: int = 12
+    # Agent-authored feedback counts toward source scoring at this fraction
+    # of a human verdict's weight (sources/value.py._component_feedback) —
+    # synthetic signal is useful but shouldn't outrank a real analyst's call.
+    feedback_agent_weight: float = 0.5
+    # Quality prior by media kind (sources/value.py._component_media_prior) —
+    # first-hand darknet-forum data is the most valuable signal this system
+    # can find, ahead of forensic writeups, feeds, press and blogs.
+    media_kind_prior: dict[str, float] = {
+        "darknet_forum": 1.0,
+        "forensic": 0.85,
+        "feed": 0.7,
+        "press": 0.6,
+        "blog": 0.55,
+    }
 
     # ── Semantic search / embeddings ────────────────────────────────────────
     # Separate from the llm_* extraction layer above — embeddings are a

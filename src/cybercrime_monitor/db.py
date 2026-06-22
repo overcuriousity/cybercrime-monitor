@@ -1,5 +1,6 @@
 import json
 import logging
+import random
 import re
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
@@ -271,6 +272,7 @@ CREATE TABLE IF NOT EXISTS feedback (
     item_id     INTEGER REFERENCES items(id) ON DELETE CASCADE,
     verdict     TEXT NOT NULL, -- useful | not_useful | noise | wrong_attribution
     note        TEXT,
+    origin      TEXT NOT NULL DEFAULT 'human', -- human | agent (research/evaluator.py)
     created_at  TEXT NOT NULL
 );
 
@@ -465,6 +467,11 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         if col not in inv_cols:
             await conn.execute(ddl)
             log.info("Migrated investigations table: added %s column", col)
+
+    feedback_cols = {r["name"] for r in await conn.execute_fetchall("PRAGMA table_info(feedback)")}
+    if "origin" not in feedback_cols:
+        await conn.execute("ALTER TABLE feedback ADD COLUMN origin TEXT NOT NULL DEFAULT 'human'")
+        log.info("Migrated feedback table: added origin column")
 
     await _migrate_normalize_countries(conn)
 
@@ -2390,6 +2397,7 @@ async def count_running_research_runs(conn: aiosqlite.Connection) -> int:
 # autonomous source loop knows which sources the analyst trusts.
 
 VALID_FEEDBACK_VERDICTS = {"useful", "not_useful", "noise", "wrong_attribution"}
+VALID_FEEDBACK_ORIGINS = {"human", "agent"}
 
 
 async def add_feedback(
@@ -2399,26 +2407,53 @@ async def add_feedback(
     item_id: int | None,
     verdict: str,
     note: str | None,
+    origin: str = "human",
 ) -> int:
     if verdict not in VALID_FEEDBACK_VERDICTS:
         raise ValueError(f"invalid verdict: {verdict!r}")
+    if origin not in VALID_FEEDBACK_ORIGINS:
+        raise ValueError(f"invalid origin: {origin!r}")
     if bool(case_id) == bool(item_id):
         raise ValueError("feedback needs exactly one of case_id or item_id")
     cur = await conn.execute(
         """
-        INSERT INTO feedback (case_id, item_id, verdict, note, created_at)
-        VALUES (:case_id, :item_id, :verdict, :note, :created_at)
+        INSERT INTO feedback (case_id, item_id, verdict, note, origin, created_at)
+        VALUES (:case_id, :item_id, :verdict, :note, :origin, :created_at)
         """,
         {
             "case_id": case_id,
             "item_id": item_id,
             "verdict": verdict,
             "note": (note or "")[:1000] or None,
+            "origin": origin,
             "created_at": _utcnow().isoformat(),
         },
     )
     await conn.commit()
     return cur.lastrowid
+
+
+async def get_case_for_evaluation(conn: aiosqlite.Connection) -> dict | None:
+    """Pick a case for research/evaluator.py to judge — biased toward recent
+    cases with the fewest existing feedback rows (so the agent fills gaps
+    human review hasn't reached yet, rather than re-grading the same
+    well-covered cases), with a random tiebreak among equally under-covered
+    candidates so the agent doesn't loop on the same single case forever."""
+    rows = await conn.execute_fetchall(
+        """
+        SELECT c.id, c.title, COUNT(f.id) AS feedback_count
+        FROM cases c
+        LEFT JOIN feedback f ON f.case_id = c.id
+        GROUP BY c.id
+        ORDER BY feedback_count ASC, c.first_seen DESC
+        LIMIT 20
+        """
+    )
+    if not rows:
+        return None
+    min_count = rows[0]["feedback_count"]
+    candidates = [dict(r) for r in rows if r["feedback_count"] == min_count]
+    return random.choice(candidates)
 
 
 async def get_feedback_for_case(conn: aiosqlite.Connection, case_id: int) -> list[dict]:
@@ -2429,35 +2464,41 @@ async def get_feedback_for_case(conn: aiosqlite.Connection, case_id: int) -> lis
     return [dict(r) for r in rows]
 
 
-async def aggregate_feedback_by_source(conn: aiosqlite.Connection, *, since_iso: str) -> dict[str, dict[str, int]]:
-    """Verdict counts per source_id since `since_iso`, joining feedback →
-    item/case → originating items.source_id. A case's feedback is
+async def aggregate_feedback_by_source(
+    conn: aiosqlite.Connection, *, since_iso: str
+) -> dict[str, dict[str, dict[str, int]]]:
+    """Verdict counts per source_id since `since_iso`, split by feedback
+    origin ("human" vs "agent" — see research/evaluator.py), joining
+    feedback → item/case → originating items.source_id. A case's feedback is
     attributed to every source that contributed an item to it (a case can
-    span multiple sources). Used by sources/value.py's feedback component
-    and to digest "why" into heal/discover prompts."""
+    span multiple sources). Returns {source_id: {origin: {verdict: count}}}.
+    Used by sources/value.py's feedback component (which weighs human and
+    agent counts differently) and to digest "why" into heal/discover
+    prompts."""
     rows = await conn.execute_fetchall(
         """
-        SELECT i.source_id AS source_id, f.verdict AS verdict, COUNT(*) AS n
+        SELECT i.source_id AS source_id, f.origin AS origin, f.verdict AS verdict, COUNT(*) AS n
         FROM feedback f
         JOIN items i ON i.id = f.item_id
         WHERE f.created_at >= :since AND f.item_id IS NOT NULL
-        GROUP BY i.source_id, f.verdict
+        GROUP BY i.source_id, f.origin, f.verdict
 
         UNION ALL
 
-        SELECT i.source_id AS source_id, f.verdict AS verdict, COUNT(*) AS n
+        SELECT i.source_id AS source_id, f.origin AS origin, f.verdict AS verdict, COUNT(*) AS n
         FROM feedback f
         JOIN case_items ci ON ci.case_id = f.case_id
         JOIN items i ON i.id = ci.item_id
         WHERE f.created_at >= :since AND f.case_id IS NOT NULL
-        GROUP BY i.source_id, f.verdict
+        GROUP BY i.source_id, f.origin, f.verdict
         """,
         {"since": since_iso},
     )
-    out: dict[str, dict[str, int]] = {}
+    out: dict[str, dict[str, dict[str, int]]] = {}
     for r in rows:
-        out.setdefault(r["source_id"], {}).setdefault(r["verdict"], 0)
-        out[r["source_id"]][r["verdict"]] += r["n"]
+        by_origin = out.setdefault(r["source_id"], {})
+        by_verdict = by_origin.setdefault(r["origin"], {})
+        by_verdict[r["verdict"]] = by_verdict.get(r["verdict"], 0) + r["n"]
     return out
 
 
