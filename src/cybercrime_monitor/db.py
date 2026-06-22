@@ -176,7 +176,20 @@ CREATE TABLE IF NOT EXISTS cases (
     -- this case regardless of significance/cooldown gating (see
     -- get_cases_needing_research). NULL = no forced request pending.
     -- Added via ALTER TABLE migration for pre-existing DBs.
-    research_requested_at   TEXT
+    research_requested_at   TEXT,
+    -- CVSS/CWE/EPSS/MITRE ATT&CK aggregates (issue #18) — deterministic,
+    -- token-free enrichment via enrich/cve_meta.py (CVSS/CWE/EPSS, cached in
+    -- the cve_meta table below) and enrich/mitre.py (regex technique-ID
+    -- extraction). cvss_max/epss_max are the max across this case's cve_ids;
+    -- cwe_ids is the union of weakness types across those CVEs;
+    -- mitre_techniques is the union of technique IDs found in this case's
+    -- items' text. All NULL/empty until pipeline/correlate.py resolves them
+    -- — see _resolve_cve_meta/_resolve_mitre. Added via ALTER TABLE
+    -- migration for pre-existing DBs.
+    cvss_max                REAL,
+    cwe_ids                 TEXT NOT NULL DEFAULT '[]',
+    epss_max                REAL,
+    mitre_techniques        TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE INDEX IF NOT EXISTS idx_cases_last_seen ON cases(last_seen DESC);
@@ -207,6 +220,23 @@ CREATE TABLE IF NOT EXISTS kev_catalog (
     due_date          TEXT,
     known_ransomware  TEXT,
     notes             TEXT
+);
+
+-- Per-CVE metadata cache (issue #18) — CVSS/CWE from enrich/cve_meta.py's
+-- configured source (NVD by default) and EPSS from FIRST.org, fetched
+-- lazily the first time a CVE is seen and refreshed once
+-- settings.cve_meta_cache_ttl_hours has elapsed (see
+-- enrich/cve_meta.get_or_fetch). Unlike kev_catalog (one bulk feed,
+-- replaced wholesale daily), this is a per-key cache populated on demand —
+-- there is no practical bulk-download equivalent for CVSS/CWE at this
+-- table's scale.
+CREATE TABLE IF NOT EXISTS cve_meta (
+    cve_id            TEXT PRIMARY KEY,
+    cvss_score        REAL,
+    cvss_severity     TEXT,
+    cwe_ids           TEXT NOT NULL DEFAULT '[]',
+    epss              REAL,
+    fetched_at        TEXT NOT NULL
 );
 
 -- Log of autonomous hermes-agent research runs dispatched against cases
@@ -450,6 +480,15 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
     if "research_requested_at" not in case_cols:
         await conn.execute("ALTER TABLE cases ADD COLUMN research_requested_at TEXT")
         log.info("Migrated cases table: added research_requested_at column")
+    for col, ddl in (
+        ("cvss_max", "ALTER TABLE cases ADD COLUMN cvss_max REAL"),
+        ("cwe_ids", "ALTER TABLE cases ADD COLUMN cwe_ids TEXT NOT NULL DEFAULT '[]'"),
+        ("epss_max", "ALTER TABLE cases ADD COLUMN epss_max REAL"),
+        ("mitre_techniques", "ALTER TABLE cases ADD COLUMN mitre_techniques TEXT NOT NULL DEFAULT '[]'"),
+    ):
+        if col not in case_cols:
+            await conn.execute(ddl)
+            log.info("Migrated cases table: added %s column", col)
 
     heal_cols = {r["name"] for r in await conn.execute_fetchall("PRAGMA table_info(source_heal_proposals)")}
     for col, ddl in (
@@ -1366,6 +1405,50 @@ async def count_kev_catalog(conn: aiosqlite.Connection) -> int:
     return row[0]["n"] if row else 0
 
 
+# ── CVE metadata cache (CVSS/CWE/EPSS) ──────────────────────────────────────
+# See enrich/cve_meta.py — populated lazily per-CVE (unlike kev_catalog's
+# wholesale daily replace, there's no practical bulk feed for this), looked
+# up to aggregate cases.cvss_max/cwe_ids/epss_max.
+
+async def get_cve_meta(conn: aiosqlite.Connection, cve_ids: list[str]) -> dict[str, dict]:
+    """Cached metadata for any of the given CVE ids, keyed by cve_id —
+    callers check `if cve_id in result` rather than handling None entries,
+    same convention as enrich/kev.py's lookup_cves."""
+    if not cve_ids:
+        return {}
+    placeholders = ",".join("?" * len(cve_ids))
+    rows = await conn.execute_fetchall(
+        f"SELECT * FROM cve_meta WHERE cve_id IN ({placeholders})", cve_ids
+    )
+    out = {}
+    for r in rows:
+        d = dict(r)
+        d["cwe_ids"] = json.loads(d["cwe_ids"]) if d["cwe_ids"] else []
+        out[d["cve_id"]] = d
+    return out
+
+
+async def upsert_cve_meta(conn: aiosqlite.Connection, entries: list[dict]) -> None:
+    """Insert or refresh cached metadata for one or more CVEs — each entry:
+    {cve_id, cvss_score, cvss_severity, cwe_ids (list), epss, fetched_at}."""
+    if not entries:
+        return
+    await conn.executemany(
+        """
+        INSERT INTO cve_meta (cve_id, cvss_score, cvss_severity, cwe_ids, epss, fetched_at)
+        VALUES (:cve_id, :cvss_score, :cvss_severity, :cwe_ids, :epss, :fetched_at)
+        ON CONFLICT(cve_id) DO UPDATE SET
+            cvss_score = excluded.cvss_score, cvss_severity = excluded.cvss_severity,
+            cwe_ids = excluded.cwe_ids, epss = excluded.epss, fetched_at = excluded.fetched_at
+        """,
+        [
+            {**e, "cwe_ids": json.dumps(e.get("cwe_ids") or [])}
+            for e in entries
+        ],
+    )
+    await conn.commit()
+
+
 # ── Cases (deduplicated incidents) ──────────────────────────────────────────
 # See pipeline/correlate.py — items with a usable extraction get blocked
 # against existing cases (exact case_key, then fuzzy candidates), merged or
@@ -1530,6 +1613,10 @@ async def create_case(
     item_id: int,
     event_at: str,
     iocs: list[str] | None = None,
+    cvss_max: float | None = None,
+    cwe_ids: list[str] | None = None,
+    epss_max: float | None = None,
+    mitre_techniques: list[str] | None = None,
 ) -> int:
     """Create a new case and link its founding item in one go. Returns the
     new case id.
@@ -1539,19 +1626,26 @@ async def create_case(
     posts), else its seen_at. Seeds both first_seen and last_seen so a case's
     timeline reflects when the incident actually happened/was reported, not
     merely when our scraper first noticed it — see merge_item_into_case for
-    how subsequent items extend this range."""
+    how subsequent items extend this range.
+
+    cvss_max/cwe_ids/epss_max/mitre_techniques: deterministic enrichment
+    aggregates (issue #18) — see pipeline/correlate.py's _resolve_cve_meta/
+    _resolve_mitre. All optional/None-able since enrichment may find
+    nothing for a CVE-less or pre-enrichment item."""
     cur = await conn.execute(
         """
         INSERT INTO cases
             (case_key, title, summary, crime_type, attribution, attribution_confidence,
              damaged_party, damaged_party_sector, damaged_party_country,
              significance, significance_score, status, cve_ids, in_kev,
-             first_seen, last_seen, source_count, extra, iocs)
+             first_seen, last_seen, source_count, extra, iocs,
+             cvss_max, cwe_ids, epss_max, mitre_techniques)
         VALUES
             (:case_key, :title, :summary, :crime_type, :attribution, :attribution_confidence,
              :damaged_party, :damaged_party_sector, :damaged_party_country,
              :significance, :significance_score, 'new', :cve_ids, :in_kev,
-             :event_at, :event_at, 1, '{}', :iocs)
+             :event_at, :event_at, 1, '{}', :iocs,
+             :cvss_max, :cwe_ids, :epss_max, :mitre_techniques)
         """,
         {
             "case_key": case_key,
@@ -1569,6 +1663,10 @@ async def create_case(
             "in_kev": 1 if in_kev else 0,
             "event_at": event_at,
             "iocs": json.dumps(iocs or []),
+            "cvss_max": cvss_max,
+            "cwe_ids": json.dumps(cwe_ids or []),
+            "epss_max": epss_max,
+            "mitre_techniques": json.dumps(mitre_techniques or []),
         },
     )
     case_id = cur.lastrowid
@@ -1595,10 +1693,15 @@ async def merge_item_into_case(
     damaged_party_country: str | None,
     event_at: str,
     iocs: list[str] | None = None,
+    cvss_max: float | None = None,
+    cwe_ids: list[str] | None = None,
+    epss_max: float | None = None,
+    mitre_techniques: list[str] | None = None,
 ) -> None:
     """Link a corroborating item into an existing case and recompute its
     aggregate fields: significance/score, cve_ids (union), iocs (union),
-    in_kev (OR), first_seen/last_seen (widened to cover this item's real
+    in_kev (OR), cvss_max/epss_max (max), cwe_ids/mitre_techniques (union),
+    first_seen/last_seen (widened to cover this item's real
     event date — see event_at), source_count (recount of distinct item
     sources). Sparse fields (crime_type/attribution/sector/country) are only
     filled in when the case doesn't have a value yet — first reporter's
@@ -1630,6 +1733,15 @@ async def merge_item_into_case(
 
     existing_iocs = json.loads(case["iocs"]) if case["iocs"] else []
     merged_iocs = list(dict.fromkeys([*existing_iocs, *(iocs or [])]))
+
+    existing_cwe_ids = json.loads(case["cwe_ids"]) if case["cwe_ids"] else []
+    merged_cwe_ids = list(dict.fromkeys([*existing_cwe_ids, *(cwe_ids or [])]))
+
+    existing_mitre = json.loads(case["mitre_techniques"]) if case["mitre_techniques"] else []
+    merged_mitre = list(dict.fromkeys([*existing_mitre, *(mitre_techniques or [])]))
+
+    merged_cvss_max = max((v for v in (case["cvss_max"], cvss_max) if v is not None), default=None)
+    merged_epss_max = max((v for v in (case["epss_max"], epss_max) if v is not None), default=None)
 
     researched_row = await conn.execute_fetchall(
         "SELECT 1 FROM research_runs WHERE case_id = :case_id AND status = 'completed' LIMIT 1",
@@ -1671,7 +1783,11 @@ async def merge_item_into_case(
             damaged_party_country = COALESCE(damaged_party_country, :damaged_party_country),
             first_seen = MIN(first_seen, :event_at),
             last_seen = MAX(last_seen, :event_at),
-            source_count = :source_count
+            source_count = :source_count,
+            cvss_max = :cvss_max,
+            cwe_ids = :cwe_ids,
+            epss_max = :epss_max,
+            mitre_techniques = :mitre_techniques
         WHERE id = :case_id
         """,
         {
@@ -1688,6 +1804,10 @@ async def merge_item_into_case(
             "damaged_party_country": normalize_country(damaged_party_country),
             "event_at": event_at,
             "source_count": source_count,
+            "cvss_max": merged_cvss_max,
+            "cwe_ids": json.dumps(merged_cwe_ids),
+            "epss_max": merged_epss_max,
+            "mitre_techniques": json.dumps(merged_mitre),
         },
     )
     await conn.commit()
@@ -1752,6 +1872,17 @@ async def merge_cases(
     drop_iocs = json.loads(drop["iocs"]) if drop["iocs"] else []
     merged_iocs = list(dict.fromkeys([*keep_iocs, *drop_iocs]))
 
+    keep_cwe_ids = json.loads(keep["cwe_ids"]) if keep["cwe_ids"] else []
+    drop_cwe_ids = json.loads(drop["cwe_ids"]) if drop["cwe_ids"] else []
+    merged_cwe_ids = list(dict.fromkeys([*keep_cwe_ids, *drop_cwe_ids]))
+
+    keep_mitre = json.loads(keep["mitre_techniques"]) if keep["mitre_techniques"] else []
+    drop_mitre = json.loads(drop["mitre_techniques"]) if drop["mitre_techniques"] else []
+    merged_mitre = list(dict.fromkeys([*keep_mitre, *drop_mitre]))
+
+    merged_cvss_max = max((v for v in (keep["cvss_max"], drop["cvss_max"]) if v is not None), default=None)
+    merged_epss_max = max((v for v in (keep["epss_max"], drop["epss_max"]) if v is not None), default=None)
+
     # Same precedence rule as merge_item_into_case: once the surviving case
     # has a completed research run, its significance is owned by the
     # researcher/decay job and an incoming (possibly stale) dropped case
@@ -1790,7 +1921,11 @@ async def merge_cases(
             first_seen = MIN(first_seen, :drop_first_seen),
             last_seen = MAX(last_seen, :drop_last_seen),
             source_count = :source_count,
-            status = COALESCE(NULLIF(status, 'new'), :drop_status, status)
+            status = COALESCE(NULLIF(status, 'new'), :drop_status, status),
+            cvss_max = :cvss_max,
+            cwe_ids = :cwe_ids,
+            epss_max = :epss_max,
+            mitre_techniques = :mitre_techniques
         WHERE id = :case_id
         """,
         {
@@ -1812,6 +1947,10 @@ async def merge_cases(
             "drop_last_seen": drop["last_seen"],
             "source_count": source_count,
             "drop_status": drop["status"],
+            "cvss_max": merged_cvss_max,
+            "cwe_ids": json.dumps(merged_cwe_ids),
+            "epss_max": merged_epss_max,
+            "mitre_techniques": json.dumps(merged_mitre),
         },
     )
 
@@ -1947,6 +2086,8 @@ async def fetch_cases(
         d["cve_ids"] = json.loads(d["cve_ids"]) if d["cve_ids"] else []
         d["iocs"] = json.loads(d["iocs"]) if d["iocs"] else []
         d["in_kev"] = bool(d["in_kev"])
+        d["cwe_ids"] = json.loads(d["cwe_ids"]) if d["cwe_ids"] else []
+        d["mitre_techniques"] = json.loads(d["mitre_techniques"]) if d["mitre_techniques"] else []
         out.append(d)
     return out
 
