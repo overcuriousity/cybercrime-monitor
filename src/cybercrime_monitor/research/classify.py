@@ -143,10 +143,21 @@ async def _classify_one(db_conn, source: dict) -> bool:
         )
         return False
 
+    # run_classify_batch selects sources missing region OR media_kind — only
+    # write the field(s) actually missing, so a source already classified in
+    # one dimension doesn't get its other, already-set field silently
+    # overwritten by this backfill pass.
+    fields: dict[str, str] = {}
+    if not source.get("region"):
+        fields["region"] = region
+    if not source.get("media_kind"):
+        fields["media_kind"] = media_kind
+    if not fields:
+        return True
+
     try:
         before, after = source_writer.update_field(
-            source["id"], reason="hermes-agent region/media_kind classification",
-            region=region, media_kind=media_kind,
+            source["id"], reason="hermes-agent region/media_kind classification", **fields
         )
     except source_writer.SourceWriteError as exc:
         log.error("[classify] source %s: write failed: %s", source["id"], exc)

@@ -154,6 +154,27 @@ class Settings(BaseSettings):
     # tick — at hermes_max_concurrent_runs=2, a 2h floor still caps one stuck
     # case to a handful of attempts/day, not one per tick.
     research_failure_retry_hours: int = 2
+    # Significance-scaled re-research cadence — this is the lever that makes
+    # token spend track case importance instead of a flat cooldown (see
+    # db.get_cases_needing_research). A case at "info" is researched exactly
+    # ONCE (no interval — it's eligible iff it has zero completed runs); a
+    # "warn" case is re-researched on research_warn_interval_seconds; a
+    # "critical" case (a clear victim with an ONGOING crime) is re-researched
+    # on the much shorter research_critical_interval_seconds, since fresh
+    # info matters most while a crime is still unfolding.
+    research_critical_interval_seconds: int = 86400  # daily
+    research_warn_interval_seconds: int = 604800  # weekly
+    # Mechanical staleness safety-net (db.run_significance_decay), independent
+    # of any research pass: a case with no new corroborating item AND no
+    # completed research run within this window is treated as no longer
+    # "ongoing" and is capped down a level (critical->warn->info). Only
+    # applies once research_age exceeds this window too, so an
+    # actively-researched critical case (daily cadence, well within this
+    # window) is never touched by decay — the researcher's own verdict is
+    # what governs it.
+    research_stale_window_seconds: int = 604800  # 7 days
+    # 0 disables the decay job entirely.
+    significance_decay_interval_seconds: int = 86400
     hermes_heal_interval_seconds: int = 3600
     # Investigator-triggered targeted research (POST /api/investigations,
     # research/investigate.py) — drains queued investigations. The interval

@@ -58,7 +58,8 @@ _WINDOW_DAYS = 30
 # Shared diversity vocabulary — research/classify.py backfills these onto
 # existing sources, research/discover.py asks Hermes to classify new
 # candidates with them, and bucket_counts()/_component_diversity() below
-# read them. "other"/None both mean "not (yet) usefully bucketed".
+# read them. None means "unclassified"; "other" is a valid catch-all region
+# bucket (not eu/us/ru_cn), distinct from being unclassified.
 VALID_REGIONS = {"eu", "us", "ru_cn", "other"}
 VALID_MEDIA_KINDS = {"darknet_forum", "forensic", "press", "blog", "feed"}
 

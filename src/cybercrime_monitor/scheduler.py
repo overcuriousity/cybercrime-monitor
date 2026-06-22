@@ -262,6 +262,30 @@ def build_scheduler(db_conn, sse_broadcaster) -> AsyncIOScheduler:
     else:
         log.info("Retention disabled (retention_days <= 0)")
 
+    if settings.significance_decay_interval_seconds > 0:
+        async def _decay_significance(conn) -> None:
+            try:
+                n = await db_module.run_significance_decay(conn)
+                if n:
+                    log.info("[significance_decay] stepped down %d stale case(s)", n)
+            except Exception as exc:
+                log.error("[significance_decay] failed: %s", exc)
+
+        scheduler.add_job(
+            _decay_significance,
+            trigger=IntervalTrigger(seconds=settings.significance_decay_interval_seconds),
+            id="_significance_decay",
+            name="Mechanical staleness decay for case significance",
+            next_run_time=_offset_now(180),
+            misfire_grace_time=3600,
+            max_instances=1,
+            coalesce=True,
+            kwargs={"conn": db_conn},
+        )
+        log.info("Scheduled significance decay job")
+    else:
+        log.info("Significance decay disabled (significance_decay_interval_seconds <= 0)")
+
     if settings.kev_refresh_interval_seconds > 0:
         from .enrich.kev import refresh_kev_catalog
 
