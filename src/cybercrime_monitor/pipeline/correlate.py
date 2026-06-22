@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from datetime import timedelta, timezone, datetime
 
 from .. import db
+from .. import significance as sig
 from ..api.sse import broadcaster
 from ..enrich import cve as cve_enrich
 from ..enrich import ioc as ioc_enrich
@@ -250,7 +251,7 @@ async def _correlate_one(db_conn, item: dict) -> None:
         damaged_party_sector=item.get("victim_sector"),
         damaged_party_country=item.get("victim_country"),
         significance=item["significance"],
-        significance_score={"info": 1, "warn": 2, "critical": 3}.get(item["significance"], 1) / 3.0,
+        significance_score=sig.significance_score(item["significance"]),
         cve_ids=cve_ids,
         in_kev=in_kev,
         item_id=item["id"],

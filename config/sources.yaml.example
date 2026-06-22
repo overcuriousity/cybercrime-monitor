@@ -1,5 +1,19 @@
 # Source configuration for cybercrime-monitor.
 # Top-level keys: nitter_instances (list), sources (list)
+#
+# Optional per-source fields `region` and `media_kind` feed
+# sources/value.py's diversity/media-prior scoring components and steer the
+# autonomous discover/prune loop (research/discover.py, research/heal.py)
+# toward an even geographic and editorial-type spread instead of letting the
+# corpus drift toward whatever's easiest to crawl. Sources missing either
+# field are left alone (no diversity opinion) until research/classify.py's
+# one-time backfill pass classifies them.
+#   region: eu | us | ru_cn | other
+#   media_kind: darknet_forum (highest value — first-hand forum/marketplace
+#                data) | forensic (incident-response/malware-analysis
+#                writeups) | press (mainstream news) | blog (independent
+#                researcher/hobbyist) | feed (government/vendor advisory or
+#                alert feeds)
 
 nitter_instances:
   - "https://nitter.net"
@@ -20,6 +34,8 @@ sources:
     title_selector: "span.subject_new a, span.subject_old a"
     url_selector: "span.subject_new a, span.subject_old a"
     date_selector: "span.lastpost span"
+    region: other
+    media_kind: darknet_forum  # first-hand leak-forum posts, the highest-value media_kind
 
   - id: leakbase
     name: "Leakbase"
@@ -151,6 +167,8 @@ sources:
     interval_seconds: 300
     jitter: 60
     enabled: true
+    region: other
+    media_kind: blog
 
   - id: mastodon_databreach
     name: "Mastodon #databreach"
@@ -226,6 +244,8 @@ sources:
     jitter: 180
     enabled: true
     source_tags: [advisory, government]
+    region: us
+    media_kind: feed
 
   - id: rss_bleepingcomputer
     name: "BleepingComputer"
@@ -235,6 +255,8 @@ sources:
     jitter: 120
     enabled: true
     source_tags: [security-news]
+    region: us
+    media_kind: press
 
   # ── Ransomware leak-site tracker ───────────────────────────────────────────
   # Structured JSON (victim, group/actor, country, attack date) from

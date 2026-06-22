@@ -15,11 +15,20 @@ Score components (each folded to 0.0-1.0, see _component_* below):
   - case_contribution: how much this source's items end up corroborating
     or founding cases, weighted toward confirmed/significant ones.
   - health: collector reliability (consecutive errors, ever-succeeded).
-  - feedback: analyst-supplied verdicts (db.feedback) on items/cases this
-    source contributed to.
+  - feedback: analyst-supplied (and research/evaluator.py agent-supplied,
+    discounted) verdicts (db.feedback) on items/cases this source
+    contributed to.
   - recency: decay if a source has gone quiet relative to its own configured
     interval — a once-good, now-silent source drifts down over time instead
     of keeping a stale high score forever.
+  - media_prior: a quality prior by media_kind (settings.media_kind_prior)
+    — first-hand darknet-forum data ranks highest, ahead of forensic
+    writeups, feeds, press and blogs. None for sources not yet classified
+    (see research/classify.py).
+  - diversity: rewards a source for sitting in an under-represented
+    region/media_kind bucket relative to the rest of the managed
+    population, so convergence pruning (research/heal.py) doesn't
+    accidentally collapse the corpus onto one geography or media type.
 
 Classification is *relative*: a source is "dead" only if it has never once
 produced a successful fetch while peers are succeeding (an objective,
@@ -36,6 +45,7 @@ from datetime import datetime, timedelta, timezone
 from .. import db
 from .. import health
 from ..scheduler import load_sources
+from ..settings import settings
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +54,14 @@ log = logging.getLogger(__name__)
 # which used to be good but has been silent for months doesn't coast on
 # ancient history forever.
 _WINDOW_DAYS = 30
+
+# Shared diversity vocabulary — research/classify.py backfills these onto
+# existing sources, research/discover.py asks Hermes to classify new
+# candidates with them, and bucket_counts()/_component_diversity() below
+# read them. None means "unclassified"; "other" is a valid catch-all region
+# bucket (not eu/us/ru_cn), distinct from being unclassified.
+VALID_REGIONS = {"eu", "us", "ru_cn", "other"}
+VALID_MEDIA_KINDS = {"darknet_forum", "forensic", "press", "blog", "feed"}
 
 
 def _now() -> datetime:
@@ -90,15 +108,89 @@ def _component_health(source_id: str) -> tuple[float | None, bool]:
     return score, True
 
 
-def _component_feedback(counts: dict[str, int] | None) -> float | None:
-    if not counts:
+def _component_feedback(by_origin: dict[str, dict[str, int]] | None) -> float | None:
+    """`by_origin` is db.aggregate_feedback_by_source's per-source value:
+    {"human": {verdict: n}, "agent": {verdict: n}}. Human and agent verdicts
+    are blended into one ratio, but an agent verdict (research/evaluator.py)
+    counts for only settings.feedback_agent_weight of a human one — synthetic
+    signal fills the gap when there's no analyst feedback yet, but a real
+    analyst's call always dominates when both exist."""
+    if not by_origin:
         return None
-    positive = counts.get("useful", 0)
-    negative = counts.get("not_useful", 0) + counts.get("noise", 0) + counts.get("wrong_attribution", 0)
-    total = positive + negative
-    if total == 0:
+    origin_weights = {"human": 1.0, "agent": settings.feedback_agent_weight}
+    weighted_positive = 0.0
+    weighted_total = 0.0
+    for origin, counts in by_origin.items():
+        w = origin_weights.get(origin, 0.0)
+        if w <= 0:
+            continue
+        positive = counts.get("useful", 0)
+        negative = counts.get("not_useful", 0) + counts.get("noise", 0) + counts.get("wrong_attribution", 0)
+        weighted_positive += positive * w
+        weighted_total += (positive + negative) * w
+    if weighted_total == 0:
         return None
-    return max(0.0, min(1.0, positive / total))
+    return max(0.0, min(1.0, weighted_positive / weighted_total))
+
+
+def _component_media_prior(src: dict) -> float | None:
+    """Quality prior by media_kind — first-hand darknet-forum data is the
+    most valuable signal this system can find. None (no opinion) for
+    sources not yet classified by research/classify.py."""
+    media_kind = src.get("media_kind")
+    if media_kind not in VALID_MEDIA_KINDS:
+        return None
+    return settings.media_kind_prior.get(media_kind, 0.6)
+
+
+def bucket_counts(sources: list[dict]) -> dict:
+    """Enabled-source counts per region and per media_kind — the shared
+    input for the diversity component below, research/discover.py's
+    under-represented-bucket prompt steer, and (implicitly, via the score)
+    research/heal.py's convergence pruning. Sources missing the field, or
+    carrying an invalid one (e.g. a typo from hand-editing sources.yaml —
+    these fields aren't otherwise validated on load), are excluded from
+    that dimension's tally rather than lumped into a fake bucket."""
+    region: dict[str, int] = {}
+    media_kind: dict[str, int] = {}
+    for src in sources:
+        if not src.get("enabled", True):
+            continue
+        r = src.get("region")
+        if r in VALID_REGIONS:
+            region[r] = region.get(r, 0) + 1
+        m = src.get("media_kind")
+        if m in VALID_MEDIA_KINDS:
+            media_kind[m] = media_kind.get(m, 0) + 1
+    return {
+        "region": region,
+        "region_total": sum(region.values()),
+        "media_kind": media_kind,
+        "media_kind_total": sum(media_kind.values()),
+    }
+
+
+def _component_diversity(src: dict, buckets: dict) -> float | None:
+    """Higher when this source's region/media_kind sit in a thinner slice of
+    the managed population — a soft nudge (not a hard prune guard, per the
+    explicit steer) so convergence pruning naturally leaves under-represented
+    geographies/media types alone in favor of trimming over-represented
+    ones. None for sources not yet classified (or carrying an invalid
+    region/media_kind — see bucket_counts' docstring; an invalid value must
+    not get a free maximal bonus just because it's absent from every
+    bucket)."""
+    shares = []
+    region = src.get("region")
+    if region in VALID_REGIONS and buckets.get("region_total"):
+        share = buckets["region"].get(region, 0) / buckets["region_total"]
+        shares.append(max(0.0, min(1.0, 1.0 - share)))
+    media_kind = src.get("media_kind")
+    if media_kind in VALID_MEDIA_KINDS and buckets.get("media_kind_total"):
+        share = buckets["media_kind"].get(media_kind, 0) / buckets["media_kind_total"]
+        shares.append(max(0.0, min(1.0, 1.0 - share)))
+    if not shares:
+        return None
+    return sum(shares) / len(shares)
 
 
 def _component_recency(source_id: str, interval_seconds: int) -> float:
@@ -117,11 +209,13 @@ def _component_recency(source_id: str, interval_seconds: int) -> float:
 
 
 _WEIGHTS = {
-    "yield": 0.30,
-    "case_contribution": 0.30,
+    "yield": 0.25,
+    "case_contribution": 0.25,
     "health": 0.20,
     "feedback": 0.10,
-    "recency": 0.10,
+    "recency": 0.05,
+    "media_prior": 0.10,
+    "diversity": 0.05,
 }
 
 
@@ -155,6 +249,7 @@ async def compute_all(conn) -> dict[str, dict]:
     contribution_stats = await db.case_contribution_by_source(conn, since_iso=since_iso)
     feedback_stats = await db.aggregate_feedback_by_source(conn, since_iso=since_iso)
     max_cases_touched = max((s.get("cases_touched") or 0) for s in contribution_stats.values()) if contribution_stats else 0
+    buckets = bucket_counts(sources)
 
     raw: dict[str, dict] = {}
     for src in sources:
@@ -168,6 +263,8 @@ async def compute_all(conn) -> dict[str, dict]:
             "health": health_score,
             "feedback": _component_feedback(feedback_stats.get(sid)),
             "recency": _component_recency(sid, src.get("interval_seconds", 600)),
+            "media_prior": _component_media_prior(src),
+            "diversity": _component_diversity(src, buckets),
         }
         score = _blend(components)
         raw[sid] = {

@@ -13,9 +13,10 @@ run must never stall the rest of the pipeline.
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from .. import db
+from .. import significance as sig
 from ..api.sse import broadcaster
 from ..hermes.runner import run_agent
 from ..settings import settings
@@ -91,11 +92,6 @@ async def _log_activity(
     except Exception as exc:
         log.error("[research] activity log failed: %s", exc)
 
-# A case that yielded nothing new on a research pass isn't re-researched
-# every tick forever — this cooldown bounds how often the same case can be
-# picked up again (see db.get_cases_needing_research).
-_RESEARCH_COOLDOWN_HOURS = 24
-
 _RESEARCH_PROMPT_TEMPLATE = """\
 You are assisting a cybercrime intelligence monitor. Research the following \
 incident using web search and any pages you need to fetch. Try to: confirm \
@@ -114,6 +110,22 @@ are the best source of concrete IoCs and CVEs, often in a table or list — \
 if you find one, pull every IoC and CVE it publishes into this incident's \
 record rather than just summarizing the prose.
 
+Also judge the case's CURRENT significance based on everything you found —
+this re-classifies the case (it can move up or down from where it started):
+- "critical": there is a clear victim AND the crime is still ongoing — new \
+information is still being produced (an active sale, a live extortion \
+countdown, exploitation still happening, the actor still posting updates). \
+Set "ongoing": true whenever you call it "critical" — critical requires \
+ongoing.
+- "warn": a clear victim and a clear act of crime (breach/sale/ransomware, \
+possibly a CVE) with real consequences, but it is NOT ongoing anymore — a \
+closed/past incident.
+- "info": on closer inspection this case is irrelevant, stale, unconfirmed, \
+or too insignificant to track closely.
+Be honest about degrading a case — if you find nothing to corroborate it or \
+it's clearly old news with no new developments, say so; that's exactly what \
+this judgment is for.
+
 INCIDENT:
 Title: {title}
 Crime type: {crime_type}
@@ -127,7 +139,8 @@ When you are done, respond with ONLY a single-line JSON object as your \
 final message, no markdown fencing, no commentary, exactly these keys:
 {{"confirmed": true|false, "attribution": <string|null>, "damaged_party": <string|null>, \
 "summary": "<2-3 sentence summary of what you found>", "sources": [<url>...], \
-"iocs": [<string>...], "confidence": <0.0-1.0>}}
+"iocs": [<string>...], "confidence": <0.0-1.0>, \
+"significance": "info"|"warn"|"critical", "ongoing": true|false}}
 """
 
 
@@ -165,6 +178,27 @@ def _gap_note(case: dict) -> str:
     )
 
 
+def _reconcile_verdict(verdict, ongoing: bool) -> str | None:
+    """Validate and reconcile the researcher's significance/ongoing verdict
+    before it's allowed to reclassify a case. Returns None when the verdict
+    shouldn't be applied at all (this research pass leaves the case's
+    current level untouched — see _research_one's confidence gate for the
+    other half of that decision).
+
+    "critical" requires "ongoing": true by definition (see the case-level
+    rubric in _RESEARCH_PROMPT_TEMPLATE) — a model that returns critical
+    without confirming the crime is still active is downgraded to "warn"
+    rather than trusted at face value or discarded outright."""
+    if not isinstance(verdict, str):
+        return None
+    verdict = verdict.lower()
+    if verdict not in sig.VALID_SIGNIFICANCE:
+        return None
+    if verdict == "critical" and not ongoing:
+        return "warn"
+    return verdict
+
+
 def _build_prompt(case: dict) -> str:
     return _RESEARCH_PROMPT_TEMPLATE.format(
         title=case.get("title") or "",
@@ -183,9 +217,14 @@ async def run_research_batch(db_conn) -> int:
     significant, not-recently-researched cases, concurrently. Returns the
     number of cases processed (regardless of outcome — a failed/timed-out
     run still counts, since it consumed a research_runs row and won't be
-    retried until its cooldown elapses — the full 24h for a completed run,
-    but only settings.research_failure_retry_hours for a failed one; see
-    db.get_cases_needing_research's docstring).
+    retried until its cooldown elapses). The cooldown is significance-scaled,
+    not a flat window: a completed run blocks re-research for
+    settings.research_critical_interval_seconds (critical, daily by default)
+    or settings.research_warn_interval_seconds (warn, weekly by default), and
+    an info case is researched exactly once and never again automatically.
+    A *failed* run instead uses the much shorter
+    settings.research_failure_retry_hours, regardless of level — see
+    db._research_eligibility_sql's docstring for the exact predicate.
 
     Cases are fetched settings.hermes_research_batch_size at a time and
     dispatched together via asyncio.gather, but actual parallelism is capped
@@ -200,11 +239,8 @@ async def run_research_batch(db_conn) -> int:
 
     record_run_start()
     now = datetime.now(timezone.utc)
-    cooldown_iso = (now - timedelta(hours=_RESEARCH_COOLDOWN_HOURS)).isoformat()
-    failure_cooldown_iso = (now - timedelta(hours=settings.research_failure_retry_hours)).isoformat()
     cases = await db.get_cases_needing_research(
-        db_conn, limit=settings.hermes_research_batch_size,
-        cooldown_iso=cooldown_iso, failure_cooldown_iso=failure_cooldown_iso,
+        db_conn, limit=settings.hermes_research_batch_size, now=now,
     )
 
     async def _one(case: dict) -> bool:
@@ -288,6 +324,15 @@ async def _research_one(db_conn, case: dict) -> None:
     iocs = data.get("iocs") if isinstance(data.get("iocs"), list) else []
     iocs = [str(x) for x in iocs][:50]
 
+    # The researcher may escalate OR degrade the case's significance (e.g.
+    # critical -> info if it turned out stale/irrelevant, or info -> critical
+    # if it's a significant ongoing crime) — see _reconcile_verdict's
+    # docstring and db.apply_research_findings's significance-precedence
+    # note. Gated on the same confidence>=0.5 bar as status promotion so a
+    # weak pass can't flap a case's level on shaky evidence.
+    reconciled = _reconcile_verdict(data.get("significance"), bool(data.get("ongoing")))
+    new_significance = reconciled if (reconciled and confidence >= 0.5) else None
+
     await db.apply_research_findings(
         db_conn,
         iocs=iocs,
@@ -296,21 +341,23 @@ async def _research_one(db_conn, case: dict) -> None:
         attribution=attribution,
         damaged_party=damaged_party,
         summary_addendum=summary,
+        significance=new_significance,
     )
     log.info(
-        "[research] case %s -> status=%s confirmed=%s confidence=%.2f",
-        case["id"], new_status, confirmed, confidence,
+        "[research] case %s -> status=%s confirmed=%s confidence=%.2f significance=%s",
+        case["id"], new_status, confirmed, confidence, new_significance or "(unchanged)",
     )
     await _log_activity(
         db_conn, action="research_completed",
         summary=(
             f"Researched case #{case['id']} ({case.get('title') or 'untitled'}) -> "
             f"{new_status} (confidence {confidence:.2f})"
+            + (f", significance -> {new_significance}" if new_significance else "")
         ),
         detail={
             "confirmed": confirmed, "confidence": confidence, "new_status": new_status,
             "attribution": attribution, "damaged_party": damaged_party,
-            "iocs": iocs, "sources": sources,
+            "iocs": iocs, "sources": sources, "significance": new_significance,
         },
         ref_id=case["id"],
     )

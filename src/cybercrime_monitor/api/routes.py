@@ -440,12 +440,11 @@ async def api_status(request: Request, db=Depends(get_db)):
     dh = discover_health.get()
     ih = investigate_health.get()
 
-    # Must mirror research.agent.run_research_batch's eligibility windows
-    # exactly, or this "queued" count would disagree with what the scheduler
-    # is actually about to pick up next tick.
+    # count_cases_needing_research shares db._research_eligibility_sql with
+    # get_cases_needing_research by construction, so this "queued" count
+    # can't drift from what the scheduler is actually about to pick up next
+    # tick — just needs the same `now`.
     _status_now = datetime.now(timezone.utc)
-    cooldown_iso = (_status_now - timedelta(hours=research_health._RESEARCH_COOLDOWN_HOURS)).isoformat()
-    failure_cooldown_iso = (_status_now - timedelta(hours=settings.research_failure_retry_hours)).isoformat()
 
     # Approximate KEV age from the catalog's most recent date_added (CISA
     # publishes the date each CVE was added to the catalog). The scheduler
@@ -506,9 +505,7 @@ async def api_status(request: Request, db=Depends(get_db)):
             "last_error_at": rh.last_error_at,
             "consecutive_errors": rh.consecutive_errors,
             "running": await count_running_research_runs(db),
-            "queued": await count_cases_needing_research(
-                db, cooldown_iso=cooldown_iso, failure_cooldown_iso=failure_cooldown_iso
-            ),
+            "queued": await count_cases_needing_research(db, now=_status_now),
         },
         "heal": {
             "last_run_at": hh.last_run_at,
@@ -1087,8 +1084,8 @@ async def api_investigation_detail(investigation_id: int, db=Depends(get_db)):
 
 # ── AI activity log ───────────────────────────────────────────────────────────
 # Deliberately public, no admin token — every subsystem here (discover/heal/
-# prune/research/classifier/correlator/cross_correlator) already acts fully
-# autonomously with no human approval gate; this is the transparency
+# prune/research/classify/classifier/correlator/cross_correlator/evaluator)
+# already acts fully autonomously with no human approval gate; this is the transparency
 # counterpart, not an admin control surface. See db.py's ai_activity table
 # docstring and db.log_ai_activity.
 

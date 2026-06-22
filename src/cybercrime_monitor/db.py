@@ -1,5 +1,6 @@
 import json
 import logging
+import random
 import re
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
@@ -8,6 +9,7 @@ from typing import AsyncIterator
 
 import aiosqlite
 
+from . import significance as sig
 from .country import normalize_country
 from .models import Item
 from .settings import settings
@@ -271,6 +273,7 @@ CREATE TABLE IF NOT EXISTS feedback (
     item_id     INTEGER REFERENCES items(id) ON DELETE CASCADE,
     verdict     TEXT NOT NULL, -- useful | not_useful | noise | wrong_attribution
     note        TEXT,
+    origin      TEXT NOT NULL DEFAULT 'human', -- human | agent (research/evaluator.py)
     created_at  TEXT NOT NULL
 );
 
@@ -399,7 +402,9 @@ CREATE TABLE IF NOT EXISTS vec_index_state (
 -- Resolves one effective priority rank + false_positive flag per item, from
 -- the LLM extraction's significance — the sole classification signal (the
 -- old regex-matcher fallback was removed; an item simply has no priority
--- until the extraction job reaches it).
+-- until the extraction job reaches it). The rank below is a raw-SQL mirror
+-- of significance.SIG_RANK and must be kept in sync by hand (SQL can't
+-- import it — known sync trap, see significance.py's module docstring).
 DROP VIEW IF EXISTS item_priority;
 CREATE VIEW item_priority AS
 SELECT i.id AS item_id,
@@ -465,6 +470,11 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         if col not in inv_cols:
             await conn.execute(ddl)
             log.info("Migrated investigations table: added %s column", col)
+
+    feedback_cols = {r["name"] for r in await conn.execute_fetchall("PRAGMA table_info(feedback)")}
+    if "origin" not in feedback_cols:
+        await conn.execute("ALTER TABLE feedback ADD COLUMN origin TEXT NOT NULL DEFAULT 'human'")
+        log.info("Migrated feedback table: added origin column")
 
     await _migrate_normalize_countries(conn)
 
@@ -1501,10 +1511,6 @@ async def find_candidate_cases(
     return sorted(candidates.values(), key=lambda c: c["last_seen"], reverse=True)
 
 
-_SIG_RANK = {"info": 1, "warn": 2, "critical": 3}
-_RANK_SIG = {1: "info", 2: "warn", 3: "critical"}
-
-
 async def create_case(
     conn: aiosqlite.Connection,
     *,
@@ -1591,14 +1597,24 @@ async def merge_item_into_case(
     iocs: list[str] | None = None,
 ) -> None:
     """Link a corroborating item into an existing case and recompute its
-    aggregate fields: significance/score (max across all linked items —
-    corroboration never lowers significance), cve_ids (union), iocs (union),
+    aggregate fields: significance/score, cve_ids (union), iocs (union),
     in_kev (OR), first_seen/last_seen (widened to cover this item's real
     event date — see event_at), source_count (recount of distinct item
     sources). Sparse fields (crime_type/attribution/sector/country) are only
     filled in when the case doesn't have a value yet — first reporter's
     structured data wins unless blank, rather than the newest report
     silently overwriting an established attribution.
+
+    Significance precedence: until a case has had its first *completed*
+    research run, corroboration is max-merge — never lowers significance,
+    same as before. Once a case has been researched, the researcher (and the
+    mechanical staleness-decay job, see run_significance_decay) own its
+    level; a new corroborating item no longer re-escalates it on its own —
+    otherwise a researcher's deliberate degrade (case turned out stale/
+    irrelevant) would be silently undone by the next matching item. The
+    level can still change, but only via the next research pass or decay
+    tick. See research/agent.py's _research_one docstring for the other side
+    of this precedence rule.
 
     event_at: the merging item's published_at if known, else its seen_at —
     same convention as create_case. A corroborating report can be OLDER than
@@ -1615,7 +1631,16 @@ async def merge_item_into_case(
     existing_iocs = json.loads(case["iocs"]) if case["iocs"] else []
     merged_iocs = list(dict.fromkeys([*existing_iocs, *(iocs or [])]))
 
-    new_rank = max(_SIG_RANK.get(case["significance"], 1), _SIG_RANK.get(significance, 1))
+    researched_row = await conn.execute_fetchall(
+        "SELECT 1 FROM research_runs WHERE case_id = :case_id AND status = 'completed' LIMIT 1",
+        {"case_id": case_id},
+    )
+    if researched_row:
+        new_significance = case["significance"]
+        new_score = case["significance_score"]
+    else:
+        new_significance = sig.max_significance(case["significance"], significance)
+        new_score = sig.significance_score(new_significance)
 
     await conn.execute(
         "INSERT OR IGNORE INTO case_items (case_id, item_id) VALUES (:case_id, :item_id)",
@@ -1635,7 +1660,7 @@ async def merge_item_into_case(
         """
         UPDATE cases SET
             significance = :significance,
-            significance_score = MAX(significance_score, :significance_score),
+            significance_score = :significance_score,
             cve_ids = :cve_ids,
             iocs = :iocs,
             in_kev = MAX(in_kev, :in_kev),
@@ -1651,8 +1676,8 @@ async def merge_item_into_case(
         """,
         {
             "case_id": case_id,
-            "significance": _RANK_SIG[new_rank],
-            "significance_score": new_rank / 3.0,
+            "significance": new_significance,
+            "significance_score": new_score,
             "cve_ids": json.dumps(merged_cve_ids),
             "iocs": json.dumps(merged_iocs),
             "in_kev": 1 if in_kev else 0,
@@ -1727,10 +1752,20 @@ async def merge_cases(
     drop_iocs = json.loads(drop["iocs"]) if drop["iocs"] else []
     merged_iocs = list(dict.fromkeys([*keep_iocs, *drop_iocs]))
 
-    new_rank = max(
-        _SIG_RANK.get(keep["significance"], 1),
-        _SIG_RANK.get(drop["significance"], 1),
+    # Same precedence rule as merge_item_into_case: once the surviving case
+    # has a completed research run, its significance is owned by the
+    # researcher/decay job and an incoming (possibly stale) dropped case
+    # must not silently re-escalate it.
+    keep_researched_row = await conn.execute_fetchall(
+        "SELECT 1 FROM research_runs WHERE case_id = :case_id AND status = 'completed' LIMIT 1",
+        {"case_id": keep_case_id},
     )
+    if keep_researched_row:
+        merged_significance = keep["significance"]
+        merged_score = keep["significance_score"]
+    else:
+        merged_significance = sig.max_significance(keep["significance"], drop["significance"])
+        merged_score = sig.significance_score(merged_significance)
 
     # Prefer the more specific victim/title when one clearly extends the other.
     merged_damaged_party = _prefer_more_specific(keep["damaged_party"], drop["damaged_party"])
@@ -1762,8 +1797,8 @@ async def merge_cases(
             "case_id": keep_case_id,
             "title": merged_title or keep["title"],
             "summary": (keep["summary"] or "") + (f"\n\n{drop['summary']}" if drop.get("summary") else ""),
-            "significance": _RANK_SIG[new_rank],
-            "significance_score": new_rank / 3.0,
+            "significance": merged_significance,
+            "significance_score": merged_score,
             "cve_ids": json.dumps(merged_cve_ids),
             "iocs": json.dumps(merged_iocs),
             "in_kev": 1 if drop["in_kev"] else 0,
@@ -1811,10 +1846,13 @@ def _build_cases_where(
     parts = []
     params: dict = {}
     if min_significance:
+        # Raw-SQL rank mirror of significance.SIG_RANK — kept manually in
+        # sync since SQL can't import it (known sync trap, see
+        # significance.py's module docstring).
         parts.append("(:min_rank = 0 OR " +
                       "CASE significance WHEN 'critical' THEN 3 WHEN 'warn' THEN 2 WHEN 'info' THEN 1 ELSE 0 END"
                       " >= :min_rank)")
-        params["min_rank"] = _SIG_RANK.get(min_significance, 0)
+        params["min_rank"] = sig.SIG_RANK.get(min_significance, 0)
     if crime_type:
         parts.append("crime_type = :crime_type")
         params["crime_type"] = crime_type
@@ -1949,45 +1987,88 @@ async def count_cases(
 # autonomous OSINT but haven't been researched (recently). research_runs is
 # the log; cases.status tracks where a case is in that lifecycle.
 
-async def get_cases_needing_research(
-    conn: aiosqlite.Connection, *, limit: int, cooldown_iso: str, failure_cooldown_iso: str
-) -> list[dict]:
-    """Cases worth spending a Hermes research run on: either explicitly
-    forced via POST /api/cases/{id}/research (research_requested_at set —
-    bypasses both the significance and cooldown gates, since an analyst
-    asking for a re-research means "go again right now"), or naturally
-    significant (warn/critical) and not recently researched. "Recently" is
-    two different windows depending on outcome: a *completed* run blocks
-    re-research for `cooldown_iso` (don't waste a run re-asking a question
-    we already have an answer to) — but a *failed* run only blocks for the
-    much shorter `failure_cooldown_iso` (see settings.research_failure_retry_hours's
-    docstring): a failure means we have no answer at all, so locking the
-    case out for a full cooldown period just because the backend hiccuped
-    wastes the case's slot in the queue for no benefit. Forced cases sort
-    first, then critical-before-warn, then oldest-first, so a backlog
-    drains in a stable order rather than thrashing between cases."""
-    rows = await conn.execute_fetchall(
-        """
-        SELECT * FROM cases
-        WHERE research_requested_at IS NOT NULL
-           OR (
-             significance IN ('warn', 'critical')
+def _research_eligibility_sql() -> str:
+    """Shared WHERE-clause body for "is this case due for a research pass" —
+    used by BOTH get_cases_needing_research and count_cases_needing_research
+    so they cannot drift out of agreement (the dashboard's queued count must
+    match what the scheduler is actually about to pick up next tick).
+
+    A case qualifies if it's explicitly forced (research_requested_at set —
+    bypasses every other gate, since an analyst asking for a re-research
+    means "go again right now"), OR it's past the failure-retry guard AND
+    due per its significance-scaled cadence:
+      - info: researched exactly ONCE — eligible iff it has zero completed
+        runs ever (no interval; see settings.research_critical/warn_interval).
+      - warn: eligible if its last completed run is older than
+        settings.research_warn_interval_seconds.
+      - critical: eligible if its last completed run is older than
+        settings.research_critical_interval_seconds (an ongoing crime needs
+        fresher info, so this is the shortest interval).
+    The failure-retry guard (a non-completed run more recent than
+    settings.research_failure_retry_hours) applies across all three levels —
+    a failure means no answer was produced at all, so it shouldn't lock a
+    case out for a full cadence interval just because the backend hiccuped."""
+    return """
+        research_requested_at IS NOT NULL
+        OR (
+          NOT EXISTS (
+            SELECT 1 FROM research_runs r
+            WHERE r.case_id = cases.id
+              AND r.status != 'completed'
+              AND r.started_at >= :failure_cutoff
+          )
+          AND (
+            (significance = 'info'
              AND NOT EXISTS (
                SELECT 1 FROM research_runs r
-               WHERE r.case_id = cases.id
-                 AND (
-                   (r.status = 'completed' AND r.started_at >= :cooldown)
-                   OR (r.status != 'completed' AND r.started_at >= :failure_cooldown)
-                 )
-             )
-           )
+               WHERE r.case_id = cases.id AND r.status = 'completed'
+             ))
+            OR (significance = 'warn'
+                AND NOT EXISTS (
+                  SELECT 1 FROM research_runs r
+                  WHERE r.case_id = cases.id AND r.status = 'completed'
+                    AND r.started_at >= :warn_cutoff
+                ))
+            OR (significance = 'critical'
+                AND NOT EXISTS (
+                  SELECT 1 FROM research_runs r
+                  WHERE r.case_id = cases.id AND r.status = 'completed'
+                    AND r.started_at >= :critical_cutoff
+                ))
+          )
+        )
+    """
+
+
+def _research_eligibility_params(now: datetime) -> dict:
+    return {
+        "failure_cutoff": (now - timedelta(hours=settings.research_failure_retry_hours)).isoformat(),
+        "warn_cutoff": (now - timedelta(seconds=settings.research_warn_interval_seconds)).isoformat(),
+        "critical_cutoff": (now - timedelta(seconds=settings.research_critical_interval_seconds)).isoformat(),
+    }
+
+
+async def get_cases_needing_research(
+    conn: aiosqlite.Connection, *, limit: int, now: datetime
+) -> list[dict]:
+    """Cases worth spending a Hermes research run on this tick — see
+    _research_eligibility_sql's docstring for the exact eligibility rule.
+    Forced cases sort first, then critical-before-warn-before-info, then
+    oldest-first, so a backlog drains in a stable order rather than
+    thrashing between cases. info cases sort last among naturally-eligible
+    cases, so their one-time pass never displaces a warn/critical case
+    within a bounded batch."""
+    rows = await conn.execute_fetchall(
+        f"""
+        SELECT * FROM cases
+        WHERE {_research_eligibility_sql()}
         ORDER BY
             (research_requested_at IS NOT NULL) DESC,
             CASE significance WHEN 'critical' THEN 3 WHEN 'warn' THEN 2 ELSE 1 END DESC,
             last_seen ASC
         LIMIT :limit
         """,
-        {"cooldown": cooldown_iso, "failure_cooldown": failure_cooldown_iso, "limit": limit},
+        {**_research_eligibility_params(now), "limit": limit},
     )
     out = []
     for r in rows:
@@ -2023,27 +2104,15 @@ async def request_case_research(conn: aiosqlite.Connection, *, case_id: int) -> 
     return cur.rowcount > 0
 
 
-async def count_cases_needing_research(
-    conn: aiosqlite.Connection, *, cooldown_iso: str, failure_cooldown_iso: str
-) -> int:
+async def count_cases_needing_research(conn: aiosqlite.Connection, *, now: datetime) -> int:
     """Queued cases waiting for hermes-agent research — surfaced in
-    /api/status. Must mirror get_cases_needing_research's eligibility
-    exactly (success vs failure cooldown), or this count would disagree
-    with what the scheduler is actually about to pick up."""
+    /api/status. Uses the exact same _research_eligibility_sql predicate as
+    get_cases_needing_research (by construction, not just convention) so
+    this count can never disagree with what the scheduler is actually about
+    to pick up."""
     row = await conn.execute_fetchall(
-        """
-        SELECT COUNT(*) AS n FROM cases
-        WHERE significance IN ('warn', 'critical')
-          AND NOT EXISTS (
-            SELECT 1 FROM research_runs r
-            WHERE r.case_id = cases.id
-              AND (
-                (r.status = 'completed' AND r.started_at >= :cooldown)
-                OR (r.status != 'completed' AND r.started_at >= :failure_cooldown)
-              )
-          )
-        """,
-        {"cooldown": cooldown_iso, "failure_cooldown": failure_cooldown_iso},
+        f"SELECT COUNT(*) AS n FROM cases WHERE {_research_eligibility_sql()}",
+        _research_eligibility_params(now),
     )
     return row[0]["n"] if row else 0
 
@@ -2097,6 +2166,7 @@ async def apply_research_findings(
     damaged_party: str | None,
     summary_addendum: str | None,
     iocs: list[str] | None = None,
+    significance: str | None = None,
 ) -> None:
     """Merge Hermes' research findings back into the case. Sparse fields
     (attribution/damaged_party) only fill in if the case doesn't have a
@@ -2106,7 +2176,18 @@ async def apply_research_findings(
     disagrees with. iocs are unioned in (research can only add indicators,
     never remove ones extraction already found). Always clears
     research_requested_at — a forced research request is satisfied by one
-    completed run, whatever it found."""
+    completed run, whatever it found.
+
+    significance, when not None, is the researcher's reclassification
+    verdict (research/agent.py's _reconcile_verdict) and is an
+    AUTHORITATIVE OVERWRITE — unlike the sparse fields above, it can both
+    raise and lower the case's level, including degrading a critical case to
+    info if it turned out stale/irrelevant. This is the one place a case's
+    significance is allowed to go down. When significance is None (no
+    verdict, or one filtered out by the confidence gate), the case's current
+    significance/significance_score are left untouched. See
+    merge_item_into_case's docstring for how this interacts with later
+    item corroboration."""
     case = await get_case_by_id(conn, case_id)
     if case is None:
         return
@@ -2123,6 +2204,10 @@ async def apply_research_findings(
             damaged_party = COALESCE(damaged_party, :damaged_party),
             summary = :summary,
             iocs = :iocs,
+            significance = COALESCE(:significance, significance),
+            significance_score = CASE WHEN :significance IS NULL
+                                       THEN significance_score
+                                       ELSE :significance_score END,
             research_requested_at = NULL
         WHERE id = :case_id
         """,
@@ -2133,6 +2218,8 @@ async def apply_research_findings(
             "damaged_party": damaged_party,
             "summary": summary,
             "iocs": json.dumps(merged_iocs),
+            "significance": significance,
+            "significance_score": sig.significance_score(significance) if significance else None,
         },
     )
     await conn.commit()
@@ -2390,6 +2477,7 @@ async def count_running_research_runs(conn: aiosqlite.Connection) -> int:
 # autonomous source loop knows which sources the analyst trusts.
 
 VALID_FEEDBACK_VERDICTS = {"useful", "not_useful", "noise", "wrong_attribution"}
+VALID_FEEDBACK_ORIGINS = {"human", "agent"}
 
 
 async def add_feedback(
@@ -2399,26 +2487,58 @@ async def add_feedback(
     item_id: int | None,
     verdict: str,
     note: str | None,
+    origin: str = "human",
 ) -> int:
     if verdict not in VALID_FEEDBACK_VERDICTS:
         raise ValueError(f"invalid verdict: {verdict!r}")
+    if origin not in VALID_FEEDBACK_ORIGINS:
+        raise ValueError(f"invalid origin: {origin!r}")
     if bool(case_id) == bool(item_id):
         raise ValueError("feedback needs exactly one of case_id or item_id")
     cur = await conn.execute(
         """
-        INSERT INTO feedback (case_id, item_id, verdict, note, created_at)
-        VALUES (:case_id, :item_id, :verdict, :note, :created_at)
+        INSERT INTO feedback (case_id, item_id, verdict, note, origin, created_at)
+        VALUES (:case_id, :item_id, :verdict, :note, :origin, :created_at)
         """,
         {
             "case_id": case_id,
             "item_id": item_id,
             "verdict": verdict,
             "note": (note or "")[:1000] or None,
+            "origin": origin,
             "created_at": _utcnow().isoformat(),
         },
     )
     await conn.commit()
     return cur.lastrowid
+
+
+async def get_case_for_evaluation(conn: aiosqlite.Connection) -> dict | None:
+    """Pick a case for research/evaluator.py to judge — biased toward recent
+    cases with the fewest existing feedback rows (so the agent fills gaps
+    human review hasn't reached yet, rather than re-grading the same
+    well-covered cases), with a random tiebreak among equally under-covered
+    candidates so the agent doesn't loop on the same single case forever."""
+    rows = await conn.execute_fetchall(
+        """
+        SELECT c.id, c.title,
+               (
+                   SELECT COUNT(*) FROM feedback f WHERE f.case_id = c.id
+               ) + (
+                   SELECT COUNT(*) FROM feedback f
+                   JOIN case_items ci ON ci.item_id = f.item_id
+                   WHERE ci.case_id = c.id AND f.item_id IS NOT NULL
+               ) AS feedback_count
+        FROM cases c
+        ORDER BY feedback_count ASC, c.first_seen DESC
+        LIMIT 20
+        """
+    )
+    if not rows:
+        return None
+    min_count = rows[0]["feedback_count"]
+    candidates = [dict(r) for r in rows if r["feedback_count"] == min_count]
+    return random.choice(candidates)
 
 
 async def get_feedback_for_case(conn: aiosqlite.Connection, case_id: int) -> list[dict]:
@@ -2429,35 +2549,41 @@ async def get_feedback_for_case(conn: aiosqlite.Connection, case_id: int) -> lis
     return [dict(r) for r in rows]
 
 
-async def aggregate_feedback_by_source(conn: aiosqlite.Connection, *, since_iso: str) -> dict[str, dict[str, int]]:
-    """Verdict counts per source_id since `since_iso`, joining feedback →
-    item/case → originating items.source_id. A case's feedback is
+async def aggregate_feedback_by_source(
+    conn: aiosqlite.Connection, *, since_iso: str
+) -> dict[str, dict[str, dict[str, int]]]:
+    """Verdict counts per source_id since `since_iso`, split by feedback
+    origin ("human" vs "agent" — see research/evaluator.py), joining
+    feedback → item/case → originating items.source_id. A case's feedback is
     attributed to every source that contributed an item to it (a case can
-    span multiple sources). Used by sources/value.py's feedback component
-    and to digest "why" into heal/discover prompts."""
+    span multiple sources). Returns {source_id: {origin: {verdict: count}}}.
+    Used by sources/value.py's feedback component (which weighs human and
+    agent counts differently) and to digest "why" into heal/discover
+    prompts."""
     rows = await conn.execute_fetchall(
         """
-        SELECT i.source_id AS source_id, f.verdict AS verdict, COUNT(*) AS n
+        SELECT i.source_id AS source_id, f.origin AS origin, f.verdict AS verdict, COUNT(*) AS n
         FROM feedback f
         JOIN items i ON i.id = f.item_id
         WHERE f.created_at >= :since AND f.item_id IS NOT NULL
-        GROUP BY i.source_id, f.verdict
+        GROUP BY i.source_id, f.origin, f.verdict
 
         UNION ALL
 
-        SELECT i.source_id AS source_id, f.verdict AS verdict, COUNT(*) AS n
+        SELECT i.source_id AS source_id, f.origin AS origin, f.verdict AS verdict, COUNT(*) AS n
         FROM feedback f
         JOIN case_items ci ON ci.case_id = f.case_id
         JOIN items i ON i.id = ci.item_id
         WHERE f.created_at >= :since AND f.case_id IS NOT NULL
-        GROUP BY i.source_id, f.verdict
+        GROUP BY i.source_id, f.origin, f.verdict
         """,
         {"since": since_iso},
     )
-    out: dict[str, dict[str, int]] = {}
+    out: dict[str, dict[str, dict[str, int]]] = {}
     for r in rows:
-        out.setdefault(r["source_id"], {}).setdefault(r["verdict"], 0)
-        out[r["source_id"]][r["verdict"]] += r["n"]
+        by_origin = out.setdefault(r["source_id"], {})
+        by_verdict = by_origin.setdefault(r["origin"], {})
+        by_verdict[r["verdict"]] = by_verdict.get(r["verdict"], 0) + r["n"]
     return out
 
 
@@ -3009,3 +3135,60 @@ async def stats_cases_by_actor(
     sql = _build_casefold_leaderboard_sql("attribution", where=where) + " LIMIT :limit"
     rows = await conn.execute_fetchall(sql, params)
     return [{"actor": r["value"], "n": r["n"]} for r in rows]
+
+
+async def run_significance_decay(conn: aiosqlite.Connection, *, now: datetime | None = None) -> int:
+    """Mechanical staleness safety-net — the "no research pass needed"
+    half of the hybrid ongoing-metric (see research/agent.py's
+    _RESEARCH_PROMPT_TEMPLATE case-level rubric for the researcher's half).
+
+    A warn/critical case that nobody is feeding (no new corroborating item)
+    AND that research hasn't actively touched within
+    settings.research_stale_window_seconds is no longer "ongoing" by
+    definition and gets capped down: more than one window since last_seen
+    caps at "warn", more than two windows caps at "info". Only ever lowers
+    significance (min(current, cap)) — it can't escalate a case, that's the
+    researcher's job alone.
+
+    Deliberately skips any case research has completed within the window —
+    that case's level is owned by the researcher's own verdict (see
+    merge_item_into_case's precedence note), not this job; a case that's on
+    a daily critical research cadence is therefore never touched here.
+    Stateless and idempotent: recomputed fresh from last_seen/research_runs
+    every tick, no "last decayed" bookkeeping needed. Returns the number of
+    cases stepped down."""
+    now = now or _utcnow()
+    window = settings.research_stale_window_seconds
+    if window <= 0:
+        return 0
+    stale_cutoff = (now - timedelta(seconds=window)).isoformat()
+    two_window_cutoff = (now - timedelta(seconds=2 * window)).isoformat()
+
+    rows = await conn.execute_fetchall(
+        """
+        SELECT id, significance, last_seen FROM cases
+        WHERE significance IN ('warn', 'critical')
+          AND last_seen < :stale_cutoff
+          AND NOT EXISTS (
+            SELECT 1 FROM research_runs r
+            WHERE r.case_id = cases.id
+              AND r.status = 'completed'
+              AND r.started_at >= :stale_cutoff
+          )
+        """,
+        {"stale_cutoff": stale_cutoff},
+    )
+
+    decayed = 0
+    for row in rows:
+        cap = "info" if row["last_seen"] < two_window_cutoff else "warn"
+        if sig.SIG_RANK[cap] >= sig.SIG_RANK[row["significance"]]:
+            continue
+        await conn.execute(
+            "UPDATE cases SET significance = :sig, significance_score = :score WHERE id = :id",
+            {"sig": cap, "score": sig.significance_score(cap), "id": row["id"]},
+        )
+        decayed += 1
+    if decayed:
+        await conn.commit()
+    return decayed

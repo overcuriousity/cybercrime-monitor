@@ -154,6 +154,27 @@ class Settings(BaseSettings):
     # tick — at hermes_max_concurrent_runs=2, a 2h floor still caps one stuck
     # case to a handful of attempts/day, not one per tick.
     research_failure_retry_hours: int = 2
+    # Significance-scaled re-research cadence — this is the lever that makes
+    # token spend track case importance instead of a flat cooldown (see
+    # db.get_cases_needing_research). A case at "info" is researched exactly
+    # ONCE (no interval — it's eligible iff it has zero completed runs); a
+    # "warn" case is re-researched on research_warn_interval_seconds; a
+    # "critical" case (a clear victim with an ONGOING crime) is re-researched
+    # on the much shorter research_critical_interval_seconds, since fresh
+    # info matters most while a crime is still unfolding.
+    research_critical_interval_seconds: int = 86400  # daily
+    research_warn_interval_seconds: int = 604800  # weekly
+    # Mechanical staleness safety-net (db.run_significance_decay), independent
+    # of any research pass: a case with no new corroborating item AND no
+    # completed research run within this window is treated as no longer
+    # "ongoing" and is capped down a level (critical->warn->info). Only
+    # applies once research_age exceeds this window too, so an
+    # actively-researched critical case (daily cadence, well within this
+    # window) is never touched by decay — the researcher's own verdict is
+    # what governs it.
+    research_stale_window_seconds: int = 604800  # 7 days
+    # 0 disables the decay job entirely.
+    significance_decay_interval_seconds: int = 86400
     hermes_heal_interval_seconds: int = 3600
     # Investigator-triggered targeted research (POST /api/investigations,
     # research/investigate.py) — drains queued investigations. The interval
@@ -202,6 +223,33 @@ class Settings(BaseSettings):
     # gets a recovery attempt every _HEAL_COOLDOWN_HOURS before this elapses.
     source_prune_grace_days: int = 5
     source_value_refresh_interval_seconds: int = 1800
+    # Target size of the managed source population — discovery and pruning
+    # both steer toward this number instead of running as independent,
+    # unbounded loops (see research/discover.py's gap-based batch sizing and
+    # research/heal.py's _prune_pass overage trim). A deadband around the
+    # target avoids thrashing (one source added/removed every cycle).
+    source_target_count: int = 25
+    source_target_band: int = 3
+    # 0 disables the evaluator job. A periodic Hermes agent (research/
+    # evaluator.py) that reads a case's items like a human analyst would and
+    # writes its own feedback rows (origin="agent") — gives source scoring an
+    # actionable signal even when no one has clicked a feedback button.
+    hermes_evaluator_interval_seconds: int = 7200
+    evaluator_items_per_run: int = 12
+    # Agent-authored feedback counts toward source scoring at this fraction
+    # of a human verdict's weight (sources/value.py._component_feedback) —
+    # synthetic signal is useful but shouldn't outrank a real analyst's call.
+    feedback_agent_weight: float = 0.5
+    # Quality prior by media kind (sources/value.py._component_media_prior) —
+    # first-hand darknet-forum data is the most valuable signal this system
+    # can find, ahead of forensic writeups, feeds, press and blogs.
+    media_kind_prior: dict[str, float] = {
+        "darknet_forum": 1.0,
+        "forensic": 0.85,
+        "feed": 0.7,
+        "press": 0.6,
+        "blog": 0.55,
+    }
 
     # ── Semantic search / embeddings ────────────────────────────────────────
     # Separate from the llm_* extraction layer above — embeddings are a

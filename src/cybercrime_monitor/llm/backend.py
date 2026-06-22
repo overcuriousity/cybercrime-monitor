@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 
 import httpx
 
+from .. import significance as sig
 from ..hermes.runner import run_agent
 from ..settings import settings
 from . import health as llm_health
@@ -134,24 +135,32 @@ Extract these fields:
   hashes, IPs, onion addresses, leak-site URLs, cryptocurrency wallet \
   addresses used for ransom/extortion payments) — empty array if none.
 
-Assess significance:
-- "critical": an active data-for-sale offering — a named victim AND a named \
-  seller/threat actor, with sale evidence (a price, a marketplace or forum, \
-  a leak sample, or an explicit "for sale"/"selling" claim) — OR a confirmed \
-  exploited/actively-exploited vulnerability with a named victim.
-- "warn": a confirmed exfiltration/breach/ransomware/fraud incident with a \
-  named victim and/or a named threat actor (e.g. a ransomware group's \
-  leak-site posting, a confirmed breach disclosure) but without explicit \
-  sale evidence.
-- "info": cybercrime-related content that names neither a clear victim nor a \
-  clear actor — real, but too vague to act on.
+Assess significance (about THIS single report):
+- "critical": evidence of an ONGOING crime — a named victim AND the harm is \
+  still in progress: an active data-for-sale offering (a price, a \
+  marketplace or forum, a leak sample, or an explicit "for sale"/"selling" \
+  claim), an actively-exploited vulnerability against a named victim, or an \
+  incident the report itself describes as still unfolding (a live \
+  extortion countdown, ongoing exfiltration, the attacker still inside).
+- "warn": a clear, named victim with a concrete act — a confirmed \
+  exfiltration/breach/ransomware/fraud incident, a leak-site posting, or a \
+  named exploited vulnerability/CVE — but the report does NOT establish \
+  that it's still ongoing (it reads as a past/closed incident or a \
+  disclosure after the fact).
+- "info": cybercrime-related but stale, insignificant, or unconfirmed — \
+  names no clear victim, or is too vague/unverified to act on. This is \
+  still a real, specific-enough item to keep in the pipeline — distinct \
+  from false_positive below, which is for items that aren't a specific \
+  incident at all.
 
 Set false_positive=true for anything that is NOT a specific, identifiable \
 incident: generic security/cybercrime news, industry trend pieces, opinion \
 or analysis articles, vague "X were breached" mentions you can't pin to an \
 incident, or empty/uninformative posts. The bar: would a reader learn \
 *which* victim and/or *which* actor this is about? If not, it's noise — \
-eliminate it.
+eliminate it. (Contrast with "info" above: an item can name a real, \
+specific incident — and so NOT be a false_positive — while still being low \
+significance because it's stale, minor, or unconfirmed.)
 
 Respond with ONLY a single-line JSON object, no markdown fencing, no \
 commentary, exactly these keys:
@@ -183,7 +192,7 @@ def _build_user_prompt(title: str, snippet: str, source_name: str) -> str:
 
 
 _JSON_OBJECT = re.compile(r"\{.*\}", re.DOTALL)
-_VALID_SIGNIFICANCE = {"info", "warn", "critical"}
+_VALID_SIGNIFICANCE = sig.VALID_SIGNIFICANCE
 
 
 def _coerce_str_list(value) -> list[str]:
@@ -257,7 +266,7 @@ _EXTRACTION_SCHEMA = {
         "actor": {"type": ["string", "null"]},
         "cve_ids": {"type": "array", "items": {"type": "string"}},
         "iocs": {"type": "array", "items": {"type": "string"}},
-        "significance": {"type": "string", "enum": ["info", "warn", "critical"]},
+        "significance": {"type": "string", "enum": list(sig.SIGNIFICANCE_LEVELS)},
         "false_positive": {"type": "boolean"},
         "confidence": {"type": "number"},
         "reasoning": {"type": "string"},

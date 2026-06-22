@@ -42,6 +42,7 @@ from ..hermes.runner import run_agent
 from ..http import clearnet_client, tor_client
 from ..scheduler import load_sources, reschedule_source
 from ..settings import settings
+from ..sources import value as source_value
 from ..sources import writer as source_writer
 
 log = logging.getLogger(__name__)
@@ -117,17 +118,27 @@ You are assisting in expanding a cybercrime OSINT monitor's data sources. \
 The monitor currently tracks these topics: {topics}. It already has these \
 sources (do not suggest duplicates of these domains): {existing_domains}.
 
+{underrepresented}
+
 Search for new sources, in this priority order:
 1. Darknet forums, marketplaces, or leak sites (.onion addresses) — find \
    these via clearnet darknet directories/mirror lists (e.g. dark.fail, \
    Tor.taxi) or via cybersecurity write-ups and CTI reports that publish \
    onion addresses for ransomware leak sites or cybercrime forums. You do \
    not need to be able to browse the .onion address yourself — reporting \
-   the address and what it is, as found in clearnet text, is enough.
+   the address and what it is, as found in clearnet text, is enough. This \
+   is always the single most valuable kind of source this monitor can add \
+   — first-hand actor chatter, not someone else's writeup of it — so \
+   actively look for one even when the balance note above doesn't call \
+   for it.
 2. Cybersecurity researcher feeds/blogs that publish their own incident \
    analysis or threat intel (vendor blogs, independent researchers).
 3. General press/news feeds that cover data breaches and cybercrime \
    promptly (e.g. heise, KrebsOnSecurity, and similar outlets).
+
+Within that priority order, prefer candidates that help fill the \
+under-represented regions/media kinds noted above over ones that pile \
+onto an already well-covered bucket.
 
 For each candidate, determine its "kind":
 - "rss": you found a working RSS/Atom feed URL for it (NOT a general web \
@@ -137,14 +148,24 @@ For each candidate, determine its "kind":
 - "html_forum": a clearnet forum/leak-site with no feed — give its \
   listing_url likewise.
 
-Find up to 5 candidates total, prioritized as above (darknet first). \
-Prefer sites with a track record of being first to report incidents over \
-general security news aggregators.
+Also classify each candidate's region (where its primary operator/\
+publisher is based or oriented: "eu", "us", "ru_cn" for Russia/China or \
+that sphere including Russian-language cybercrime forums, or "other") and \
+media_kind ("darknet_forum" for first-hand forum/marketplace data, \
+"forensic" for incident-response/malware-analysis writeups, "press" for \
+mainstream news, "blog" for independent researcher/hobbyist blogs, or \
+"feed" for government/vendor advisory or alert feeds).
+
+Find up to {batch_size} candidate(s) total, prioritized as above (darknet \
+first). Prefer sites with a track record of being first to report \
+incidents over general security news aggregators.
 
 When you are done, respond with ONLY a single-line JSON object as your \
 final message, no markdown fencing, no commentary, exactly these keys:
 {{"candidates": [{{"name": "<short site name>", "kind": "rss"|"tor_forum"|"html_forum", \
 "feed_url": <"<RSS/Atom feed URL>"|null>, "listing_url": <"<forum listing page URL>"|null>, \
+"region": "eu"|"us"|"ru_cn"|"other", \
+"media_kind": "darknet_forum"|"forensic"|"press"|"blog"|"feed", \
 "reason": "<why this is a good fit>"}}, ...]}}
 Use an empty "candidates" array if you find nothing suitable.
 """
@@ -216,10 +237,67 @@ def _existing_domains(sources: list[dict]) -> set[str]:
     return domains
 
 
+_TARGET_REGIONS = ("eu", "us", "ru_cn")
+# Ordered for the "thinnest first" pick below — darknet_forum listed first
+# so it wins ties (it's always wanted regardless of balance).
+_MEDIA_KINDS_BY_PRIORITY = ("darknet_forum", "forensic", "press", "blog", "feed")
+
+
+def _underrepresented_summary(sources: list[dict]) -> str:
+    """Digests sources/value.py's bucket_counts into a short note steering
+    Hermes toward the regions/media kinds the corpus is currently thin on
+    — the discovery half of convergence's diversity steer (pruning gets the
+    same signal implicitly, via _component_diversity feeding the score it
+    ranks on)."""
+    buckets = source_value.bucket_counts(sources)
+    notes = []
+    # Baseline only over the target regions (excludes "other") — otherwise a
+    # corpus heavy on "other" sources would inflate region_total and falsely
+    # mark every target region as under-represented.
+    target_total = sum(buckets["region"].get(r, 0) for r in _TARGET_REGIONS)
+    if target_total:
+        even_share = target_total / len(_TARGET_REGIONS)
+        thin = [r for r in _TARGET_REGIONS if buckets["region"].get(r, 0) < even_share]
+        if thin:
+            notes.append(f"under-represented regions: {', '.join(thin)}")
+    if buckets["media_kind_total"]:
+        thin_kinds = sorted(_MEDIA_KINDS_BY_PRIORITY, key=lambda k: buckets["media_kind"].get(k, 0))[:2]
+        notes.append(f"under-represented media kinds: {', '.join(thin_kinds)}")
+    if not notes:
+        return (
+            "No region/media-kind balance data yet — no particular bias needed beyond "
+            "the priority order above."
+        )
+    return (
+        "Balance note — " + "; ".join(notes) + ". Prefer filling these where a good "
+        "candidate exists, but darknet first-hand data is always top priority regardless."
+    )
+
+
+def _discover_batch_size(existing: list[dict]) -> int:
+    """Convergence steer: how many candidates to ask for and accept this
+    tick, based on the gap between the current enabled-source count and
+    settings.source_target_count. Clearly below target (gap >= the
+    deadband) scales up to fill the gap (capped at 5 per tick — still one
+    Hermes run); at or near target, keep a slow trickle of 1 so a
+    genuinely better candidate can still displace the weakest existing
+    source via convergence pruning (research/heal.py), rather than freezing
+    the corpus solid once it hits the number."""
+    enabled_count = sum(1 for s in existing if s.get("enabled", True))
+    if enabled_count >= settings.source_target_count + settings.source_target_band:
+        return 0
+    gap = settings.source_target_count - enabled_count
+    if gap >= settings.source_target_band:
+        return min(5, max(1, gap))
+    return 1
+
+
 async def run_discover_batch(db_conn, scheduler=None, sse_broadcaster=None) -> int:
     """One tick: ask hermes-agent for new source candidates (RSS first, then
     forum-type), probe/validate each, and auto-add the ones that pass.
-    Returns the number of sources added."""
+    Batch size and acceptance count are steered toward
+    settings.source_target_count (see _discover_batch_size). Returns the
+    number of sources added."""
     if settings.hermes_discover_interval_seconds <= 0:
         return 0
 
@@ -227,9 +305,15 @@ async def run_discover_batch(db_conn, scheduler=None, sse_broadcaster=None) -> i
     added = 0
     try:
         existing = load_sources()
+        batch_size = _discover_batch_size(existing)
+        if batch_size == 0:
+            record_success(0)
+            return 0
         prompt = _DISCOVER_PROMPT_TEMPLATE.format(
             topics=await _topics(db_conn),
             existing_domains=", ".join(sorted(_existing_domains(existing))) or "none",
+            underrepresented=_underrepresented_summary(existing),
+            batch_size=batch_size,
         )
         result = await run_agent(
             prompt,
@@ -249,7 +333,7 @@ async def run_discover_batch(db_conn, scheduler=None, sse_broadcaster=None) -> i
         existing_domains = _existing_domains(existing)
         existing_ids = {s["id"] for s in existing}
 
-        for cand in candidates[:5]:
+        for cand in candidates[:batch_size]:
             try:
                 if await _try_add_candidate(db_conn, cand, existing_domains, existing_ids, scheduler, sse_broadcaster):
                     added += 1
@@ -261,6 +345,21 @@ async def run_discover_batch(db_conn, scheduler=None, sse_broadcaster=None) -> i
         record_error(str(exc) or repr(exc))
         raise
     return added
+
+
+def _cand_classification(cand: dict) -> dict:
+    """Pull validated region/media_kind off a Hermes candidate, if present
+    and well-formed — omitted (not defaulted) when missing/invalid so
+    research/classify.py's backfill pass still picks it up rather than
+    silently locking in a wrong guess."""
+    out = {}
+    region = cand.get("region")
+    if region in source_value.VALID_REGIONS:
+        out["region"] = region
+    media_kind = cand.get("media_kind")
+    if media_kind in source_value.VALID_MEDIA_KINDS:
+        out["media_kind"] = media_kind
+    return out
 
 
 def _candidate_url(cand: dict, kind: str) -> str:
@@ -354,6 +453,7 @@ async def _try_add_rss_candidate(
         "jitter": 120,
         "enabled": True,
         "source_tags": ["discovered", "probationary"],
+        **_cand_classification(cand),
     }
     return await _apply_new_source(
         db_conn, entry=entry, reason="hermes-agent discovery", proposal_id=proposal_id,
@@ -497,6 +597,7 @@ async def _try_add_forum_candidate(
         "url_selector": selectors["url_selector"],
         "date_selector": selectors["date_selector"],
         "source_tags": ["discovered", "probationary"] + (["dark-web"] if kind == "tor_forum" else []),
+        **_cand_classification(cand),
     }
     return await _apply_new_source(
         db_conn, entry=entry, reason="hermes-agent discovery (selector-validated)", proposal_id=proposal_id,
