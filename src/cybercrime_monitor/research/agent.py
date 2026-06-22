@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from .. import db
+from .. import prompts
 from .. import significance as sig
 from ..api.sse import broadcaster
 from ..hermes.runner import run_agent
@@ -92,58 +93,6 @@ async def _log_activity(
     except Exception as exc:
         log.error("[research] activity log failed: %s", exc)
 
-_RESEARCH_PROMPT_TEMPLATE = """\
-You are assisting a cybercrime intelligence monitor. Research the following \
-incident using web search and any pages you need to fetch. Try to: confirm \
-the incident is real and ongoing/recent, identify the threat actor or \
-seller if not already known, identify the victim organization if not \
-already known, find any concrete indicators of compromise (domains, \
-hashes, IPs, onion addresses, leak-site URLs, ransom/extortion \
-cryptocurrency wallet addresses) tied to this incident, and find \
-corroborating independent sources (not just the original report below).
-
-Actively look for a technical malware/incident write-up of this case, not \
-just news coverage — the kind of deep-dive analysis BleepingComputer, The \
-DFIR Report, vendor threat-intel blogs (Mandiant, Recorded Future, Talos, \
-etc.), or the actor's own leak-site posting would publish. These write-ups \
-are the best source of concrete IoCs and CVEs, often in a table or list — \
-if you find one, pull every IoC and CVE it publishes into this incident's \
-record rather than just summarizing the prose.
-
-Also judge the case's CURRENT significance based on everything you found —
-this re-classifies the case (it can move up or down from where it started):
-- "critical": there is a clear victim AND the crime is still ongoing — new \
-information is still being produced (an active sale, a live extortion \
-countdown, exploitation still happening, the actor still posting updates). \
-Set "ongoing": true whenever you call it "critical" — critical requires \
-ongoing.
-- "warn": a clear victim and a clear act of crime (breach/sale/ransomware, \
-possibly a CVE) with real consequences, but it is NOT ongoing anymore — a \
-closed/past incident.
-- "info": on closer inspection this case is irrelevant, stale, unconfirmed, \
-or too insignificant to track closely.
-Be honest about degrading a case — if you find nothing to corroborate it or \
-it's clearly old news with no new developments, say so; that's exactly what \
-this judgment is for.
-
-INCIDENT:
-Title: {title}
-Crime type: {crime_type}
-Known victim: {victim}
-Known attribution: {attribution}
-CVEs: {cve_ids}
-Known IoCs: {iocs}
-Summary so far: {summary}
-{gap_note}
-When you are done, respond with ONLY a single-line JSON object as your \
-final message, no markdown fencing, no commentary, exactly these keys:
-{{"confirmed": true|false, "attribution": <string|null>, "damaged_party": <string|null>, \
-"summary": "<2-3 sentence summary of what you found>", "sources": [<url>...], \
-"iocs": [<string>...], "confidence": <0.0-1.0>, \
-"significance": "info"|"warn"|"critical", "ongoing": true|false}}
-"""
-
-
 def _gap_note(case: dict) -> str:
     """Built only for forced re-research (research_requested_at set) — names
     what's actually missing so a re-trigger digs into gaps instead of
@@ -164,18 +113,8 @@ def _gap_note(case: dict) -> str:
     if not case.get("iocs"):
         missing.append("indicators of compromise")
     if not missing:
-        return (
-            "\nThis case has already been researched before but was re-queued for "
-            "deeper research — dig further than a surface-level search. Specifically "
-            "look for a technical malware/incident write-up (BleepingComputer, The "
-            "DFIR Report, vendor threat-intel blogs, the actor's own leak-site post) "
-            "beyond what's already known, and pull any IoCs/CVEs it publishes.\n"
-        )
-    return (
-        "\nThis case was specifically re-queued for deeper research because the "
-        f"following is still missing: {', '.join(missing)}. Focus your search on "
-        "filling these gaps.\n"
-    )
+        return prompts.GAP_NOTE_REDIG
+    return prompts.GAP_NOTE_MISSING_TEMPLATE.format(missing=", ".join(missing))
 
 
 def _reconcile_verdict(verdict, ongoing: bool) -> str | None:
@@ -186,7 +125,7 @@ def _reconcile_verdict(verdict, ongoing: bool) -> str | None:
     other half of that decision).
 
     "critical" requires "ongoing": true by definition (see the case-level
-    rubric in _RESEARCH_PROMPT_TEMPLATE) — a model that returns critical
+    rubric in prompts.RESEARCH_PROMPT_TEMPLATE) — a model that returns critical
     without confirming the crime is still active is downgraded to "warn"
     rather than trusted at face value or discarded outright."""
     if not isinstance(verdict, str):
@@ -200,7 +139,7 @@ def _reconcile_verdict(verdict, ongoing: bool) -> str | None:
 
 
 def _build_prompt(case: dict) -> str:
-    return _RESEARCH_PROMPT_TEMPLATE.format(
+    return prompts.RESEARCH_PROMPT_TEMPLATE.format(
         title=case.get("title") or "",
         crime_type=case.get("crime_type") or "other",
         victim=case.get("damaged_party") or "unknown",

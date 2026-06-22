@@ -44,6 +44,7 @@ from datetime import datetime, timedelta, timezone
 
 from .. import db
 from .. import health
+from .. import prompts
 from ..api.sse import broadcaster
 from ..hermes.runner import run_agent
 from ..http import clearnet_client, tor_client
@@ -129,30 +130,6 @@ async def _log_activity(
 _HEAL_COOLDOWN_HOURS = 24
 _SOURCES_PER_TICK = 1
 
-_HEAL_PROMPT_TEMPLATE = """\
-You are assisting in maintaining a cybercrime OSINT monitor's data \
-collectors. The following source has stopped working — its current \
-configured URL is dead, redirected, or blocked, or it requires JavaScript \
-that the current scraper can't handle. Investigate using web search and \
-browsing: find out what happened (domain moved? site down? needs a \
-different mirror or instance?) and, if possible, find a working \
-replacement URL or mirror for the same type of content.
-
-SOURCE:
-id: {source_id}
-name: {name}
-type: {type}
-current config: {config}
-status: {status_note}
-{feedback_note}
-When you are done, respond with ONLY a single-line JSON object as your \
-final message, no markdown fencing, no commentary, exactly these keys:
-{{"found_fix": true|false, "proposed_url": <string|null>, \
-"proposed_config_notes": "<what should change in sources.yaml and why, or \
-why no fix was found>", "confidence": <0.0-1.0>}}
-"""
-
-
 def _status_note(source: dict) -> str:
     if not source.get("enabled", True):
         return "disabled (presumed broken at config time)"
@@ -172,11 +149,7 @@ def _feedback_note(value: dict | None) -> str:
     if feedback_score is None:
         return ""
     if feedback_score < 0.5:
-        return (
-            "\nNote: the analyst has flagged recent reports from this source as "
-            "noise/not useful/misattributed more often than useful — if you find "
-            "a replacement, prefer one less likely to repeat that problem.\n"
-        )
+        return prompts.FEEDBACK_NOTE_LOW_SCORE
     return ""
 
 
@@ -239,7 +212,7 @@ async def run_heal_batch(db_conn, scheduler=None, sse_broadcaster=None) -> int:
 
 async def _heal_one(db_conn, source: dict, *, scheduler, sse_broadcaster) -> None:
     value = (await db.get_source_value(db_conn, source["id"]))
-    prompt = _HEAL_PROMPT_TEMPLATE.format(
+    prompt = prompts.HEAL_PROMPT_TEMPLATE.format(
         source_id=source["id"],
         name=source.get("name", source["id"]),
         type=source.get("type", "unknown"),

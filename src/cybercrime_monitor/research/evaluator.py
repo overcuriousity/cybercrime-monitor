@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from .. import db
+from .. import prompts
 from ..api.sse import broadcaster
 from ..hermes.runner import run_agent
 from ..settings import settings
@@ -98,35 +99,6 @@ async def _log_activity(
         log.error("[evaluator] activity log failed: %s", exc)
 
 
-_EVALUATE_PROMPT_TEMPLATE = """\
-You are reviewing a cybercrime intelligence case the way a human analyst \
-would when triaging incoming reports. Below is a case and a batch of items \
-(article/post/feed entry) linked to it — possibly a subset if the case has \
-many items. For EACH item, judge \
-whether it is genuinely useful, on-topic, real information about this \
-case — exactly as a human analyst clicking a "useful" / "noise" feedback \
-button would.
-
-CASE:
-title: {case_title}
-
-ITEMS:
-{items_block}
-
-For each item, pick exactly one verdict:
-  - "useful": on-topic, carries real/specific information about the case
-  - "noise": off-topic, duplicate, or carries no real information
-  - "wrong_attribution": clearly misattributes the actor, victim, or facts
-  - "not_useful": on-topic but adds nothing beyond what's already known
-
-When you are done, respond with ONLY a single-line JSON object as your \
-final message, no markdown fencing, no commentary, exactly this shape:
-{{"verdicts": [{{"item_id": <int>, "verdict": "useful"|"noise"|"wrong_attribution"|"not_useful", \
-"reason": "<one short sentence>"}}, ...]}}
-Include one entry per item_id listed above.
-"""
-
-
 def _items_block(items: list[dict]) -> str:
     lines = []
     for item in items:
@@ -167,7 +139,7 @@ async def _evaluate_one(db_conn) -> int:
     if not items:
         return 0
 
-    prompt = _EVALUATE_PROMPT_TEMPLATE.format(
+    prompt = prompts.EVALUATE_PROMPT_TEMPLATE.format(
         case_title=case.get("title") or f"case {case['id']}",
         items_block=_items_block(items),
     )

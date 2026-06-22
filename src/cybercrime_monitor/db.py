@@ -3140,7 +3140,7 @@ async def stats_cases_by_actor(
 async def run_significance_decay(conn: aiosqlite.Connection, *, now: datetime | None = None) -> int:
     """Mechanical staleness safety-net — the "no research pass needed"
     half of the hybrid ongoing-metric (see research/agent.py's
-    _RESEARCH_PROMPT_TEMPLATE case-level rubric for the researcher's half).
+    prompts.RESEARCH_PROMPT_TEMPLATE case-level rubric for the researcher's half).
 
     A warn/critical case that nobody is feeding (no new corroborating item)
     AND that research hasn't actively touched within

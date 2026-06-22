@@ -24,7 +24,7 @@ match — folds the findings in exactly like organic ingestion:
      evaluated whether it is kept for the future."
 
 A submission that finds nothing convincing creates nothing — no case, no
-items, no sources. See _INVESTIGATE_PROMPT_TEMPLATE / settings.
+items, no sources. See prompts.INVESTIGATE_PROMPT_TEMPLATE / settings.
 investigate_min_confidence for the gate.
 
 Runs on its own APScheduler interval (scheduler.py's "_investigate" job),
@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from .. import db
+from .. import prompts
 from ..api.sse import broadcaster
 from ..collectors.base import _content_key, _dedupe_key
 from ..hermes.runner import _is_transient, run_agent
@@ -137,54 +138,6 @@ _LOCAL_CONTEXT_LIMIT = 8
 _MAX_ITEMS = 20
 _MAX_NEW_FEEDS = 5
 
-_INVESTIGATE_PROMPT_TEMPLATE = """\
-You are assisting a cybercrime intelligence monitor. An investigator has a \
-new case that the monitor's automated collection has not picked up yet. \
-Research the following case brief using web search and any pages you need \
-to fetch — check whether it is reported on the monitor's EXISTING source \
-sites listed below, and also search the open web more broadly.
-
-CASE BRIEF:
-{brief}
-
-EXISTING SOURCE SITES (check these specifically, in addition to general web \
-search): {existing_domains}
-
-ITEMS ALREADY IN THIS MONITOR THAT MIGHT BE RELATED (for context only — \
-verify, don't assume these are the same incident):
-{local_context}
-
-Only report found=true if you find genuine, corroborated evidence of a \
-specific, identifiable incident matching this brief — a named victim and/or \
-named actor, with concrete reporting (not just the brief restated back at \
-you). If you find nothing convincing, report found=false and nothing else \
-matters.
-
-If found, also list every distinct piece of reporting you found as a \
-separate "items" entry (title, url, a short snippet/quote, the site/source \
-name, and a publish date if known) — these become the monitor's record of \
-where this incident was reported. And if you discover a site that reports \
-this kind of cybercrime well but is NOT one of the monitor's existing \
-sources, list it under "new_feeds" so it can be considered for ongoing \
-collection — same "kind" classification as source discovery: "rss" (give \
-feed_url), "tor_forum" or "html_forum" (give listing_url).
-
-When you are done, respond with ONLY a single-line JSON object as your \
-final message, no markdown fencing, no commentary, exactly these keys:
-{{"found": true|false, "confidence": <0.0-1.0>, "title": <string|null>, \
-"crime_type": <string|null>, "victim": <string|null>, \
-"victim_sector": <string|null>, \
-"victim_country": <ISO 3166-1 alpha-2 country code of the victim, or null>, \
-"attribution": <string|null>, "summary": "<2-3 sentence summary>", \
-"cve_ids": [<string>...], "iocs": [<string>...], \
-"items": [{{"title": "<string>", "url": "<string>", "snippet": "<string>", \
-"source_name": "<string>", "published_at": <string|null>}}, ...], \
-"new_feeds": [{{"name": "<string>", "kind": "rss"|"tor_forum"|"html_forum", \
-"feed_url": <string|null>, "listing_url": <string|null>, "reason": "<string>"}}, ...]}}
-Use empty arrays for "items"/"new_feeds" if found=false.
-"""
-
-
 def _local_context(items: list[dict]) -> str:
     if not items:
         return "(none found)"
@@ -194,7 +147,7 @@ def _local_context(items: list[dict]) -> str:
 
 def _build_prompt(brief: str, existing_sources: list[dict], local_items: list[dict]) -> str:
     domains = sorted(discover_research._existing_domains(existing_sources))
-    return _INVESTIGATE_PROMPT_TEMPLATE.format(
+    return prompts.INVESTIGATE_PROMPT_TEMPLATE.format(
         brief=brief.strip()[:2000],
         existing_domains=", ".join(domains) or "none configured",
         local_context=_local_context(local_items),

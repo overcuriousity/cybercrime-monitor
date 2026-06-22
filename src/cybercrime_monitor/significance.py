@@ -17,9 +17,9 @@ possibly-researched incident):
 - CRITICAL: a clear victim AND the crime is ongoing — new information is
   still being produced (active sale, live extortion, active exploitation).
 
-Note: this is distinct from `false_positive`, a separate, lower tier
-(llm/backend.py's _SYSTEM_PROMPT) for items that aren't a specific,
-identifiable incident at all. The full ladder, low to high, is:
+Note: this is distinct from `false_positive`, a separate, lower tier (see
+prompts.SYSTEM_PROMPT) for items that aren't a specific, identifiable
+incident at all. The full ladder, low to high, is:
 (deleted) < false_positive < info < warn < critical.
 """
 
