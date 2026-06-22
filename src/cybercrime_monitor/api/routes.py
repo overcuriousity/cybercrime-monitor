@@ -645,10 +645,13 @@ async def api_cases_by_country(
     until: str | None = Query(default=None),
     mode: str = Query(default="keyword", pattern="^(keyword|semantic)$"),
 ):
-    """Per-country case counts for the Cases tab's map — honors the same
-    filters as GET /api/cases (last_seen-based since/until) rather than
-    Landscape's first_seen window, so the map always matches what's in the
-    filtered case list."""
+    """Per-country case counts backing the Cases tab's victim-country
+    dropdown — honors the same filters as GET /api/cases (last_seen-based
+    since/until) rather than Landscape's first_seen window, so the
+    dropdown's per-country counts always match what's in the filtered case
+    list. No `country` param: this endpoint *is* the country breakdown, so
+    filtering it by the already-selected country would collapse the
+    dropdown to a single option (see cases_country_counts)."""
     since_norm = _normalize_date_filter(since, end_of_day=False)
     until_norm = _normalize_date_filter(until, end_of_day=True)
 

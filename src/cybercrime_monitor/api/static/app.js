@@ -1129,6 +1129,8 @@ const ACTOR_BAR_COLOR = '#c77dff';
 
 const landscapeWindowSelect = document.getElementById('landscape-window-select');
 const landscapeExportBtn = document.getElementById('landscape-export-btn');
+const landscapeMapEl = document.getElementById('landscape-map');
+const landscapeMapLegendEl = document.getElementById('landscape-map-legend');
 const actorProfileOverlay = document.getElementById('actor-profile-overlay');
 const actorProfileContent = document.getElementById('actor-profile-content');
 const actorProfileClose = document.getElementById('actor-profile-close');
@@ -1179,6 +1181,7 @@ async function loadLandscape() {
     renderLandscapeCountry(stats.by_country);
     renderLandscapeSector(stats.by_sector);
     renderLandscapeActors(stats.by_actor);
+    renderLandscapeMap(stats.by_country);
     renderEmergingPanels();
   } catch (e) {
     console.error('Failed to load landscape', e);
@@ -1508,7 +1511,6 @@ const casesState = {
   pageSize: 50,
   hasMore: false,
   selectedId: null,
-  countryCounts: {},
   filters: { search: '', searchMode: 'keyword', significance: '', kevOnly: false, crimeType: '', since: '', until: '', cveId: '', ioc: '', country: '' },
 };
 const CASE_FILTERS_DEFAULT = { ...casesState.filters };
@@ -1528,8 +1530,6 @@ const caseUntilInput   = document.getElementById('case-until-input');
 const caseFiltersClear = document.getElementById('case-filters-clear');
 const caseDetailPane   = document.getElementById('case-detail');
 const caseDetailEmpty  = document.getElementById('case-detail-empty');
-const casesMapEl       = document.getElementById('cases-map');
-const casesMapLegendEl = document.getElementById('cases-map-legend');
 
 // Native, zero-data country-code -> English-name lookup (avoids shipping a
 // second name table alongside country.py's server-side one).
@@ -1665,7 +1665,7 @@ async function applyCaseFilters() {
     casesState.cases = data.cases;
     casesState.hasMore = data.cases.length === casesState.pageSize && data.total > casesState.pageSize;
     renderCasesList();
-    loadCasesMap();
+    loadCaseCountryOptions();
   } catch (e) {
     console.error('Failed to load cases', e);
   }
@@ -1722,64 +1722,27 @@ function populateFeedCrimeTypeDropdown(byCrimeType) {
   crimeTypeInput.value = current || '';
 }
 
-// ── Cases world map ─────────────────────────────────────────────────────
-// Vendored inline SVG (see static/world.svg, CC BY-SA 3.0 — credited in
-// index.html) with <path id="xx"> keyed by lowercase ISO 3166-1 alpha-2,
-// matching the canonical codes country.py normalizes into
-// damaged_party_country. Choropleth buckets + the "flash on select" effect
-// are plain CSS classes toggled on those paths — no charting/map library
-// needed, consistent with the rest of this vanilla-JS app.
-let casesMapSvgPromise = null;
-
-function ensureCasesMapSvg() {
-  if (!casesMapSvgPromise) {
-    casesMapSvgPromise = fetch('/world.svg')
-      .then(r => r.text())
-      .then(svgText => {
-        casesMapEl.innerHTML = svgText;
-        const svg = casesMapEl.querySelector('svg');
-        if (svg) {
-          svg.removeAttribute('width');
-          svg.removeAttribute('height');
-          svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
-        }
-        casesMapEl.addEventListener('click', onCasesMapClick);
-      })
-      .catch(e => console.error('Failed to load world map', e));
-  }
-  return casesMapSvgPromise;
-}
-
-function onCasesMapClick(e) {
-  const el = e.target.closest('path[id], g[id]');
-  if (!el) return;
-  const code = el.id.toUpperCase();
-  if (code.length !== 2) return; // skip non-ISO "_named" territories
-  const next = casesState.filters.country === code ? '' : code;
-  casesState.filters.country = next;
-  caseCountrySelect.value = next;
-  applyCaseFilters();
-}
-
-const CASES_MAP_BUCKETS = 4;
-
-async function loadCasesMap() {
+// ── Cases country dropdown ──────────────────────────────────────────────
+// The Cases tab keeps only the <select> filter; the choropleth map itself
+// now lives on the Landscape tab (see "Landscape world map" below).
+async function loadCaseCountryOptions() {
   try {
     const data = await api('/api/cases/by-country?' + caseQueryParams());
     const counts = {};
     (data.by_country || []).forEach(({ country, n }) => { counts[country] = n; });
-    casesState.countryCounts = counts;
     populateCaseCountrySelect(counts);
-    await ensureCasesMapSvg();
-    renderCasesMap();
   } catch (e) {
-    console.error('Failed to load cases map', e);
+    console.error('Failed to load case country counts', e);
   }
 }
 
 function populateCaseCountrySelect(counts) {
   const current = casesState.filters.country;
   const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  // Keep the active filter selectable even if it now matches zero cases
+  // (e.g. combined with a search term) — otherwise the <select> silently
+  // resets to "All countries" while casesState.filters.country is still set.
+  if (current && !(current in counts)) entries.unshift([current, 0]);
   caseCountrySelect.innerHTML = '<option value="">All countries</option>';
   entries.forEach(([code, n]) => {
     const opt = document.createElement('option');
@@ -1790,10 +1753,73 @@ function populateCaseCountrySelect(counts) {
   caseCountrySelect.value = current || '';
 }
 
-function renderCasesMap() {
-  const svg = casesMapEl.querySelector('svg');
+// Jump to the Cases tab filtered to a single victim country — used by the
+// Landscape map's click-to-filter below.
+function pivotCasesByCountry(code) {
+  casesState.filters = { ...CASE_FILTERS_DEFAULT, country: code };
+  caseSearchInput.value = '';
+  caseKevOnlyCb.checked = false;
+  caseSignificanceSelect.value = '';
+  caseCrimeTypeSelect.value = '';
+  caseSinceInput.value = '';
+  caseUntilInput.value = '';
+  syncSearchModeToggle(caseSearchModeToggle, casesState.filters.searchMode);
+  caseSearchModeHint.classList.add('hidden');
+  updateIndicatorPivotBanner();
+  document.querySelector('.tab[data-tab="cases"]').click();
+  applyCaseFilters();
+}
+
+// ── Landscape world map ──────────────────────────────────────────────────
+// Vendored inline SVG (see static/world.svg, CC BY-SA 3.0 — credited in
+// index.html) with <path id="xx">/<g id="xx"> keyed by lowercase ISO 3166-1
+// alpha-2, matching the canonical codes country.py normalizes into
+// damaged_party_country. Choropleth buckets are plain CSS classes toggled
+// on those shapes — no charting/map library needed, consistent with the
+// rest of this vanilla-JS app. Counts come from the same /api/stats/cases
+// by_country breakdown that already feeds the "Victims by country" bar
+// chart, so the map honors the Landscape window filter automatically.
+// Clicking a country jumps to the Cases tab filtered to it (see
+// pivotCasesByCountry above) rather than filtering in place.
+let landscapeMapSvgPromise = null;
+const LANDSCAPE_MAP_BUCKETS = 4;
+let landscapeMapCounts = {};
+
+function ensureLandscapeMapSvg() {
+  if (!landscapeMapSvgPromise) {
+    landscapeMapSvgPromise = fetch('/world.svg')
+      .then(r => r.text())
+      .then(svgText => {
+        landscapeMapEl.innerHTML = svgText;
+        const svg = landscapeMapEl.querySelector('svg');
+        if (svg) {
+          svg.removeAttribute('width');
+          svg.removeAttribute('height');
+          svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+        }
+        landscapeMapEl.addEventListener('click', onLandscapeMapClick);
+      })
+      .catch(e => console.error('Failed to load world map', e));
+  }
+  return landscapeMapSvgPromise;
+}
+
+function onLandscapeMapClick(e) {
+  const el = e.target.closest('path[id], g[id]');
+  if (!el) return;
+  const code = el.id.toUpperCase();
+  if (code.length !== 2) return; // skip non-ISO "_named" territories
+  if (!landscapeMapCounts[code]) return;
+  pivotCasesByCountry(code);
+}
+
+async function renderLandscapeMap(byCountry) {
+  const counts = {};
+  (byCountry || []).forEach(({ country, n }) => { counts[country] = n; });
+  landscapeMapCounts = counts;
+  await ensureLandscapeMapSvg();
+  const svg = landscapeMapEl.querySelector('svg');
   if (!svg) return;
-  const counts = casesState.countryCounts;
   const max = Math.max(0, ...Object.values(counts));
 
   svg.querySelectorAll('path[id], g[id]').forEach(el => {
@@ -1803,15 +1829,12 @@ function renderCasesMap() {
     // child <path>s rather than a single <path id="xx">; style every child
     // path so the whole country gets colored/hover-highlighted consistently.
     const paths = el.tagName.toLowerCase() === 'path' ? [el] : Array.from(el.querySelectorAll('path'));
-    paths.forEach(path => path.classList.remove('q0', 'q1', 'q2', 'q3', 'q4', 'map-active-filter'));
+    paths.forEach(path => path.classList.remove('q0', 'q1', 'q2', 'q3', 'q4'));
     const n = counts[code] || 0;
-    const bucket = n === 0 ? 0 : Math.min(CASES_MAP_BUCKETS, Math.ceil((n / max) * CASES_MAP_BUCKETS));
+    const bucket = n === 0 ? 0 : Math.min(LANDSCAPE_MAP_BUCKETS, Math.ceil((n / max) * LANDSCAPE_MAP_BUCKETS));
     const title = el.querySelector(':scope > title');
     if (n > 0) {
-      paths.forEach(path => {
-        path.classList.add('q' + bucket);
-        path.classList.toggle('map-active-filter', casesState.filters.country === code);
-      });
+      paths.forEach(path => path.classList.add('q' + bucket));
       const t = title || el.appendChild(document.createElementNS('http://www.w3.org/2000/svg', 'title'));
       t.textContent = `${countryLabel(code)} — ${n} case${n === 1 ? '' : 's'}`;
     } else {
@@ -1820,15 +1843,11 @@ function renderCasesMap() {
     }
   });
 
-  // Re-apply the flash to the selected case's country, if any, after the
-  // map re-renders (e.g. filters changed while a case stays selected).
-  if (casesMapFlashCode) flashCasesMapCountry(casesMapFlashCode);
-
-  renderCasesMapLegend(max);
+  renderLandscapeMapLegend(max);
 }
 
-function renderCasesMapLegend(max) {
-  casesMapLegendEl.innerHTML = '';
+function renderLandscapeMapLegend(max) {
+  landscapeMapLegendEl.innerHTML = '';
   if (max === 0) return;
   const swatches = [0, 1, 2, 3, 4];
   swatches.forEach(bucket => {
@@ -1838,25 +1857,10 @@ function renderCasesMapLegend(max) {
     swatch.className = 'case-map-legend-swatch q' + bucket;
     item.appendChild(swatch);
     const label = document.createElement('span');
-    label.textContent = bucket === 0 ? '0' : Math.ceil((bucket / CASES_MAP_BUCKETS) * max);
+    label.textContent = bucket === 0 ? '0' : Math.ceil((bucket / LANDSCAPE_MAP_BUCKETS) * max);
     item.appendChild(label);
-    casesMapLegendEl.appendChild(item);
+    landscapeMapLegendEl.appendChild(item);
   });
-}
-
-let casesMapFlashCode = null;
-
-async function flashCasesMapCountry(code) {
-  casesMapFlashCode = code || null;
-  await ensureCasesMapSvg();
-  const svg = casesMapEl.querySelector('svg');
-  if (!svg) return;
-  svg.querySelectorAll('path.flash').forEach(p => p.classList.remove('flash'));
-  if (!code) return;
-  const el = svg.querySelector(`path[id="${code.toLowerCase()}"], g[id="${code.toLowerCase()}"]`);
-  if (!el) return;
-  const paths = el.tagName.toLowerCase() === 'path' ? [el] : Array.from(el.querySelectorAll('path'));
-  paths.forEach(p => p.classList.add('flash'));
 }
 
 function renderCasesList() {
@@ -1944,7 +1948,6 @@ async function selectCase(id) {
   try {
     const { case: c, items, research_runs, related_cases } = await api(`/api/cases/${id}`);
     renderCaseDetail(c, items, research_runs || [], related_cases || []);
-    flashCasesMapCountry(c.damaged_party_country);
   } catch (e) {
     console.error('Failed to load case detail', e);
   }

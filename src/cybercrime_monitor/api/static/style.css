@@ -839,17 +839,6 @@ mark { background: var(--prio-warn-bg); color: var(--prio-warn); padding: 0 2px;
 .case-map svg path.q3 { fill: #c47e2c; }
 .case-map svg path.q4 { fill: var(--accent); }
 .case-map svg path:hover { stroke: var(--accent-hover); stroke-width: 1.2; }
-.case-map svg path.map-active-filter { stroke: var(--accent); stroke-width: 1.6; }
-
-@keyframes case-map-flash {
-  0%, 100% { fill: var(--prio-critical); }
-  50% { fill: var(--accent-hover); }
-}
-.case-map svg path.flash {
-  animation: case-map-flash 0.9s ease-in-out 3;
-  stroke: var(--prio-critical);
-  stroke-width: 1.6;
-}
 
 .case-map-credit {
   margin-top: 4px;

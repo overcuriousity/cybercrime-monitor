@@ -484,7 +484,7 @@ async def _migrate_normalize_countries(conn: aiosqlite.Connection) -> None:
     rewritten = 0
     for table, column in (("cases", "damaged_party_country"), ("extractions", "victim_country")):
         rows = await conn.execute_fetchall(
-            f"SELECT DISTINCT {column} AS v FROM {table} WHERE {column} IS NOT NULL AND {column} != ''"
+            f"SELECT DISTINCT {column} AS v FROM {table} WHERE {column} IS NOT NULL AND TRIM({column}) != ''"
         )
         for r in rows:
             old = r["v"]
@@ -2844,7 +2844,7 @@ async def stats_cases_by_sector(conn: aiosqlite.Connection, *, since_iso: str | 
 
 
 async def stats_cases_by_country(conn: aiosqlite.Connection, *, since_iso: str | None = None) -> list[dict]:
-    where = "WHERE c.damaged_party_country IS NOT NULL AND c.damaged_party_country != ''"
+    where = "WHERE c.damaged_party_country IS NOT NULL AND TRIM(c.damaged_party_country) != ''"
     params: dict = {}
     if since_iso:
         where += " AND c.first_seen >= :since"
@@ -2869,17 +2869,19 @@ async def cases_country_counts(
 ) -> list[dict]:
     """Per-country case counts honoring the same Cases-tab filters as
     fetch_cases (last_seen-based since/until, not Landscape's first_seen
-    window) — backs the Cases tab's map, which must reflect exactly what's
-    in the filtered case list rather than a separate stats window. Values
-    are normalized ISO alpha-2 codes (see country.py), so a plain GROUP BY
-    is enough — no casefold leaderboard needed here. `id_in` scopes to a
+    window) — backs the Cases tab's victim-country dropdown. Deliberately
+    has no `country` parameter, unlike fetch_cases: this *is* the
+    country breakdown, so filtering it down to one already-selected
+    country would collapse the dropdown to a single option. Values are
+    normalized ISO alpha-2 codes (see country.py), so a plain GROUP BY is
+    enough — no casefold leaderboard needed here. `id_in` scopes to a
     semantic-search candidate set, mirroring fetch_cases' same parameter."""
     where, params = _build_cases_where(
         min_significance=min_significance, crime_type=crime_type, in_kev=in_kev,
         search=search, cve_id=cve_id, ioc=ioc, since=since, until=until,
         id_in=id_in,
     )
-    country_clause = "damaged_party_country IS NOT NULL AND damaged_party_country != ''"
+    country_clause = "damaged_party_country IS NOT NULL AND TRIM(damaged_party_country) != ''"
     where = f"{where} AND {country_clause}" if where else f"WHERE {country_clause}"
     rows = await conn.execute_fetchall(
         f"""

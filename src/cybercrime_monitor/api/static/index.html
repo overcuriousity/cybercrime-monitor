@@ -236,18 +236,6 @@
       </div>
     </div>
 
-    <section class="case-map-section">
-      <div class="case-map-header">
-        <h3>Victim countries</h3>
-        <div id="cases-map-legend" class="case-map-legend"></div>
-      </div>
-      <div id="cases-map" class="case-map" aria-label="World map of case counts by victim country"></div>
-      <div class="case-map-credit">
-        Map: <a href="https://github.com/flekschas/simple-world-map" target="_blank" rel="noopener">simple-world-map</a>
-        (CC BY-SA 3.0)
-      </div>
-    </section>
-
     <div id="case-pivot-banner" class="case-pivot-banner hidden">
       <span id="case-pivot-label"></span>
       <button id="case-pivot-clear" class="link-button" type="button">✕ clear pivot</button>
@@ -335,6 +323,18 @@
 
       <section class="landscape-emerging-row" id="landscape-emerging-row">
         <!-- populated by renderEmergingPanels (Phase 3) -->
+      </section>
+
+      <section class="case-map-section">
+        <div class="case-map-header">
+          <h3>Victim countries</h3>
+          <div id="landscape-map-legend" class="case-map-legend"></div>
+        </div>
+        <div id="landscape-map" class="case-map" aria-label="World map of case counts by victim country — click a country to jump to the Cases tab filtered to it"></div>
+        <div class="case-map-credit">
+          Map: <a href="https://github.com/flekschas/simple-world-map" target="_blank" rel="noopener">simple-world-map</a>
+          (CC BY-SA 3.0)
+        </div>
       </section>
     </div>
 
