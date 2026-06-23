@@ -39,8 +39,25 @@ Configuration lives in three places:
 |---|---|
 | `.env` | Runtime settings: bind host/port, DB path, LLM backend, Gotify, retention, rate limits. |
 | `config/sources.yaml` | Data sources: type, URL, interval, credentials, selectors. |
+| `AGENTS.md` | Seed context for the `hermes` CLI (see "Hermes-agent setup" below). |
 
 See `.env.example` and `config/*.yaml.example` for documented templates.
+
+### Hermes-agent setup
+
+If you're running with `llm_backend = "hermes_cli"` or using any of the
+autonomous research/heal/discover/investigate jobs (see "Background jobs"
+below), install and authenticate the [hermes-agent](https://github.com/NousResearch/hermes-agent)
+CLI (`hermes`) per its own docs, then run `hermes doctor` to confirm it's
+healthy. No further hermes-side configuration is needed: this repo ships an
+`AGENTS.md` at its root, which hermes-agent auto-loads as background context
+into every headless run this app makes — as long as the app's process runs
+with the repo root as its working directory (true both for `uv run python -m
+cybercrime_monitor.main` from the repo root, and for the provided systemd
+unit's `WorkingDirectory=`), no extra wiring is required. See that file for
+what it seeds (project purpose/authorization context, output-format
+discipline, and OSINT/passive-research boundaries) and `hermes/runner.py`
+for the integration's verified CLI contract.
 
 ### Tor requirement
 
