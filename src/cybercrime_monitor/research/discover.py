@@ -32,7 +32,7 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from selectolax.parser import HTMLParser
 
@@ -188,6 +188,48 @@ def _underrepresented_summary(sources: list[dict]) -> str:
     )
 
 
+# How far back to mine research_runs.sources for hand-off candidates (quick
+# win B1) — a recent window keeps candidates relevant to current cases
+# without re-probing the same long-stale domain forever.
+_RESEARCH_HANDOFF_WINDOW_DAYS = 14
+
+
+async def _research_handoff_candidates(db_conn, existing_domains: set[str], remaining: int) -> list[dict]:
+    """Pre-warmed RSS candidates from domains cited in recently completed
+    research_runs.sources (agentic-coordination quick win B1) — the
+    research agent already vouched for these by visiting them while
+    researching a case, so they're a free head start over discovery's
+    speculative Hermes-driven search. Previously research_runs.sources was
+    write-only (populated by research/agent.py, read by nothing).
+
+    Returns synthetic candidate dicts shaped exactly like a Hermes discover
+    proposal (kind="rss") so they flow through _try_add_candidate's normal
+    domain-dedup + _try_add_rss_candidate's probe-before-apply path
+    unchanged — most will correctly fail the feed probe (a cited URL is
+    usually an article, not a feed) and just leave a logged proposal
+    instead of being applied; that's the validation gate doing its job, not
+    a bug. Only the most common feed-path convention is guessed
+    deterministically (no extra Hermes call — stays token-frugal); a domain
+    that doesn't expose a feed there is simply skipped."""
+    if remaining <= 0:
+        return []
+    since_iso = (datetime.now(timezone.utc) - timedelta(days=_RESEARCH_HANDOFF_WINDOW_DAYS)).isoformat()
+    domains = await db.get_recent_research_source_domains(db_conn, since_iso=since_iso)
+    out = []
+    for domain in domains:
+        if domain in existing_domains:
+            continue
+        out.append({
+            "kind": "rss",
+            "name": domain,
+            "feed_url": f"https://{domain}/feed/",
+            "reason": "cited in a recent research run",
+        })
+        if len(out) >= remaining:
+            break
+    return out
+
+
 def _discover_batch_size(existing: list[dict]) -> int:
     """Convergence steer: how many candidates to ask for and accept this
     tick, based on the gap between the current enabled-source count and
@@ -253,6 +295,24 @@ async def run_discover_batch(db_conn, scheduler=None, sse_broadcaster=None) -> i
                     added += 1
             except Exception as exc:
                 log.error("[discover] candidate %r failed: %s", cand, exc)
+
+        # Research → discovery hand-off (quick win B1) — spend any leftover
+        # batch budget on domains the research agent recently cited, before
+        # the next tick's Hermes-proposed search.
+        if settings.research_handoff_enabled:
+            remaining_budget = batch_size - added
+            try:
+                handoff_candidates = await _research_handoff_candidates(db_conn, existing_domains, remaining_budget)
+                for cand in handoff_candidates:
+                    try:
+                        if await _try_add_candidate(
+                            db_conn, cand, existing_domains, existing_ids, scheduler, sse_broadcaster
+                        ):
+                            added += 1
+                    except Exception as exc:
+                        log.error("[discover] research-handoff candidate %r failed: %s", cand, exc)
+            except Exception as exc:
+                log.error("[discover] research handoff lookup failed: %s", exc)
 
         record_success(added)
     except Exception as exc:

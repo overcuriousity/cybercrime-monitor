@@ -122,6 +122,12 @@ async def test_get_actor_profile_aggregates_over_all_cases(db_conn):
         cve_ids=["CVE-2024-1", "CVE-2024-2"],
     )
 
+    # actor_profiles is now a materialized table (agentic-coordination
+    # foundation F3) refreshed on its own job tick, not recomputed on every
+    # get_actor_profile call — see pipeline/actor_profiles.refresh_actor_profiles.
+    from cybercrime_monitor.pipeline.actor_profiles import refresh_actor_profiles
+    await refresh_actor_profiles(db_conn)
+
     profile = await db_module.get_actor_profile(db_conn, "Actor1")
     assert profile["case_count"] == 2
     assert profile["victim_count"] == 2
@@ -411,6 +417,12 @@ async def _seed_single_case(db_path: str, **case_kwargs):
     conn = await db_module.open_db()
     item_id = await _insert_item(conn)
     case_id = await _create_case(conn, item_id, **case_kwargs)
+    # Materialize actor_profiles (agentic-coordination foundation F3) so
+    # routes reading via get_actor_profile see this case immediately,
+    # matching what the "_actor_profiles" scheduler job would do on its
+    # next tick — see pipeline/actor_profiles.refresh_actor_profiles.
+    from cybercrime_monitor.pipeline.actor_profiles import refresh_actor_profiles
+    await refresh_actor_profiles(conn)
     await conn.close()
     return case_id
 

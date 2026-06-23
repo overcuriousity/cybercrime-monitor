@@ -1065,9 +1065,15 @@ class InvestigationCreate(BaseModel):
     brief: str
 
 
+# Verdicts that re-trigger research on the case they're attached to (quick
+# win C3) — the strongest possible "the AI got this case wrong" signals,
+# as opposed to "useful"/positive feedback which only feeds source scoring.
+_REANALYSIS_VERDICTS = frozenset({"wrong_attribution", "not_useful"})
+
+
 @router.post("/api/feedback")
-async def api_feedback_create(body: FeedbackCreate, db=Depends(get_db)):
-    from ..db import VALID_FEEDBACK_VERDICTS, add_feedback
+async def api_feedback_create(body: FeedbackCreate, request: Request, db=Depends(get_db)):
+    from ..db import VALID_FEEDBACK_VERDICTS, add_feedback, nudge_case
 
     if (body.case_id is None) == (body.item_id is None):
         raise HTTPException(status_code=400, detail="exactly one of case_id or item_id is required")
@@ -1079,6 +1085,34 @@ async def api_feedback_create(body: FeedbackCreate, db=Depends(get_db)):
     feedback_id = await add_feedback(
         db, case_id=body.case_id, item_id=body.item_id, verdict=body.verdict, note=body.note
     )
+
+    # Feedback-triggered re-analysis (quick win C3) — a wrong_attribution/
+    # not_useful verdict on a case nudges it back into the research queue
+    # (research_requested_at activates the existing _gap_note machinery in
+    # research/agent.py, which re-digs the case's actual missing fields)
+    # instead of only feeding sources/value.py's scoring.
+    if (
+        settings.feedback_reanalysis_enabled
+        and body.case_id is not None
+        and body.verdict in _REANALYSIS_VERDICTS
+    ):
+        await nudge_case(
+            db, case_id=body.case_id, boost=settings.feedback_agent_weight, requested_by="feedback"
+        )
+        scheduler = getattr(request.app.state, "scheduler", None)
+        if scheduler is not None and scheduler.get_job("_research") is not None:
+            scheduler.modify_job("_research", next_run_time=datetime.now(timezone.utc))
+        try:
+            event = await log_ai_activity(
+                db, subsystem="feedback", action="reanalysis_requested",
+                summary=f"Re-analysis requested for case #{body.case_id} (verdict: {body.verdict})",
+                detail={"verdict": body.verdict, "case_id": body.case_id, "feedback_id": feedback_id},
+                ref_type="case", ref_id=body.case_id,
+            )
+            await broadcaster.broadcast_activity(event)
+        except Exception:
+            log.error("[feedback] reanalysis activity log failed", exc_info=True)
+
     return {"id": feedback_id, "status": "ok"}
 
 

@@ -189,7 +189,17 @@ CREATE TABLE IF NOT EXISTS cases (
     cvss_max                REAL,
     cwe_ids                 TEXT NOT NULL DEFAULT '[]',
     epss_max                REAL,
-    mitre_techniques        TEXT NOT NULL DEFAULT '[]'
+    mitre_techniques        TEXT NOT NULL DEFAULT '[]',
+    -- Generalized nudge primitive (agentic-coordination foundation F1) — any
+    -- subsystem can raise priority_boost via db.nudge_case() to pull a case
+    -- forward in the research queue without forcing a full bypass like
+    -- research_requested_at does. priority_boost_at timestamps the last
+    -- nudge for time-decay (see run_significance_decay); requested_by names
+    -- the nudging subsystem for audit/debugging. Added via ALTER TABLE
+    -- migration for pre-existing DBs.
+    priority_boost          REAL NOT NULL DEFAULT 0,
+    priority_boost_at       TEXT,
+    requested_by            TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_cases_last_seen ON cases(last_seen DESC);
@@ -323,6 +333,30 @@ CREATE TABLE IF NOT EXISTS source_value (
     computed_at     TEXT NOT NULL
 );
 
+-- Cross-case actor knowledge base (agentic-coordination foundation F3) —
+-- deterministic union of CVEs/MITRE techniques/sectors/countries/IoCs/
+-- victims/case ids per attributed actor, refreshed on a light timer
+-- (pipeline/actor_profiles.py, mirrors source_value's refresh-job pattern)
+-- instead of recomputed on every GET /api/actors/{actor} request. "actor"
+-- is the lower-cased canonical key; display_name keeps a representative
+-- original casing. One row per actor, overwritten on each refresh.
+CREATE TABLE IF NOT EXISTS actor_profiles (
+    actor             TEXT PRIMARY KEY,
+    display_name      TEXT NOT NULL,
+    cve_ids           TEXT NOT NULL DEFAULT '[]',
+    mitre_techniques  TEXT NOT NULL DEFAULT '[]',
+    sectors           TEXT NOT NULL DEFAULT '[]',
+    countries         TEXT NOT NULL DEFAULT '[]',
+    iocs              TEXT NOT NULL DEFAULT '[]',
+    victims           TEXT NOT NULL DEFAULT '[]',
+    case_ids          TEXT NOT NULL DEFAULT '[]',
+    case_count        INTEGER NOT NULL DEFAULT 0,
+    victim_count      INTEGER NOT NULL DEFAULT 0,
+    first_seen        TEXT,
+    last_seen         TEXT,
+    computed_at       TEXT NOT NULL
+);
+
 -- Algorithmic (non-LLM) case-to-case relationships — shared victim/actor/
 -- CVE/IoC overlap within a temporal window (pipeline/cross_correlate.py).
 -- Symmetric: case_a < case_b by convention so a pair is stored once.
@@ -362,14 +396,21 @@ CREATE TABLE IF NOT EXISTS source_health (
 CREATE TABLE IF NOT EXISTS ai_activity (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ts          TEXT NOT NULL,
-    subsystem   TEXT NOT NULL, -- discover | heal | prune | research | classifier | correlator | cross_correlator
+    subsystem   TEXT NOT NULL, -- discover | heal | prune | research | classifier | correlator | cross_correlator | scheduler | feedback
     action      TEXT NOT NULL, -- e.g. source_added, source_removed, case_created, cases_linked, item_classified
     summary     TEXT NOT NULL,
     detail      TEXT NOT NULL DEFAULT '{}', -- JSON: before/after, scores, reasons, model output
     status      TEXT NOT NULL DEFAULT 'ok', -- ok | error | skipped
     ref_type    TEXT, -- case | source | item | null
     ref_id      TEXT,
-    model       TEXT
+    model       TEXT,
+    -- Optional provenance link to the ai_activity row that triggered this
+    -- one (agentic-coordination foundation F2), e.g. a cross-correlator
+    -- case_escalated event pointing at the cases_linked event that caused
+    -- it. No FK — this table is a loose denormalized index, same spirit as
+    -- ref_id. NULL = no known cause (the common case). Added via ALTER
+    -- TABLE migration for pre-existing DBs.
+    caused_by   INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_ai_activity_ts ON ai_activity(ts DESC);
@@ -485,6 +526,9 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         ("cwe_ids", "ALTER TABLE cases ADD COLUMN cwe_ids TEXT NOT NULL DEFAULT '[]'"),
         ("epss_max", "ALTER TABLE cases ADD COLUMN epss_max REAL"),
         ("mitre_techniques", "ALTER TABLE cases ADD COLUMN mitre_techniques TEXT NOT NULL DEFAULT '[]'"),
+        ("priority_boost", "ALTER TABLE cases ADD COLUMN priority_boost REAL NOT NULL DEFAULT 0"),
+        ("priority_boost_at", "ALTER TABLE cases ADD COLUMN priority_boost_at TEXT"),
+        ("requested_by", "ALTER TABLE cases ADD COLUMN requested_by TEXT"),
     ):
         if col not in case_cols:
             await conn.execute(ddl)
@@ -514,6 +558,11 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
     if "origin" not in feedback_cols:
         await conn.execute("ALTER TABLE feedback ADD COLUMN origin TEXT NOT NULL DEFAULT 'human'")
         log.info("Migrated feedback table: added origin column")
+
+    activity_cols = {r["name"] for r in await conn.execute_fetchall("PRAGMA table_info(ai_activity)")}
+    if "caused_by" not in activity_cols:
+        await conn.execute("ALTER TABLE ai_activity ADD COLUMN caused_by INTEGER")
+        log.info("Migrated ai_activity table: added caused_by column")
 
     await _migrate_normalize_countries(conn)
 
@@ -1247,12 +1296,19 @@ async def log_ai_activity(
     ref_type: str | None = None,
     ref_id: int | str | None = None,
     model: str | None = None,
+    caused_by: int | None = None,
 ) -> dict:
     """Insert one activity row and commit. Returns the row as a dict (already
     JSON-decoded) so callers can immediately broadcast it over SSE without a
     second query. Never raises on a bad `detail` value — activity logging is
     observability, not a path that should be able to take down the subsystem
-    it's reporting on; non-serializable detail is coerced via default=str."""
+    it's reporting on; non-serializable detail is coerced via default=str.
+
+    `caused_by` is an optional ai_activity.id this event was triggered by
+    (agentic-coordination foundation F2), e.g. a cross-correlator
+    case_escalated event pointing at the cases_linked event that caused it.
+    Most callers leave it None — only a handful of cross-subsystem nudges
+    have a known cause to stamp."""
     ts = _utcnow().isoformat()
     detail_json = json.dumps(detail or {}, default=str)
     # Return exactly what went into the DB so SSE broadcasts and the stored
@@ -1260,8 +1316,8 @@ async def log_ai_activity(
     detail_out = json.loads(detail_json)
     cur = await conn.execute(
         """
-        INSERT INTO ai_activity (ts, subsystem, action, summary, detail, status, ref_type, ref_id, model)
-        VALUES (:ts, :subsystem, :action, :summary, :detail, :status, :ref_type, :ref_id, :model)
+        INSERT INTO ai_activity (ts, subsystem, action, summary, detail, status, ref_type, ref_id, model, caused_by)
+        VALUES (:ts, :subsystem, :action, :summary, :detail, :status, :ref_type, :ref_id, :model, :caused_by)
         """,
         {
             "ts": ts,
@@ -1273,6 +1329,7 @@ async def log_ai_activity(
             "ref_type": ref_type,
             "ref_id": str(ref_id) if ref_id is not None else None,
             "model": model,
+            "caused_by": caused_by,
         },
     )
     await conn.commit()
@@ -1287,6 +1344,7 @@ async def log_ai_activity(
         "ref_type": ref_type,
         "ref_id": str(ref_id) if ref_id is not None else None,
         "model": model,
+        "caused_by": caused_by,
     }
 
 
@@ -1319,7 +1377,7 @@ async def list_ai_activity(
 
     rows = await conn.execute_fetchall(
         f"""
-        SELECT id, ts, subsystem, action, summary, detail, status, ref_type, ref_id, model
+        SELECT id, ts, subsystem, action, summary, detail, status, ref_type, ref_id, model, caused_by
         FROM ai_activity {clause}
         ORDER BY ts DESC, id DESC
         LIMIT :limit OFFSET :offset
@@ -2136,8 +2194,11 @@ def _research_eligibility_sql() -> str:
 
     A case qualifies if it's explicitly forced (research_requested_at set —
     bypasses every other gate, since an analyst asking for a re-research
-    means "go again right now"), OR it's past the failure-retry guard AND
-    due per its significance-scaled cadence:
+    means "go again right now"), OR its priority_boost has crossed
+    research_priority_boost_floor (the generalized nudge primitive — see
+    db.nudge_case; a backstop for boost-only nudges, since most current
+    nudgers also set research_requested_at), OR it's past the failure-retry
+    guard AND due per its significance-scaled cadence:
       - info: researched exactly ONCE — eligible iff it has zero completed
         runs ever (no interval; see settings.research_critical/warn_interval).
       - warn: eligible if its last completed run is older than
@@ -2151,6 +2212,7 @@ def _research_eligibility_sql() -> str:
     case out for a full cadence interval just because the backend hiccuped."""
     return """
         research_requested_at IS NOT NULL
+        OR priority_boost >= :boost_floor
         OR (
           NOT EXISTS (
             SELECT 1 FROM research_runs r
@@ -2186,6 +2248,7 @@ def _research_eligibility_params(now: datetime) -> dict:
         "failure_cutoff": (now - timedelta(hours=settings.research_failure_retry_hours)).isoformat(),
         "warn_cutoff": (now - timedelta(seconds=settings.research_warn_interval_seconds)).isoformat(),
         "critical_cutoff": (now - timedelta(seconds=settings.research_critical_interval_seconds)).isoformat(),
+        "boost_floor": settings.research_priority_boost_floor,
     }
 
 
@@ -2194,7 +2257,9 @@ async def get_cases_needing_research(
 ) -> list[dict]:
     """Cases worth spending a Hermes research run on this tick — see
     _research_eligibility_sql's docstring for the exact eligibility rule.
-    Forced cases sort first, then critical-before-warn-before-info, then
+    Forced cases sort first, then higher-priority_boost cases (the
+    generalized nudge primitive — e.g. cross-correlation escalation or
+    negative feedback), then critical-before-warn-before-info, then
     oldest-first, so a backlog drains in a stable order rather than
     thrashing between cases. info cases sort last among naturally-eligible
     cases, so their one-time pass never displaces a warn/critical case
@@ -2205,6 +2270,7 @@ async def get_cases_needing_research(
         WHERE {_research_eligibility_sql()}
         ORDER BY
             (research_requested_at IS NOT NULL) DESC,
+            priority_boost DESC,
             CASE significance WHEN 'critical' THEN 3 WHEN 'warn' THEN 2 ELSE 1 END DESC,
             last_seen ASC
         LIMIT :limit
@@ -2225,9 +2291,19 @@ async def clear_case_research_request(conn: aiosqlite.Connection, *, case_id: in
     used when a research run fails/times out so a persistently-broken
     Hermes backend doesn't make a forced case retry every single tick
     forever (see research/agent.py's failure path). The analyst can always
-    re-request via the API if it's still wanted."""
+    re-request via the API if it's still wanted. Also zeroes priority_boost
+    (see nudge_case) — a failed forced run shouldn't leave a stale boost
+    keeping the case at the front of the queue forever."""
     await conn.execute(
-        "UPDATE cases SET research_requested_at = NULL WHERE id = :id", {"id": case_id}
+        """
+        UPDATE cases SET
+            research_requested_at = NULL,
+            priority_boost = 0,
+            priority_boost_at = NULL,
+            requested_by = NULL
+        WHERE id = :id
+        """,
+        {"id": case_id},
     )
     await conn.commit()
 
@@ -2240,6 +2316,59 @@ async def request_case_research(conn: aiosqlite.Connection, *, case_id: int) -> 
     cur = await conn.execute(
         "UPDATE cases SET research_requested_at = :now WHERE id = :id",
         {"now": _utcnow().isoformat(), "id": case_id},
+    )
+    await conn.commit()
+    return cur.rowcount > 0
+
+
+async def nudge_case(
+    conn: aiosqlite.Connection,
+    *,
+    case_id: int,
+    boost: float,
+    requested_by: str,
+    gap_note: str | None = None,
+) -> bool:
+    """Generalized nudge primitive (agentic-coordination foundation F1) —
+    lets any subsystem (cross-correlation escalation, feedback re-analysis,
+    ...) pull a case forward in the research queue, without each one having
+    to know about research_requested_at's bypass semantics directly.
+
+    priority_boost is raised via MAX() rather than overwritten so two
+    subsystems nudging the same case in quick succession don't stomp each
+    other — the stronger signal wins and requested_by records the latest
+    nudger for audit/debugging. research_requested_at is also set
+    (COALESCE — don't clobber an earlier forced request's timestamp) so the
+    existing _gap_note machinery in research/agent.py activates on the next
+    pass and targets the case's actual missing fields.
+
+    `gap_note` is accepted for interface symmetry with how callers think
+    about "why am I nudging this case" but is intentionally NOT persisted —
+    research/agent.py's _gap_note is computed fresh from the live case row
+    at prompt-build time, so a stored free-text note would just go stale.
+    Callers that want a *specific* re-dig (e.g. re-checking attribution)
+    rely on research_requested_at activating _gap_note's existing
+    missing-field diff rather than this kwarg.
+
+    Reversed by: apply_research_findings/clear_case_research_request
+    (zeroed once a research pass resolves or fails the case) and the
+    periodic decay step in run_significance_decay (so a boost that never
+    gets researched fades back to zero on its own)."""
+    cur = await conn.execute(
+        """
+        UPDATE cases SET
+            priority_boost = MAX(priority_boost, :boost),
+            priority_boost_at = :now,
+            requested_by = :requested_by,
+            research_requested_at = COALESCE(research_requested_at, :now)
+        WHERE id = :case_id
+        """,
+        {
+            "case_id": case_id,
+            "boost": boost,
+            "requested_by": requested_by,
+            "now": _utcnow().isoformat(),
+        },
     )
     await conn.commit()
     return cur.rowcount > 0
@@ -2328,7 +2457,9 @@ async def apply_research_findings(
     verdict, or one filtered out by the confidence gate), the case's current
     significance/significance_score are left untouched. See
     merge_item_into_case's docstring for how this interacts with later
-    item corroboration."""
+    item corroboration. Also zeroes priority_boost/requested_by (see
+    nudge_case) — a nudge that requested this pass is satisfied once it
+    completes, same as research_requested_at."""
     case = await get_case_by_id(conn, case_id)
     if case is None:
         return
@@ -2349,7 +2480,10 @@ async def apply_research_findings(
             significance_score = CASE WHEN :significance IS NULL
                                        THEN significance_score
                                        ELSE :significance_score END,
-            research_requested_at = NULL
+            research_requested_at = NULL,
+            priority_boost = 0,
+            priority_boost_at = NULL,
+            requested_by = NULL
         WHERE id = :case_id
         """,
         {
@@ -2377,6 +2511,41 @@ async def get_research_runs_for_case(conn: aiosqlite.Connection, case_id: int) -
         d["findings"] = json.loads(d["findings"]) if d["findings"] else {}
         d["sources"] = json.loads(d["sources"]) if d["sources"] else []
         out.append(d)
+    return out
+
+
+async def get_recent_research_source_domains(
+    conn: aiosqlite.Connection, *, since_iso: str, limit: int = 200
+) -> list[str]:
+    """Distinct domains cited in recently completed research_runs.sources
+    (agentic-coordination quick win B1) — research/discover.py mines these
+    as pre-warmed source candidates. Until this, research_runs.sources was
+    write-only: populated by research/agent.py's finish_research_run, read
+    by nothing. Newest-finished-first, deduped, no per-row ordering
+    guarantee beyond that."""
+    rows = await conn.execute_fetchall(
+        """
+        SELECT sources FROM research_runs
+        WHERE status = 'completed' AND finished_at >= :since
+        ORDER BY finished_at DESC LIMIT :limit
+        """,
+        {"since": since_iso, "limit": limit},
+    )
+    seen: set[str] = set()
+    out: list[str] = []
+    for r in rows:
+        try:
+            urls = json.loads(r["sources"]) if r["sources"] else []
+        except (TypeError, ValueError):
+            continue
+        for u in urls:
+            m = re.search(r"://([^/]+)/?", str(u))
+            if not m:
+                continue
+            domain = m.group(1).lower()
+            if domain and domain not in seen:
+                seen.add(domain)
+                out.append(domain)
     return out
 
 
@@ -3191,45 +3360,31 @@ async def stats_cases_timeseries(
 
 async def get_actor_profile(conn: aiosqlite.Connection, actor: str, *, case_limit: int = 50) -> dict | None:
     """Full aggregate profile for one attributed actor — backs the
-    Landscape tab's actor-leaderboard click-through. Unlike computing this
-    client-side from a paginated /api/cases?actor= call (which the frontend
-    did before this existed), the aggregates here are computed over *every*
-    matching case, not just the first page, so victim/sector/CVE counts for
-    a prolific actor aren't silently undercounted; `cases` itself is still
-    capped (case_limit) since the UI only needs a browsable list, not every
-    row in memory."""
-    # Case-insensitive: the leaderboard (stats_cases_by_actor) merges casing
-    # variants of the same actor into one entry, so the click-through here
-    # must pull every casing too, not just an exact-cased match.
-    all_rows = await conn.execute_fetchall(
-        """
-        SELECT id, title, damaged_party, damaged_party_sector, damaged_party_country,
-               cve_ids, first_seen, last_seen, significance
-        FROM cases WHERE lower(attribution) = lower(:actor)
-        """,
-        {"actor": actor},
-    )
-    if not all_rows:
-        return None
+    Landscape tab's actor-leaderboard click-through.
 
-    victims, sectors, countries, cve_ids = set(), set(), set(), set()
-    first_seen = last_seen = None
-    monthly: dict[str, int] = {}
-    for r in all_rows:
-        if r["damaged_party"]:
-            victims.add(r["damaged_party"])
-        if r["damaged_party_sector"]:
-            sectors.add(r["damaged_party_sector"])
-        if r["damaged_party_country"]:
-            countries.add(r["damaged_party_country"])
-        for cve_id in (json.loads(r["cve_ids"]) if r["cve_ids"] else []):
-            cve_ids.add(cve_id)
-        if first_seen is None or r["first_seen"] < first_seen:
-            first_seen = r["first_seen"]
-        if last_seen is None or r["last_seen"] > last_seen:
-            last_seen = r["last_seen"]
-        month_key = (r["first_seen"] or "")[:7]
-        monthly[month_key] = monthly.get(month_key, 0) + 1
+    Reads the actor_profiles materialized table (agentic-coordination
+    foundation F3, refreshed periodically by
+    pipeline/actor_profiles.refresh_actor_profiles — see scheduler.py's
+    "_actor_profiles" job) instead of recomputing the aggregate from `cases`
+    on every request. This also adds mitre_techniques/iocs to the profile,
+    which the old per-request computation never aggregated. The browsable
+    `cases` list and the monthly `activity` timeline are still small live
+    queries — they're presentation details the materialized table doesn't
+    need to store, and case_limit only needs a bounded recent slice, not
+    every row in memory.
+
+    Eventually consistent: a just-attributed actor won't appear until the
+    next refresh tick (default 30 min) — acceptable, matching the
+    source_value precedent this mirrors."""
+    # Case-insensitive: the leaderboard (stats_cases_by_actor) merges casing
+    # variants of the same actor into one entry, so the lookup here must
+    # match on the same lower-cased key actor_profiles is keyed by.
+    profile_rows = await conn.execute_fetchall(
+        "SELECT * FROM actor_profiles WHERE actor = lower(:actor)", {"actor": actor}
+    )
+    if not profile_rows:
+        return None
+    p = dict(profile_rows[0])
 
     cases_rows = await conn.execute_fetchall(
         """
@@ -3240,19 +3395,112 @@ async def get_actor_profile(conn: aiosqlite.Connection, actor: str, *, case_limi
         """,
         {"actor": actor, "limit": case_limit},
     )
+    monthly_rows = await conn.execute_fetchall(
+        "SELECT first_seen FROM cases WHERE lower(attribution) = lower(:actor)", {"actor": actor}
+    )
+    monthly: dict[str, int] = {}
+    for r in monthly_rows:
+        month_key = (r["first_seen"] or "")[:7]
+        monthly[month_key] = monthly.get(month_key, 0) + 1
 
     return {
-        "actor": actor,
-        "case_count": len(all_rows),
-        "victim_count": len(victims),
-        "sectors": sorted(sectors),
-        "countries": sorted(countries),
-        "cve_ids": sorted(cve_ids),
-        "first_seen": first_seen,
-        "last_seen": last_seen,
+        "actor": p["display_name"],
+        "case_count": p["case_count"],
+        "victim_count": p["victim_count"],
+        "sectors": json.loads(p["sectors"]) if p["sectors"] else [],
+        "countries": json.loads(p["countries"]) if p["countries"] else [],
+        "cve_ids": json.loads(p["cve_ids"]) if p["cve_ids"] else [],
+        "mitre_techniques": json.loads(p["mitre_techniques"]) if p["mitre_techniques"] else [],
+        "iocs": json.loads(p["iocs"]) if p["iocs"] else [],
+        "first_seen": p["first_seen"],
+        "last_seen": p["last_seen"],
         "activity": [{"bucket": k, "n": v} for k, v in sorted(monthly.items())],
         "cases": [dict(r) for r in cases_rows],
     }
+
+
+async def upsert_actor_profile(
+    conn: aiosqlite.Connection,
+    *,
+    actor: str,
+    display_name: str,
+    cve_ids: list[str],
+    mitre_techniques: list[str],
+    sectors: list[str],
+    countries: list[str],
+    iocs: list[str],
+    victims: list[str],
+    case_ids: list[int],
+    case_count: int,
+    victim_count: int,
+    first_seen: str | None,
+    last_seen: str | None,
+) -> None:
+    """Write/replace one actor's materialized profile row (see
+    pipeline/actor_profiles.refresh_actor_profiles). Mirrors
+    save_source_value's upsert shape."""
+    await conn.execute(
+        """
+        INSERT INTO actor_profiles (
+            actor, display_name, cve_ids, mitre_techniques, sectors, countries,
+            iocs, victims, case_ids, case_count, victim_count, first_seen, last_seen, computed_at
+        ) VALUES (
+            :actor, :display_name, :cve_ids, :mitre_techniques, :sectors, :countries,
+            :iocs, :victims, :case_ids, :case_count, :victim_count, :first_seen, :last_seen, :computed_at
+        )
+        ON CONFLICT(actor) DO UPDATE SET
+            display_name = excluded.display_name,
+            cve_ids = excluded.cve_ids,
+            mitre_techniques = excluded.mitre_techniques,
+            sectors = excluded.sectors,
+            countries = excluded.countries,
+            iocs = excluded.iocs,
+            victims = excluded.victims,
+            case_ids = excluded.case_ids,
+            case_count = excluded.case_count,
+            victim_count = excluded.victim_count,
+            first_seen = excluded.first_seen,
+            last_seen = excluded.last_seen,
+            computed_at = excluded.computed_at
+        """,
+        {
+            "actor": actor,
+            "display_name": display_name,
+            "cve_ids": json.dumps(cve_ids),
+            "mitre_techniques": json.dumps(mitre_techniques),
+            "sectors": json.dumps(sectors),
+            "countries": json.dumps(countries),
+            "iocs": json.dumps(iocs),
+            "victims": json.dumps(victims),
+            "case_ids": json.dumps(case_ids),
+            "case_count": case_count,
+            "victim_count": victim_count,
+            "first_seen": first_seen,
+            "last_seen": last_seen,
+            "computed_at": _utcnow().isoformat(),
+        },
+    )
+
+
+async def get_attributed_cases_for_actor_profiles(conn: aiosqlite.Connection) -> list[dict]:
+    """All cases with a non-empty attribution, for
+    pipeline/actor_profiles.refresh_actor_profiles to group by lower-cased
+    actor. A thin reader so the aggregation module doesn't hand-write SQL."""
+    rows = await conn.execute_fetchall(
+        """
+        SELECT attribution, damaged_party, damaged_party_sector, damaged_party_country,
+               cve_ids, mitre_techniques, iocs, id, first_seen, last_seen
+        FROM cases WHERE attribution IS NOT NULL AND attribution != ''
+        """
+    )
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["cve_ids"] = json.loads(d["cve_ids"]) if d["cve_ids"] else []
+        d["mitre_techniques"] = json.loads(d["mitre_techniques"]) if d["mitre_techniques"] else []
+        d["iocs"] = json.loads(d["iocs"]) if d["iocs"] else []
+        out.append(d)
+    return out
 
 
 async def stats_cases_by_actor(
@@ -3278,6 +3526,69 @@ async def stats_cases_by_actor(
     return [{"actor": r["value"], "n": r["n"]} for r in rows]
 
 
+async def bump_case_significance_one_rung(conn: aiosqlite.Connection, *, case_id: int, cap: str) -> bool:
+    """Escalate a case's significance by exactly one rung
+    (info->warn->critical), never above `cap` and never down — the
+    significance-bump half of cross-correlation escalation (quick win C2,
+    pipeline/cross_correlate.py), gated separately behind
+    settings.cross_correlate_escalation_bump_enabled since auto-raising a
+    case's level is a stronger move than just nudging it toward research.
+
+    Deliberately does no bookkeeping about "how/why this case was raised" —
+    it relies entirely on the existing run_significance_decay job (which
+    lowers any stale warn/critical case regardless of how it got there) as
+    the reversal mechanism, same as every other significance mutation in
+    this codebase. Returns True if the level actually changed."""
+    row = await conn.execute_fetchall("SELECT significance FROM cases WHERE id = :id", {"id": case_id})
+    if not row:
+        return False
+    current = row[0]["significance"]
+    current_rank = sig.SIG_RANK.get(current, 1)
+    cap_rank = sig.SIG_RANK.get(cap, 1)
+    new_rank = min(current_rank + 1, cap_rank)
+    if new_rank <= current_rank:
+        return False
+    new_sig = sig.RANK_SIG[new_rank]
+    await conn.execute(
+        "UPDATE cases SET significance = :sig, significance_score = :score WHERE id = :id",
+        {"sig": new_sig, "score": sig.significance_score(new_sig), "id": case_id},
+    )
+    await conn.commit()
+    return True
+
+
+_PRIORITY_BOOST_EPSILON = 0.05
+
+
+async def _decay_priority_boost(conn: aiosqlite.Connection, *, now: datetime) -> None:
+    """Geometrically decay priority_boost (see nudge_case) on the
+    significance-decay job's cadence, so a nudge that never resulted in a
+    research pass fades out instead of pinning a case at the front of the
+    queue indefinitely. Only touches boosts set at least one decay-interval
+    ago, so a boost set this tick isn't immediately decayed next tick before
+    research had a chance to act on it."""
+    factor = settings.priority_boost_decay_factor
+    if factor >= 1:
+        return
+    interval = max(settings.significance_decay_interval_seconds, 1)
+    cutoff = (now - timedelta(seconds=interval)).isoformat()
+    await conn.execute(
+        """
+        UPDATE cases SET priority_boost = priority_boost * :factor
+        WHERE priority_boost > 0 AND priority_boost_at IS NOT NULL AND priority_boost_at < :cutoff
+        """,
+        {"factor": factor, "cutoff": cutoff},
+    )
+    await conn.execute(
+        """
+        UPDATE cases SET priority_boost = 0, priority_boost_at = NULL, requested_by = NULL
+        WHERE priority_boost > 0 AND priority_boost < :epsilon
+        """,
+        {"epsilon": _PRIORITY_BOOST_EPSILON},
+    )
+    await conn.commit()
+
+
 async def run_significance_decay(conn: aiosqlite.Connection, *, now: datetime | None = None) -> int:
     """Mechanical staleness safety-net — the "no research pass needed"
     half of the hybrid ongoing-metric (see research/agent.py's
@@ -3297,8 +3608,17 @@ async def run_significance_decay(conn: aiosqlite.Connection, *, now: datetime | 
     a daily critical research cadence is therefore never touched here.
     Stateless and idempotent: recomputed fresh from last_seen/research_runs
     every tick, no "last decayed" bookkeeping needed. Returns the number of
-    cases stepped down."""
+    cases stepped down.
+
+    Also runs priority_boost decay (agentic-coordination foundation F1) on
+    this same cadence — any case nudged via nudge_case() that never got
+    researched has its boost geometrically decayed
+    (settings.priority_boost_decay_factor per tick) rather than staying
+    pinned at the front of the research queue forever. This keeps boost
+    reversible/self-clearing even when significance decay itself is
+    disabled (research_stale_window_seconds <= 0)."""
     now = now or _utcnow()
+    await _decay_priority_boost(conn, now=now)
     window = settings.research_stale_window_seconds
     if window <= 0:
         return 0
