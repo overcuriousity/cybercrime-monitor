@@ -142,6 +142,20 @@ class Settings(BaseSettings):
     # 429s that burn the fallback_providers chain (kimi-coding -> devstral-2512)
     # instead.
     hermes_max_concurrent_runs: int = 2
+    # Real (measured) token burn-rate tracking — see db.token_usage and
+    # hermes/usage_ingest.py. hermes-agent measures its own token usage per
+    # session in ~/.hermes/state.db (not estimated); this job copies that
+    # into our own db on a poll so it can be queried/aggregated alongside the
+    # direct-llm usage llm/backend.py logs per-call. 0 disables the ingester
+    # — hermes-agent rows simply never appear in /api/tokens, direct-llm
+    # usage is unaffected.
+    hermes_state_db_path: Path = Path("~/.hermes/state.db")
+    token_ingest_interval_seconds: int = 30
+    # Averaging window for the headline tokens/hour figure on the Activity
+    # tab — wide enough to smooth over a single burst/idle tick, narrow
+    # enough to reflect "what's happening right now" rather than a daily
+    # average.
+    burn_rate_window_seconds: int = 3600
     # 0 disables this job only (research_runs never dispatch) without
     # touching llm_backend. heal/investigate/discover are gated by their own
     # *_interval_seconds settings below, independently.

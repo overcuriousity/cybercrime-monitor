@@ -79,7 +79,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   setInterval(loadDashboard, 30000);
 
   initCases();
-  initStatusBar();
+  initQueuesPanel();
+  initTokenBurn();
   initActivity();
   initLandscape();
   initInvestigate();
@@ -365,7 +366,7 @@ function patchCardWithVerdict(verdict) {
 // failed/unavailable semantic request must read as visibly different from
 // "keyword found nothing" (see settings.embed_backend's docstring and
 // api/routes.py's mode=semantic branch). semanticSearchEnabled mirrors
-// /api/status's semantic_search.enabled (kept fresh by renderStatusBar) and
+// /api/status's semantic_search.enabled (kept fresh by renderQueuesPanel) and
 // only gates whether the Semantic button is clickable.
 let semanticSearchEnabled = true;
 
@@ -2304,23 +2305,29 @@ async function submitFeedback(body, btn, row) {
   }
 }
 
-// ── Real-time subsystem status bar ───────────────────────────────────────────
-function initStatusBar() {
-  updateStatusBar();
-  setInterval(updateStatusBar, 10000);
+// ── Real-time subsystem queues panel (Activity tab) ──────────────────────────
+// Formerly a global status bar shown above every tab; the data now lives
+// only in the Activity tab (#queues-panel). Still polled unconditionally
+// from app bootstrap (not gated to the Activity tab being visible) because
+// it also carries the admin/semantic-search availability flags every tab's
+// UI depends on — same pattern as loadSources/loadDashboard's unconditional
+// 30s polls elsewhere in this file.
+function initQueuesPanel() {
+  updateQueuesPanel();
+  setInterval(updateQueuesPanel, 10000);
 }
 
-async function updateStatusBar() {
+async function updateQueuesPanel() {
   try {
     const s = await api('/api/status');
-    renderStatusBar(s);
+    renderQueuesPanel(s);
   } catch (e) {
     console.error('Failed to load status', e);
     setStatusPill('status-scheduler', 'status: unreachable', 'error');
   }
 }
 
-function renderStatusBar(s) {
+function renderQueuesPanel(s) {
   adminEnabledServerSide = !!(s.admin && s.admin.enabled);
   updateAdminUiState();
 
@@ -2379,9 +2386,99 @@ function setStatusPill(id, text, state) {
 // SSE may also push lightweight status events from background jobs.
 function handleStatusEvent(payload) {
   // A full status payload mirrors /api/status; partial payloads update
-  // individual subsystems. Refresh the bar from the server to keep it simple
-  // and consistent.
-  updateStatusBar();
+  // individual subsystems. Refresh the panel from the server to keep it
+  // simple and consistent.
+  updateQueuesPanel();
+}
+
+// ── Real-time token burn rate (Activity tab) ─────────────────────────────────
+// Real (measured, not estimated) usage — see GET /api/tokens and
+// db.token_usage's schema comment. Same unconditional-poll pattern as
+// initQueuesPanel above.
+function initTokenBurn() {
+  updateTokenBurn();
+  setInterval(updateTokenBurn, 10000);
+}
+
+async function updateTokenBurn() {
+  try {
+    const data = await api('/api/tokens');
+    renderTokenBurn(data);
+  } catch (e) {
+    console.error('Failed to load token usage', e);
+  }
+}
+
+function renderTokenBurn(data) {
+  const burn = data.burn || {};
+  document.getElementById('burn-tokens-per-hour').textContent =
+    burn.tokens_per_hour != null ? Math.round(burn.tokens_per_hour).toLocaleString() : '—';
+  document.getElementById('burn-input-tokens').textContent =
+    burn.input_tokens != null ? burn.input_tokens.toLocaleString() : '—';
+  document.getElementById('burn-output-tokens').textContent =
+    burn.output_tokens != null ? burn.output_tokens.toLocaleString() : '—';
+
+  renderTokenBurnChart(data.timeseries || []);
+  renderTokenBurnBreakdown(burn);
+}
+
+function renderTokenBurnChart(timeseries) {
+  const labels = timeseries.map(b => fmtTime(new Date(b.t * 1000).toISOString()));
+  const data = timeseries.map(b => b.tokens);
+  upsertChart('chart-token-burn', {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [{
+        label: 'tokens',
+        data,
+        borderColor: 'var(--accent)',
+        backgroundColor: 'transparent',
+        tension: 0.25,
+        pointRadius: 0,
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { y: { beginAtZero: true } },
+    },
+  });
+}
+
+function renderTokenBurnBreakdown(burn) {
+  const list = document.getElementById('burn-breakdown-list');
+  list.innerHTML = '';
+
+  const bySource = burn.by_source || {};
+  const byModel = burn.by_model || {};
+  const entries = [
+    ...Object.entries(bySource).map(([k, v]) => [`source: ${k}`, v]),
+    ...Object.entries(byModel).map(([k, v]) => [`model: ${k}`, v]),
+  ];
+
+  if (!entries.length) {
+    const empty = document.createElement('p');
+    empty.className = 'hint';
+    empty.textContent = 'No token usage recorded yet.';
+    list.appendChild(empty);
+    return;
+  }
+
+  entries.forEach(([label, tokens]) => {
+    const row = document.createElement('div');
+    row.className = 'emerging-row';
+    const labelEl = document.createElement('span');
+    labelEl.className = 'emerging-label';
+    labelEl.textContent = label;
+    row.appendChild(labelEl);
+    const valueEl = document.createElement('span');
+    valueEl.className = 'emerging-delta';
+    valueEl.textContent = Math.round(tokens).toLocaleString();
+    row.appendChild(valueEl);
+    list.appendChild(row);
+  });
 }
 
 // ── AI Activity log ───────────────────────────────────────────────────────

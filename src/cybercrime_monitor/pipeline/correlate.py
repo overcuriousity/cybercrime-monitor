@@ -383,7 +383,7 @@ async def _try_fuzzy_merge(
         return False
 
     for case in candidates:
-        verdict = await llm_backend.adjudicate_merge(case, item)
+        verdict = await llm_backend.adjudicate_merge(case, item, conn=db_conn)
         if verdict is None:
             continue
         same_incident, confidence = verdict

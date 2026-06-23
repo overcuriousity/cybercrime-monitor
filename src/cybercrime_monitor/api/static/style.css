@@ -174,14 +174,17 @@ header {
 .tab:hover { color: var(--text); }
 .tab.active { color: var(--text); border-bottom-color: var(--accent); }
 
-/* ── Status bar ───────────────────────────────────────────────────────────── */
+/* ── Subsystem queues panel (Activity tab) ───────────────────────────────────
+   Formerly a global bar above all tabs; now scoped to the Activity tab
+   alongside the burn-rate widgets and activity log — see index.html's
+   #queues-panel and app.js's updateQueuesPanel. */
 .status-bar {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-  padding: 5px 18px;
-  background: var(--bg);
+  padding: 8px 0;
+  margin-bottom: 14px;
   border-bottom: 1px solid var(--border);
   font-size: 0.75rem;
   min-height: 28px;

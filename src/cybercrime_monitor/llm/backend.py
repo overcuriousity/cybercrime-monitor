@@ -41,6 +41,7 @@ import httpx
 
 from .. import prompts
 from .. import significance as sig
+from ..db import log_token_usage
 from ..hermes.runner import run_agent
 from ..settings import settings
 from . import health as llm_health
@@ -183,6 +184,27 @@ def _parse_json_block(content: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+async def _log_usage(conn, *, subsystem: str, model: str | None, data: dict) -> None:
+    """Capture the OpenAI-compatible response's own `usage` object — real,
+    measured token counts, not an estimate — into token_usage. `conn` is
+    optional (callers that don't hold a db connection, e.g. ad-hoc/no-op
+    paths, just skip logging) and any unexpected usage shape is swallowed —
+    see log_token_usage's own try/except for the same reasoning."""
+    if conn is None:
+        return
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return
+    await log_token_usage(
+        conn,
+        source="direct-llm",
+        subsystem=subsystem,
+        model=model,
+        input_tokens=int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0),
+        output_tokens=int(usage.get("completion_tokens") or usage.get("output_tokens") or 0),
+    )
+
+
 def _auth_headers() -> dict[str, str]:
     headers = {"Content-Type": "application/json"}
     if settings.llm_api_key:
@@ -230,25 +252,30 @@ def _parse_batch_extractions(content: str, *, model: str, n: int) -> dict[int, E
     return _extractions_from_data(data, model=model, n=n)
 
 
-async def extract_batch(items: list[dict]) -> list[Extraction | None]:
+async def extract_batch(items: list[dict], *, conn=None) -> list[Extraction | None]:
     """Extract structured fields for N items in one call. Returns a list
     parallel to `items` — entries are None where the model omitted that
     item's extraction or the whole call failed, so llm/job.py's per-item
     backoff logic can retry just that item next batch. Transport (HTTP vs
     hermes CLI) is chosen by settings.llm_backend — see module docstring,
     with an automatic one-way fallback to hermes when llm_backend="openai"
-    but nothing is listening there (see _fallback_eligible)."""
+    but nothing is listening there (see _fallback_eligible).
+
+    conn: optional db connection — when given, the openai transport logs the
+    response's own usage object (real token counts) to token_usage (see
+    _log_usage). The hermes transport doesn't take usage from here at all;
+    its token counts are captured separately by hermes/usage_ingest.py."""
     if not items:
         return []
     if settings.llm_backend == "hermes_cli":
         return await _extract_batch_via_hermes(items)
     if not _fallback_eligible():
-        return await _extract_batch_via_openai(items)
+        return await _extract_batch_via_openai(items, conn=conn)
 
     if _in_fallback_cooldown():
         return await _extract_batch_via_hermes(items)
     try:
-        result = await _extract_batch_via_openai(items)
+        result = await _extract_batch_via_openai(items, conn=conn)
     except _BackendUnreachable:
         _enter_fallback_cooldown()
         return await _extract_batch_via_hermes(items)
@@ -256,7 +283,7 @@ async def extract_batch(items: list[dict]) -> list[Extraction | None]:
     return result
 
 
-async def _extract_batch_via_openai(items: list[dict]) -> list[Extraction | None]:
+async def _extract_batch_via_openai(items: list[dict], *, conn=None) -> list[Extraction | None]:
     url = settings.llm_base_url.rstrip("/") + "/chat/completions"
     headers = _auth_headers()
 
@@ -286,6 +313,7 @@ async def _extract_batch_via_openai(items: list[dict]) -> list[Extraction | None
             data = resp.json()
         content = data["choices"][0]["message"]["content"]
         model_name = data.get("model") or settings.llm_model or "unknown"
+        await _log_usage(conn, subsystem="classifier", model=model_name, data=data)
         extractions_by_idx = _parse_batch_extractions(content, model=model_name, n=len(items))
         if not extractions_by_idx:
             llm_health.record_error(f"unparseable batch response: {content[:200]!r}")
@@ -316,20 +344,21 @@ async def _extract_batch_via_hermes(items: list[dict]) -> list[Extraction | None
     return [extractions_by_idx.get(i) for i in range(len(items))]
 
 
-async def extract_one(*, title: str, snippet: str, source_name: str) -> Extraction | None:
+async def extract_one(*, title: str, snippet: str, source_name: str, conn=None) -> Extraction | None:
     """Single-item variant of extract_batch — used where batching doesn't
     apply (e.g. ad-hoc re-extraction). Returns None on any failure. Transport
     chosen by settings.llm_backend — see module docstring — with the same
-    automatic hermes fallback as extract_batch."""
+    automatic hermes fallback as extract_batch. conn: see extract_batch's
+    docstring."""
     if settings.llm_backend == "hermes_cli":
         return await _extract_one_via_hermes(title, snippet, source_name)
     if not _fallback_eligible():
-        return await _extract_one_via_openai(title, snippet, source_name)
+        return await _extract_one_via_openai(title, snippet, source_name, conn=conn)
 
     if _in_fallback_cooldown():
         return await _extract_one_via_hermes(title, snippet, source_name)
     try:
-        result = await _extract_one_via_openai(title, snippet, source_name)
+        result = await _extract_one_via_openai(title, snippet, source_name, conn=conn)
     except _BackendUnreachable:
         _enter_fallback_cooldown()
         return await _extract_one_via_hermes(title, snippet, source_name)
@@ -337,7 +366,7 @@ async def extract_one(*, title: str, snippet: str, source_name: str) -> Extracti
     return result
 
 
-async def _extract_one_via_openai(title: str, snippet: str, source_name: str) -> Extraction | None:
+async def _extract_one_via_openai(title: str, snippet: str, source_name: str, *, conn=None) -> Extraction | None:
     url = settings.llm_base_url.rstrip("/") + "/chat/completions"
     headers = _auth_headers()
 
@@ -362,6 +391,7 @@ async def _extract_one_via_openai(title: str, snippet: str, source_name: str) ->
             data = resp.json()
         content = data["choices"][0]["message"]["content"]
         model_name = data.get("model") or settings.llm_model or "unknown"
+        await _log_usage(conn, subsystem="classifier", model=model_name, data=data)
         block = _parse_json_block(content)
         extraction = _parse_extraction(block, model=model_name) if block is not None else None
         if extraction is None:
@@ -410,17 +440,17 @@ def _build_merge_prompt(case: dict, item: dict) -> str:
     )
 
 
-async def adjudicate_merge(case: dict, item: dict) -> tuple[bool, float] | None:
+async def adjudicate_merge(case: dict, item: dict, *, conn=None) -> tuple[bool, float] | None:
     """Ask the LLM whether `item` (a dict from db.get_uncorrelated_extracted_
     items) describes the same incident as `case` (a dict from db.fetch_cases
     /get_case_by_id). Returns (same_incident, confidence), or None on
     failure — callers should treat None as "don't merge" (the conservative
     default; a missed merge just means two cases stay separate, while a
     wrong merge corrupts attribution). Transport chosen by settings.
-    llm_backend — see module docstring."""
+    llm_backend — see module docstring. conn: see extract_batch's docstring."""
     if settings.llm_backend == "hermes_cli":
         return await _adjudicate_merge_via_hermes(case, item)
-    return await _adjudicate_merge_via_openai(case, item)
+    return await _adjudicate_merge_via_openai(case, item, conn=conn)
 
 
 def _parse_merge_block(block: dict | None) -> tuple[bool, float] | None:
@@ -434,7 +464,7 @@ def _parse_merge_block(block: dict | None) -> tuple[bool, float] | None:
     return bool(block["same_incident"]), confidence
 
 
-async def _adjudicate_merge_via_openai(case: dict, item: dict) -> tuple[bool, float] | None:
+async def _adjudicate_merge_via_openai(case: dict, item: dict, *, conn=None) -> tuple[bool, float] | None:
     url = settings.llm_base_url.rstrip("/") + "/chat/completions"
     headers = _auth_headers()
 
@@ -458,6 +488,7 @@ async def _adjudicate_merge_via_openai(case: dict, item: dict) -> tuple[bool, fl
             resp.raise_for_status()
             data = resp.json()
         content = data["choices"][0]["message"]["content"]
+        await _log_usage(conn, subsystem="correlator", model=data.get("model") or settings.llm_model, data=data)
         verdict = _parse_merge_block(_parse_json_block(content))
         if verdict is None:
             llm_health.record_error(f"unparseable merge response: {content[:200]!r}")

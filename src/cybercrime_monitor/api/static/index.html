@@ -41,17 +41,6 @@
     </nav>
   </header>
 
-  <div id="status-bar" class="status-bar" title="Subsystem status — refreshes every 10s">
-    <span class="status-pill" id="status-scheduler">scheduler: —</span>
-    <span class="status-pill" id="status-sources">sources: —</span>
-    <span class="status-pill" id="status-classifier">classifier: —</span>
-    <span class="status-pill" id="status-correlation">correlator: —</span>
-    <span class="status-pill" id="status-research">research: —</span>
-    <span class="status-pill" id="status-heal">heal: —</span>
-    <span class="status-pill" id="status-investigate">investigate: —</span>
-    <span class="status-pill" id="status-kev">KEV: —</span>
-  </div>
-
   <!-- ── Feed tab ─────────────────────────────────────────────────────────── -->
   <div id="tab-feed" class="tab-content hidden">
     <div class="dashboard-pane">
@@ -357,6 +346,47 @@
       discovery/healing/pruning, OSINT research, classification, and case correlation. This log
       is the transparency record for that autonomy, not a control panel.
     </p>
+
+    <!-- Real (measured, not estimated) token burn rate — see GET /api/tokens
+         and db.token_usage's schema comment. -->
+    <section class="gauge-row" id="burn-rate-row" title="Burn rate — refreshes every 10s">
+      <div class="gauge-card">
+        <div class="gauge-value" id="burn-tokens-per-hour">—</div>
+        <div class="gauge-label">Tokens / hour</div>
+      </div>
+      <div class="gauge-card">
+        <div class="gauge-value" id="burn-input-tokens">—</div>
+        <div class="gauge-label">Input (1h)</div>
+      </div>
+      <div class="gauge-card">
+        <div class="gauge-value" id="burn-output-tokens">—</div>
+        <div class="gauge-label">Output (1h)</div>
+      </div>
+    </section>
+    <section class="chart-row">
+      <div class="chart-card chart-card-wide">
+        <h3>Token burn rate (5m buckets, last hour)</h3>
+        <div class="chart-canvas"><canvas id="chart-token-burn"></canvas></div>
+      </div>
+      <div class="chart-card" id="burn-breakdown-card">
+        <h3>By source / model (1h)</h3>
+        <div id="burn-breakdown-list"></div>
+      </div>
+    </section>
+
+    <!-- Live subsystem queue depths — formerly the global status bar, moved
+         here so all operational state lives in one place. -->
+    <section class="status-bar" id="queues-panel" title="Subsystem queues — refreshes every 10s">
+      <span class="status-pill" id="status-scheduler">scheduler: —</span>
+      <span class="status-pill" id="status-sources">sources: —</span>
+      <span class="status-pill" id="status-classifier">classifier: —</span>
+      <span class="status-pill" id="status-correlation">correlator: —</span>
+      <span class="status-pill" id="status-research">research: —</span>
+      <span class="status-pill" id="status-heal">heal: —</span>
+      <span class="status-pill" id="status-investigate">investigate: —</span>
+      <span class="status-pill" id="status-kev">KEV: —</span>
+    </section>
+
     <div class="case-toolbar">
       <div class="case-toolbar-filters">
         <select id="activity-subsystem-select" title="Subsystem">
