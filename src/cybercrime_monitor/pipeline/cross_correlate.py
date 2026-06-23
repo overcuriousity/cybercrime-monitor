@@ -180,7 +180,7 @@ async def run_cross_correlation(db_conn) -> int:
                             await _maybe_escalate(db_conn, case=case_b, peer=case_a, link_event=link_event)
                         except Exception as exc:
                             log.error("[cross_correlate] escalation failed: %s", exc)
-                linked += 1
+                    linked += 1
     if linked:
-        log.info("[cross_correlate] recorded/updated %d case link(s)", linked)
+        log.info("[cross_correlate] recorded %d new case link(s)", linked)
     return linked

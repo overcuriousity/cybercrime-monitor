@@ -1,10 +1,11 @@
 """Mastodon public tag timeline collector — no auth required."""
 import logging
-from datetime import datetime
 
 from .. import health
 from ..http import clearnet_client
 from ..models import Item
+from ._text import parse_date as _parse_date
+from ._text import strip_html as _strip_html
 from .base import BaseCollector
 
 log = logging.getLogger(__name__)
@@ -50,17 +51,3 @@ class MastodonCollector(BaseCollector):
                 )
             )
         return items
-
-
-def _strip_html(s: str) -> str:
-    import re
-    return re.sub(r"<[^>]+>", "", s).strip()
-
-
-def _parse_date(s: str) -> datetime | None:
-    if not s:
-        return None
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except Exception:
-        return None

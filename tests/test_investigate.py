@@ -27,7 +27,7 @@ async def _stub_run_agent_factory(data: dict | None, *, ok: bool = True, error: 
 @pytest.mark.asyncio
 async def test_no_match_creates_nothing(db_conn, monkeypatch):
     monkeypatch.setattr(
-        investigate, "run_agent",
+        investigate, "run_dispatch_prompt",
         await _stub_run_agent_factory({"found": False, "confidence": 0.1, "items": [], "new_feeds": []}),
     )
 
@@ -68,7 +68,7 @@ async def test_confident_match_creates_item_and_case(db_conn, monkeypatch):
         ],
         "new_feeds": [],
     }
-    monkeypatch.setattr(investigate, "run_agent", await _stub_run_agent_factory(data))
+    monkeypatch.setattr(investigate, "run_dispatch_prompt", await _stub_run_agent_factory(data))
 
     inv_id = await db_module.create_investigation(db_conn, brief="Acme Corp possibly hit by ShadowGroup ransomware")
     inv = await db_module.get_investigation(db_conn, inv_id)
@@ -92,7 +92,7 @@ async def test_confident_match_creates_item_and_case(db_conn, monkeypatch):
 @pytest.mark.asyncio
 async def test_match_with_no_usable_items_falls_back_to_no_match(db_conn, monkeypatch):
     data = {"found": True, "confidence": 0.9, "items": [{"title": "", "url": "not-a-url"}], "new_feeds": []}
-    monkeypatch.setattr(investigate, "run_agent", await _stub_run_agent_factory(data))
+    monkeypatch.setattr(investigate, "run_dispatch_prompt", await _stub_run_agent_factory(data))
 
     inv_id = await db_module.create_investigation(db_conn, brief="Vague brief")
     inv = await db_module.get_investigation(db_conn, inv_id)
@@ -138,7 +138,7 @@ async def test_confident_match_passes_new_feeds_to_discover(db_conn, monkeypatch
         ],
         "new_feeds": [candidate],
     }
-    monkeypatch.setattr(investigate, "run_agent", await _stub_run_agent_factory(data))
+    monkeypatch.setattr(investigate, "run_dispatch_prompt", await _stub_run_agent_factory(data))
 
     called_with = []
 
@@ -164,7 +164,7 @@ async def test_transient_failure_requeues_instead_of_failing(db_conn, monkeypatc
     fallback-chain link) should be re-queued with a cooldown, not marked
     terminally failed — see research/investigate.py's _investigate_one."""
     monkeypatch.setattr(
-        investigate, "run_agent",
+        investigate, "run_dispatch_prompt",
         await _stub_run_agent_factory(
             None, ok=False, error="hermes -z: no final response was produced; treating the run as failed.",
         ),
@@ -189,7 +189,7 @@ async def test_transient_failure_goes_terminal_after_max_attempts(db_conn, monke
     terminal instead — otherwise a chronically-failing brief loops forever."""
     monkeypatch.setattr(app_settings, "investigate_max_attempts", 2)
     monkeypatch.setattr(
-        investigate, "run_agent",
+        investigate, "run_dispatch_prompt",
         await _stub_run_agent_factory(None, ok=False, error="429 Too Many Requests"),
     )
 
@@ -218,7 +218,7 @@ async def test_permanent_failure_goes_terminal_immediately(db_conn, monkeypatch)
     """A non-transient hermes failure (e.g. a misconfigured binary path)
     should still go straight to terminal "failed" on the first try."""
     monkeypatch.setattr(
-        investigate, "run_agent",
+        investigate, "run_dispatch_prompt",
         await _stub_run_agent_factory(None, ok=False, error="hermes binary not found: 'hermes'"),
     )
 

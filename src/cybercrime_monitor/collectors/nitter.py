@@ -1,13 +1,13 @@
 """Nitter RSS collector for X/Twitter accounts."""
 import logging
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 
 import feedparser
 
 from .. import health
 from ..http import clearnet_client
 from ..models import Item
+from ._text import parse_date as _parse_rss_date
+from ._text import strip_html as _strip_html
 from .base import BaseCollector
 
 log = logging.getLogger(__name__)
@@ -64,17 +64,3 @@ class NitterCollector(BaseCollector):
                 )
             )
         return items
-
-
-def _parse_rss_date(s: str) -> datetime | None:
-    if not s:
-        return None
-    try:
-        return parsedate_to_datetime(s)
-    except Exception:
-        return None
-
-
-def _strip_html(s: str) -> str:
-    import re
-    return re.sub(r"<[^>]+>", "", s)

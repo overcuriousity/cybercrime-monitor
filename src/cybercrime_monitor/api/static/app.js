@@ -1,8 +1,13 @@
 'use strict';
 
 // ── State ──────────────────────────────────────────────────────────────────
+// Cap on state.items so long sessions (heavy load-more scrolling, or a busy
+// SSE feed left open for hours) don't grow the array — and the DOM nodes
+// rendered from it — without bound.
+const MAX_FEED_ITEMS = 1000;
+
 const state = {
-  items: [],           // all loaded items (newest first)
+  items: [],           // all loaded items (newest first), capped at MAX_FEED_ITEMS
   offset: 0,
   pageSize: 100,
   hasMore: false,
@@ -439,7 +444,7 @@ async function loadMore() {
   const params = buildParams(state.offset, state.pageSize);
   const data = await api('/api/items?' + params, itemsFetchOpts());
   const newItems = data.items || [];
-  state.items = state.items.concat(newItems);
+  state.items = state.items.concat(newItems).slice(0, MAX_FEED_ITEMS);
   state.offset += newItems.length;
   state.hasMore = state.offset < data.total;
   renderItems(newItems, true);
@@ -774,6 +779,7 @@ function handleLiveItem(item) {
     card.classList.add('fadeIn');
     feedList.prepend(card);
     state.items.unshift(item);
+    if (state.items.length > MAX_FEED_ITEMS) state.items.length = MAX_FEED_ITEMS;
     totalCount.textContent = `${(state.items.length).toLocaleString()} items`;
   } else {
     state.pendingLive.push(item);
@@ -950,6 +956,10 @@ async function api(path, opts = {}) {
 
 function fmtTime(iso) {
   if (!iso) return '';
+  // Defensive: some legacy/external sources may store "YYYY-MM-DD HH:MM:SS"
+  // (space-separated) instead of ISO's "T" separator; Date() doesn't accept
+  // that form. Normalize it before the tz check below.
+  iso = iso.replace(/^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2})/, '$1T$2');
   // Append "Z" only when the string has no timezone info at all (no
   // trailing Z, no +HH:MM/-HH:MM offset). Health/classifier timestamps are
   // tz-aware (Python's datetime.now(timezone.utc).isoformat() — e.g.
@@ -2273,7 +2283,7 @@ async function requestCaseMerge(caseId, btn) {
     await api(`/api/cases/${caseId}/merge/${otherCaseId}`, { method: 'POST', headers: adminHeaders() });
     btn.textContent = 'Merged';
     // Refresh the case list and reopen the surviving case.
-    await loadCases();
+    await applyCaseFilters();
     await selectCase(caseId);
   } catch (e) {
     btn.disabled = false;

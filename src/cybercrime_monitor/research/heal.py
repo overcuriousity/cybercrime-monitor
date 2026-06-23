@@ -37,16 +37,15 @@ Three behaviors, one tick each (bounded — a Hermes run can take minutes):
 
 Runs on its own APScheduler interval (scheduler.py's "_heal" job).
 """
-import asyncio
 import logging
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from .. import db
 from .. import health
 from .. import prompts
 from ..api.sse import broadcaster
-from ..hermes.runner import run_agent
+from ..health_registry import HealthRegistry
+from ..hermes.runner import run_dispatch_prompt
 from ..http import clearnet_client, tor_client
 from ..scheduler import load_sources, reschedule_source, unschedule_source
 from ..settings import settings
@@ -58,53 +57,14 @@ log = logging.getLogger(__name__)
 
 # ── Runtime health registry ───────────────────────────────────────────────────
 # Surfaced via /api/status so the dashboard can show whether hermes-agent is
-# currently investigating a broken source.
+# currently investigating a broken source. See health_registry.py for the
+# shared implementation.
 
-@dataclass
-class HealHealth:
-    last_run_at: str | None = None
-    last_success_at: str | None = None
-    last_processed_count: int = 0
-    last_error: str | None = None
-    last_error_at: str | None = None
-    consecutive_errors: int = 0
-
-
-_health = HealHealth()
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _emit(payload: dict) -> None:
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(broadcaster.broadcast_status("heal", payload))
-    except RuntimeError:
-        pass
-
-
-def record_run_start() -> None:
-    _health.last_run_at = _now_iso()
-
-
-def record_success(processed_count: int) -> None:
-    _health.last_success_at = _now_iso()
-    _health.last_processed_count = processed_count
-    _health.consecutive_errors = 0
-    _emit({"last_processed_count": processed_count})
-
-
-def record_error(error: str) -> None:
-    _health.last_error = error[:300]
-    _health.last_error_at = _now_iso()
-    _health.consecutive_errors += 1
-    _emit({"error": error[:300], "consecutive_errors": _health.consecutive_errors})
-
-
-def get() -> HealHealth:
-    return _health
+_registry = HealthRegistry("heal")
+record_run_start = _registry.record_run_start
+record_success = _registry.record_success
+record_error = _registry.record_error
+get = _registry.get
 
 
 async def _log_activity(
@@ -233,13 +193,7 @@ async def _heal_one(db_conn, source: dict, *, scheduler, sse_broadcaster) -> Non
         status_note=_status_note(source),
         feedback_note=_feedback_note(value),
     )
-    result = await run_agent(
-        prompt,
-        toolsets=settings.hermes_toolsets,
-        timeout=settings.hermes_timeout_seconds,
-        model=settings.hermes_model or None,
-        expect_json=True,
-    )
+    result = await run_dispatch_prompt(prompt)
 
     if not result.ok or result.data is None:
         await db.create_heal_proposal(
@@ -286,7 +240,7 @@ async def _probe_and_apply(
     2xx response, combined with sources/value.py's should_apply_heal()
     judgement, is what gates actually writing sources.yaml — see that
     function's docstring for why there's no static confidence cutoff here."""
-    use_tor = source.get("type") == "tor_forum" or "tor" in (source.get("tags") or [])
+    use_tor = source.get("type") == "tor_forum" or "dark-web" in (source.get("source_tags") or [])
     probe_ok = False
     try:
         client_cm = tor_client(timeout=60.0) if use_tor else clearnet_client(timeout=30.0)

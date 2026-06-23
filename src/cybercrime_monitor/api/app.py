@@ -9,8 +9,9 @@ from fastapi.staticfiles import StaticFiles
 
 from .. import health
 from ..db import load_health_snapshot, open_db
-from ..scheduler import build_scheduler
+from ..scheduler import build_scheduler, load_sources
 from ..settings import settings
+from ..sources.value import validate_sources
 from .sse import broadcaster
 from .routes import router
 
@@ -62,6 +63,7 @@ def _assert_no_data_under_static() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.db = await open_db()
+    validate_sources(load_sources())
     # Restore health.py's in-memory registry from its last periodic snapshot
     # (see scheduler.py's "_health_persist" job) BEFORE the scheduler starts
     # ticking, so the first /api/sources response after a restart already

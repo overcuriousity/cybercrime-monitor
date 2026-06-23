@@ -16,11 +16,9 @@ be one (visible as duplicate cards, harmless); a wrong merge corrupts
 attribution by blending two different incidents. See
 llm/backend.adjudicate_merge's docstring.
 """
-import asyncio
 import hashlib
 import logging
 import re
-from dataclasses import dataclass
 from datetime import timedelta, timezone, datetime
 
 from .. import db
@@ -33,6 +31,7 @@ from ..enrich import cve_meta as cve_meta_enrich
 from ..enrich import ioc as ioc_enrich
 from ..enrich import kev as kev_enrich
 from ..enrich import mitre as mitre_enrich
+from ..health_registry import HealthRegistry
 from ..llm import backend as llm_backend
 from ..settings import settings
 
@@ -42,52 +41,13 @@ log = logging.getLogger(__name__)
 # ── Runtime health registry (mirrors llm/health.py) ───────────────────────────
 # Surfaced via /api/status so the dashboard can show what the correlator is
 # doing right now and whether it is keeping up with the extraction queue.
+# See health_registry.py for the shared implementation.
 
-@dataclass
-class CorrelationHealth:
-    last_run_at: str | None = None
-    last_success_at: str | None = None
-    last_processed_count: int = 0
-    last_error: str | None = None
-    last_error_at: str | None = None
-    consecutive_errors: int = 0
-
-
-_health = CorrelationHealth()
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _emit(payload: dict) -> None:
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(broadcaster.broadcast_status("correlation", payload))
-    except RuntimeError:
-        pass
-
-
-def record_run_start() -> None:
-    _health.last_run_at = _now_iso()
-
-
-def record_success(processed_count: int) -> None:
-    _health.last_success_at = _now_iso()
-    _health.last_processed_count = processed_count
-    _health.consecutive_errors = 0
-    _emit({"last_processed_count": processed_count})
-
-
-def record_error(error: str) -> None:
-    _health.last_error = error[:300]
-    _health.last_error_at = _now_iso()
-    _health.consecutive_errors += 1
-    _emit({"error": error[:300], "consecutive_errors": _health.consecutive_errors})
-
-
-def get() -> CorrelationHealth:
-    return _health
+_registry = HealthRegistry("correlation")
+record_run_start = _registry.record_run_start
+record_success = _registry.record_success
+record_error = _registry.record_error
+get = _registry.get
 
 
 async def _log_activity(
@@ -146,7 +106,7 @@ def _case_key_for(item: dict) -> str:
         raw = f"content:{item['content_key']}"
     else:
         raw = f"item:{item['id']}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:20]
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 def _case_title(item: dict) -> str:

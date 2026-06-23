@@ -67,6 +67,17 @@ def test_significance_score_matches_rank_over_three():
     assert sig.significance_score("critical") == pytest.approx(1.0)
 
 
+def test_significance_score_false_positive_is_zero():
+    # false_positive sits below info/warn/critical on the ladder (see
+    # significance.py's module docstring) and must not fall through to the
+    # lenient unknown-value default (which would score it the same as info).
+    assert sig.significance_score("false_positive") == 0.0
+
+
+def test_significance_score_unknown_value_defaults_to_info():
+    assert sig.significance_score("not-a-real-level") == pytest.approx(1 / 3)
+
+
 # ── research/agent._reconcile_verdict ────────────────────────────────────────
 
 

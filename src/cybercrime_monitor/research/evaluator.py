@@ -17,14 +17,12 @@ clicked a single feedback button yet.
 
 Runs on its own APScheduler interval (scheduler.py's "_evaluator" job).
 """
-import asyncio
 import logging
-from dataclasses import dataclass
-from datetime import datetime, timezone
 
 from .. import db
 from .. import prompts
 from ..api.sse import broadcaster
+from ..health_registry import HealthRegistry
 from ..hermes.runner import run_agent
 from ..settings import settings
 
@@ -34,54 +32,15 @@ log = logging.getLogger(__name__)
 # ── Runtime health registry ───────────────────────────────────────────────────
 # Same shape as research/agent.py and research/heal.py's registries, but
 # unlike those it is NOT currently surfaced via /api/status — only via the
-# "evaluator" SSE status broadcast (_emit below). Add it to api_status if/when
-# it needs to show up in the unified status payload too.
+# "evaluator" SSE status broadcast. Add it to api_status if/when it needs to
+# show up in the unified status payload too. See health_registry.py for the
+# shared implementation.
 
-@dataclass
-class EvaluatorHealth:
-    last_run_at: str | None = None
-    last_success_at: str | None = None
-    last_processed_count: int = 0
-    last_error: str | None = None
-    last_error_at: str | None = None
-    consecutive_errors: int = 0
-
-
-_health = EvaluatorHealth()
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _emit(payload: dict) -> None:
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(broadcaster.broadcast_status("evaluator", payload))
-    except RuntimeError:
-        pass
-
-
-def record_run_start() -> None:
-    _health.last_run_at = _now_iso()
-
-
-def record_success(processed_count: int) -> None:
-    _health.last_success_at = _now_iso()
-    _health.last_processed_count = processed_count
-    _health.consecutive_errors = 0
-    _emit({"last_processed_count": processed_count})
-
-
-def record_error(error: str) -> None:
-    _health.last_error = error[:300]
-    _health.last_error_at = _now_iso()
-    _health.consecutive_errors += 1
-    _emit({"error": error[:300], "consecutive_errors": _health.consecutive_errors})
-
-
-def get() -> EvaluatorHealth:
-    return _health
+_registry = HealthRegistry("evaluator")
+record_run_start = _registry.record_run_start
+record_success = _registry.record_success
+record_error = _registry.record_error
+get = _registry.get
 
 
 async def _log_activity(

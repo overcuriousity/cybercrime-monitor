@@ -155,6 +155,26 @@ async def run_agent(
     return result
 
 
+async def run_dispatch_prompt(prompt: str) -> HermesResult:
+    """Thin wrapper for the "one prompt, one structured JSON result" dispatch
+    shape shared by research/agent.py, research/heal.py, research/discover.py
+    (its main per-source dispatch, not the selector-generation call), and
+    research/investigate.py — each builds its own prompt, then calls
+    run_agent with the same kwargs (settings.hermes_toolsets/
+    hermes_timeout_seconds/hermes_model, expect_json=True) and checks
+    `result.ok and result.data is not None`. Only that identical call+kwargs
+    shell is shared here — what each caller does on failure (write a failed
+    research run, create a heal proposal, requeue an investigation, etc.)
+    differs per module and stays at the call site."""
+    return await run_agent(
+        prompt,
+        toolsets=settings.hermes_toolsets,
+        timeout=settings.hermes_timeout_seconds,
+        model=settings.hermes_model or None,
+        expect_json=True,
+    )
+
+
 async def _run_agent_once(
     prompt: str,
     *,
@@ -193,7 +213,7 @@ async def _run_agent_once(
         text = stdout.decode("utf-8", errors="replace").strip()
 
         if proc.returncode != 0:
-            err = stderr.decode("utf-8", errors="replace").strip()[:500] or f"exit {proc.returncode}"
+            err = stderr.decode("utf-8", errors="replace").strip()[:300] or f"exit {proc.returncode}"
             log.warning("[hermes] failed (exit %s): %s", proc.returncode, err)
             return HermesResult(ok=False, text=text, data=None, error=err, duration_seconds=duration)
 

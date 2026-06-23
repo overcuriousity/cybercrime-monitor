@@ -12,14 +12,14 @@ run must never stall the rest of the pipeline.
 """
 import asyncio
 import logging
-from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from .. import db
 from .. import prompts
 from .. import significance as sig
 from ..api.sse import broadcaster
-from ..hermes.runner import run_agent
+from ..health_registry import HealthRegistry
+from ..hermes.runner import run_dispatch_prompt
 from ..settings import settings
 
 log = logging.getLogger(__name__)
@@ -28,52 +28,13 @@ log = logging.getLogger(__name__)
 # ── Runtime health registry ───────────────────────────────────────────────────
 # Surfaced via /api/status so the dashboard can show whether hermes-agent is
 # currently researching a case or if the research queue is backing up.
+# See health_registry.py for the shared implementation.
 
-@dataclass
-class ResearchHealth:
-    last_run_at: str | None = None
-    last_success_at: str | None = None
-    last_processed_count: int = 0
-    last_error: str | None = None
-    last_error_at: str | None = None
-    consecutive_errors: int = 0
-
-
-_health = ResearchHealth()
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _emit(payload: dict) -> None:
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(broadcaster.broadcast_status("research", payload))
-    except RuntimeError:
-        pass
-
-
-def record_run_start() -> None:
-    _health.last_run_at = _now_iso()
-
-
-def record_success(processed_count: int) -> None:
-    _health.last_success_at = _now_iso()
-    _health.last_processed_count = processed_count
-    _health.consecutive_errors = 0
-    _emit({"last_processed_count": processed_count})
-
-
-def record_error(error: str) -> None:
-    _health.last_error = error[:300]
-    _health.last_error_at = _now_iso()
-    _health.consecutive_errors += 1
-    _emit({"error": error[:300], "consecutive_errors": _health.consecutive_errors})
-
-
-def get() -> ResearchHealth:
-    return _health
+_registry = HealthRegistry("research")
+record_run_start = _registry.record_run_start
+record_success = _registry.record_success
+record_error = _registry.record_error
+get = _registry.get
 
 
 async def _log_activity(
@@ -209,13 +170,7 @@ async def _research_one(db_conn, case: dict) -> None:
     run_id = await db.start_research_run(db_conn, case_id=case["id"], model=settings.hermes_model or None)
 
     prompt = _build_prompt(case)
-    result = await run_agent(
-        prompt,
-        toolsets=settings.hermes_toolsets,
-        timeout=settings.hermes_timeout_seconds,
-        model=settings.hermes_model or None,
-        expect_json=True,
-    )
+    result = await run_dispatch_prompt(prompt)
 
     if not result.ok or result.data is None:
         await db.finish_research_run(
