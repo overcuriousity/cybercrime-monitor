@@ -2684,6 +2684,25 @@ async def source_recently_proposed(conn: aiosqlite.Connection, *, source_id: str
     return bool(rows)
 
 
+async def source_ever_heal_investigated(conn: aiosqlite.Connection, *, source_id: str) -> bool:
+    """Whether a heal (not prune) proposal has ever been created for this
+    source — i.e. research/heal.py's _heal_one has actually had a crack at
+    it at least once (_heal_one always logs a proposal before checking
+    whether a fix was found, win or lose). Used to gate the degraded-prune
+    branch (research/heal.py's _prune_pass) so a structurally-empty source
+    can only be auto-disabled after heal has genuinely tried — not just
+    because _SOURCES_PER_TICK throttles heal to one source per tick while
+    prune sweeps every source every tick."""
+    rows = await conn.execute_fetchall(
+        """
+        SELECT 1 FROM source_heal_proposals
+        WHERE source_id = :source_id AND action = 'heal' LIMIT 1
+        """,
+        {"source_id": source_id},
+    )
+    return bool(rows)
+
+
 async def create_heal_proposal(
     conn: aiosqlite.Connection, *, source_id: str, proposal: dict, notes: str | None, action: str = "heal"
 ) -> int:

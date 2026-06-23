@@ -297,17 +297,31 @@ Dimension 2 — media_kind — what KIND of content does this source produce?
   - "darknet_forum": first-hand posts from a darknet/cybercrime forum or \
 marketplace (the highest-value kind — direct actor chatter, not someone \
 else's writeup of it)
+  - "forum": first-hand posts from a CLEARNET hacking/leak forum (same idea \
+as darknet_forum, but not on Tor)
+  - "marketplace": a darknet or clearnet marketplace listing stolen goods, \
+access, or services for sale
+  - "leak_site": a ransomware/extortion group's leak/blog site naming and \
+shaming victims
+  - "paste": a paste/dump site (Pastebin, Ghostbin, rentry, and similar)
+  - "social": a social-platform account/channel (X/Twitter, Mastodon, \
+Telegram, Discord, and similar) used to post cybercrime-relevant content
+  - "breach_service": a structured breach-notification/lookup service \
+(e.g. HIBP-style) rather than editorial content
+  - "threat_feed": a government/vendor advisory feed, structured alert \
+feed, IOC/CVE feed, or similar low-editorial aggregation (e.g. CISA \
+advisories, abuse.ch, NVD)
   - "forensic": incident-response/forensic writeups, malware analysis, \
 breach post-mortems from security researchers or vendors
   - "press": mainstream news/journalism coverage
   - "blog": independent researcher or hobbyist blog, not a press outlet \
 and not a first-hand forensic writeup
-  - "feed": a government/vendor advisory feed, structured alert feed, or \
-similar low-editorial aggregation (e.g. CISA advisories, paste-site dumps)
 
 When you are done, respond with ONLY a single-line JSON object as your \
 final message, no markdown fencing, no commentary, exactly these keys:
-{{"region": "eu"|"us"|"ru_cn"|"other", "media_kind": "darknet_forum"|"forensic"|"press"|"blog"|"feed"}}
+{{"region": "eu"|"us"|"ru_cn"|"other", "media_kind": "darknet_forum"|"forum"|\
+"marketplace"|"leak_site"|"paste"|"social"|"breach_service"|"threat_feed"|\
+"forensic"|"press"|"blog"}}
 """
 
 
@@ -353,10 +367,13 @@ For each candidate, determine its "kind":
 Also classify each candidate's region (where its primary operator/\
 publisher is based or oriented: "eu", "us", "ru_cn" for Russia/China or \
 that sphere including Russian-language cybercrime forums, or "other") and \
-media_kind ("darknet_forum" for first-hand forum/marketplace data, \
-"forensic" for incident-response/malware-analysis writeups, "press" for \
-mainstream news, "blog" for independent researcher/hobbyist blogs, or \
-"feed" for government/vendor advisory or alert feeds).
+media_kind ("darknet_forum" for first-hand darknet forum/marketplace data, \
+"forum" for the clearnet equivalent, "marketplace" for a goods/access/\
+services-for-sale listing site, "leak_site" for a ransomware/extortion \
+group's victim-naming blog, "paste" for a paste/dump site, "forensic" for \
+incident-response/malware-analysis writeups, "press" for mainstream news, \
+"blog" for independent researcher/hobbyist blogs, or "threat_feed" for \
+government/vendor advisory or alert feeds).
 
 Find up to {batch_size} candidate(s) total, prioritized as above (darknet \
 first). Prefer sites with a track record of being first to report \
@@ -367,7 +384,8 @@ final message, no markdown fencing, no commentary, exactly these keys:
 {{"candidates": [{{"name": "<short site name>", "kind": "rss"|"tor_forum"|"html_forum", \
 "feed_url": <"<RSS/Atom feed URL>"|null>, "listing_url": <"<forum listing page URL>"|null>, \
 "region": "eu"|"us"|"ru_cn"|"other", \
-"media_kind": "darknet_forum"|"forensic"|"press"|"blog"|"feed", \
+"media_kind": "darknet_forum"|"forum"|"marketplace"|"leak_site"|"paste"|\
+"forensic"|"press"|"blog"|"threat_feed", \
 "reason": "<why this is a good fit>"}}, ...]}}
 Use an empty "candidates" array if you find nothing suitable.
 """

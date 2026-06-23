@@ -220,12 +220,14 @@ function renderSourceFilters(sources) {
   });
 }
 
-// Scraper types whose "fetched OK but parsed 0 items" almost always means a
-// CSS selector drifted from the live markup, not "nothing new happened" —
-// API/feed-based sources (mastodon, hibp, nitter, rss, ransomware_live) can
-// legitimately go many ticks without new items, so empty-streak degradation
-// only applies here.
-const _SCRAPER_TYPES = new Set(['html_forum', 'tor_forum']);
+// "access" (server-derived, sources/value.py's access_for) tells us
+// whether "fetched OK but parsed 0 items" almost always means a CSS
+// selector drifted from the live markup ("scrape"), vs. API/feed-based
+// sources which can legitimately go many ticks without new items — so
+// empty-streak degradation only applies to "scrape". This used to be a
+// hardcoded type list here; now the backend is the single source of truth
+// (it also drives the same threshold in the autonomous heal/prune loop —
+// see settings.source_empty_streak_threshold).
 // Repeated-empty threshold: a handful of genuinely-quiet ticks shouldn't
 // flip the dot, but a long unbroken streak on a scraper is the signal that
 // the page still returns 200 while the row/title/url selectors match nothing.
@@ -240,7 +242,7 @@ function sourceHealthStatus(src) {
   if (!src.last_run_at) return 'unknown';
   if (src.consecutive_errors >= 3) return 'dead';
   if (!src.last_success_at) return 'stale';
-  if (_SCRAPER_TYPES.has(src.type) && src.consecutive_empty >= _EMPTY_STREAK_THRESHOLD) return 'degraded';
+  if (src.access === 'scrape' && src.consecutive_empty >= _EMPTY_STREAK_THRESHOLD) return 'degraded';
   const staleAfterMs = Math.max(src.interval_seconds, 60) * 3 * 1000;
   const age = Date.now() - new Date(src.last_success_at).getTime();
   return age > staleAfterMs ? 'stale' : 'ok';

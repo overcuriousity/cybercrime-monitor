@@ -136,6 +136,12 @@ def _status_note(source: dict) -> str:
     h = health.get(source["id"])
     if h and h.consecutive_errors:
         return f"{h.consecutive_errors} consecutive errors, last: {h.last_error}"
+    if source_value.is_structurally_empty(source, h):
+        return (
+            f"fetching OK (HTTP 200) but parsed 0 items for {h.consecutive_empty} "
+            "consecutive ticks — selectors may have drifted from the live markup, "
+            "or the page is now behind a captcha/anti-bot wall"
+        )
     return "unknown"
 
 
@@ -165,6 +171,13 @@ async def _candidates(db_conn) -> list[dict]:
         if not broken:
             h = health.get(src["id"])
             broken = bool(h and h.consecutive_errors >= settings.hermes_heal_error_threshold)
+        if not broken:
+            # A scrape source can be "broken" without a single fetch error —
+            # 200 OK, 0 items parsed, repeatedly (selector drift/captcha).
+            # consecutive_errors never trips for this, so it needs its own
+            # check (see source_value.is_structurally_empty's docstring).
+            h = health.get(src["id"])
+            broken = source_value.is_structurally_empty(src, h)
         if not broken:
             continue
         if await db.source_recently_proposed(db_conn, source_id=src["id"], since_iso=cooldown_iso):
@@ -332,6 +345,12 @@ async def _probe_and_apply(
         return
 
     await db.record_applied_change(db_conn, proposal_id=proposal_id, before=before, after=after)
+    # Clear the consecutive-error/empty streaks now, in the same tick — the
+    # prune pass runs right after this one (run_heal_batch) and would
+    # otherwise still see the pre-fix streak (it only resets on the source's
+    # *next* successful fetch) and immediately undo the fix it was meant to
+    # give a chance to work. See health.reset_streaks' docstring.
+    health.reset_streaks(source["id"])
     log.info("[heal] source %s: auto-applied fix to sources.yaml", source["id"])
     await _log_activity(
         db_conn, subsystem="heal", action="source_fixed",
@@ -388,7 +407,15 @@ async def _prune_pass(db_conn, *, scheduler, sse_broadcaster) -> None:
         if value is None:
             continue
         min_history = _min_history(source_id)
-        if not source_value.should_prune(value=value, min_history=min_history):
+        degraded = source_value.is_structurally_empty(src, health.get(source_id))
+        if degraded and not await db.source_ever_heal_investigated(db_conn, source_id=source_id):
+            # Structurally empty, but heal hasn't had a crack at it yet —
+            # _SOURCES_PER_TICK throttles heal to one source per tick while
+            # this loop sweeps every source every tick, so without this gate
+            # a degraded source could be auto-disabled before heal ever sees
+            # it, breaking "heal first, rotate only if unsuccessful."
+            degraded = False
+        if not source_value.should_prune(value=value, min_history=min_history, degraded=degraded):
             continue
         await _disable_source(db_conn, src, value, scheduler=scheduler, sse_broadcaster=sse_broadcaster)
         disabled_this_pass.add(source_id)

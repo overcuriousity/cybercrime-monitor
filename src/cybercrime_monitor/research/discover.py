@@ -154,7 +154,10 @@ def _existing_domains(sources: list[dict]) -> set[str]:
 _TARGET_REGIONS = ("eu", "us", "ru_cn")
 # Ordered for the "thinnest first" pick below — darknet_forum listed first
 # so it wins ties (it's always wanted regardless of balance).
-_MEDIA_KINDS_BY_PRIORITY = ("darknet_forum", "forensic", "press", "blog", "feed")
+_MEDIA_KINDS_BY_PRIORITY = (
+    "darknet_forum", "forum", "marketplace", "leak_site", "paste",
+    "forensic", "press", "blog", "threat_feed",
+)
 
 
 def _underrepresented_summary(sources: list[dict]) -> str:

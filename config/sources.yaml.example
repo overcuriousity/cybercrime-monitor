@@ -9,11 +9,25 @@
 # field are left alone (no diversity opinion) until research/classify.py's
 # one-time backfill pass classifies them.
 #   region: eu | us | ru_cn | other
-#   media_kind: darknet_forum (highest value — first-hand forum/marketplace
-#                data) | forensic (incident-response/malware-analysis
-#                writeups) | press (mainstream news) | blog (independent
-#                researcher/hobbyist) | feed (government/vendor advisory or
-#                alert feeds)
+#   media_kind: darknet_forum (highest value — first-hand darknet forum/
+#                marketplace data) | forum (clearnet equivalent) |
+#                marketplace (goods/access/services for sale) | leak_site
+#                (ransomware/extortion victim-naming blog) | paste
+#                (paste/dump site) | social (a social-platform account/
+#                channel) | breach_service (structured breach-notification/
+#                lookup service) | threat_feed (government/vendor advisory
+#                or alert feed) | forensic (incident-response/malware-
+#                analysis writeups) | press (mainstream news) | blog
+#                (independent researcher/hobbyist)
+#
+# Optional per-source field `access` overrides sources/value.py's
+# ACCESS_BY_TYPE default for that source's `type` — the fetch-strategy axis
+# (feed | scrape | api) that drives degraded/empty-streak detection (only
+# "scrape" sources are empty-ambiguous: a 200 response with 0 items parsed
+# means selector drift or a captcha wall, not "nothing new"). Needed when a
+# type's collector can take more than one fetch strategy depending on
+# config — e.g. "paste" defaults to "scrape" (Pastebin's CSS-selector
+# branch) but rentry_recent below is JSON-API, hence its explicit override.
 
 nitter_instances:
   - "https://nitter.net"
@@ -210,6 +224,7 @@ sources:
   - id: rentry_recent
     name: "Rentry Recent"
     type: paste
+    access: api  # JSON API branch of PasteCollector, not the CSS-scrape branch — see sources/value.py's ACCESS_BY_TYPE
     url: "https://rentry.co/api/pages"
     interval_seconds: 600
     jitter: 90
@@ -245,7 +260,7 @@ sources:
     enabled: true
     source_tags: [advisory, government]
     region: us
-    media_kind: feed
+    media_kind: threat_feed
 
   - id: rss_bleepingcomputer
     name: "BleepingComputer"

@@ -304,6 +304,10 @@ async def api_sources(request: Request, db=Depends(get_db)):
                 "id": s["id"],
                 "name": s.get("name", s["id"]),
                 "type": s.get("type", ""),
+                # Fetch-strategy axis (sources/value.py's access_for) — drives
+                # the dashboard's "degraded" detection generically instead of
+                # a hardcoded type list (see app.js's old _SCRAPER_TYPES).
+                "access": source_value.access_for(s),
                 "enabled": s.get("enabled", True),
                 "interval_seconds": s.get("interval_seconds", 600),
                 "last_run_at": h.last_run_at if h else None,

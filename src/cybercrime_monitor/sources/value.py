@@ -61,7 +61,67 @@ _WINDOW_DAYS = 30
 # read them. None means "unclassified"; "other" is a valid catch-all region
 # bucket (not eu/us/ru_cn), distinct from being unclassified.
 VALID_REGIONS = {"eu", "us", "ru_cn", "other"}
-VALID_MEDIA_KINDS = {"darknet_forum", "forensic", "press", "blog", "feed"}
+VALID_MEDIA_KINDS = {
+    "darknet_forum", "forum", "paste", "leak_site", "marketplace", "social",
+    "blog", "press", "threat_feed", "breach_service", "forensic",
+}
+# Pre-widening sources.yaml/DB rows may still carry the old "feed" value —
+# resolve it to its closest new-taxonomy equivalent everywhere a media_kind
+# is read, instead of a one-time migration that would need to touch every
+# existing config/DB row.
+_MEDIA_KIND_ALIASES = {"feed": "threat_feed"}
+
+
+def _resolve_media_kind(media_kind: str | None) -> str | None:
+    return _MEDIA_KIND_ALIASES.get(media_kind, media_kind)
+
+
+# ── Access axis ──────────────────────────────────────────────────────────────
+# `type` (sources.yaml) picks the collector *implementation*; `access` is the
+# orthogonal fetch-strategy axis that actually determines failure behavior:
+#   - "scrape": parses HTML via CSS selectors (selectolax) — brittle to
+#     markup/selector drift and captcha/anti-bot walls, which show up as a
+#     200 response with 0 items parsed, not as a fetch error.
+#   - "feed": parses a structured feed (RSS/Atom via feedparser) — breakage
+#     surfaces as a fetch error (bad XML, HTTP failure), not a silent empty.
+#   - "api": calls a structured JSON API — same failure shape as "feed".
+# Only "scrape" is empty-ambiguous, so only "scrape" sources are eligible for
+# the degraded/structurally-empty signal below (see is_structurally_empty).
+VALID_ACCESS = {"feed", "scrape", "api"}
+ACCESS_BY_TYPE = {
+    "html_forum": "scrape",
+    "tor_forum": "scrape",
+    "paste": "scrape",  # pastebin branch scrapes CSS; rentry branch is JSON —
+    # override per-source with an explicit "access: api" config field (see
+    # config/sources.yaml's rentry_recent) where the JSON branch is known.
+    "nitter": "feed",  # Nitter's own /rss endpoint, parsed via feedparser
+    "rss": "feed",
+    "mastodon": "api",
+    "hibp": "api",
+    "ransomware_live": "api",
+}
+
+
+def access_for(source: dict) -> str:
+    """A source's fetch-strategy axis — an explicit `access` config field
+    wins (lets a per-source override correct ACCESS_BY_TYPE's per-type
+    default, e.g. a JSON-API paste source), falling back to the type's
+    default. Unknown/missing type defaults to "feed" — the conservative
+    choice, since it never triggers degraded-on-empty."""
+    return source.get("access") or ACCESS_BY_TYPE.get(source.get("type"), "feed")
+
+
+def is_structurally_empty(source: dict, h) -> bool:
+    """A scrape-access source returning successful (200) responses but
+    parsing 0 items for a sustained streak — selector drift or a captcha/
+    anti-bot wall, the failure mode that looks identical to "nothing new"
+    unless tracked separately (see health.py's consecutive_empty). feed/api
+    sources are never "structurally empty" — an empty feed/API response is
+    legitimately "no new items", and real breakage there surfaces as a fetch
+    error (consecutive_errors) instead."""
+    if access_for(source) != "scrape":
+        return False
+    return bool(h and h.consecutive_empty >= settings.source_empty_streak_threshold)
 
 
 def _now() -> datetime:
@@ -92,19 +152,26 @@ def _component_case_contribution(stats: dict | None, *, max_cases_touched: int) 
     return max(0.0, min(1.0, (breadth + confirmed_rate + significant_rate) / 3.0))
 
 
-def _component_health(source_id: str) -> tuple[float | None, bool]:
+def _component_health(src: dict) -> tuple[float | None, bool]:
     """Returns (score, ever_succeeded). ever_succeeded=False + a run attempt
     on record is the objective "structurally broken" signal classify() uses
     to call a source dead outright, independent of the relative scoring."""
-    h = health.get(source_id)
+    h = health.get(src["id"])
     if h is None or h.last_run_at is None:
         return None, True  # never run yet — no opinion, not "dead"
     ever_succeeded = h.last_success_at is not None
     if not ever_succeeded:
         return 0.0, False
     # Decays toward 0 as consecutive_errors climbs; a single transient error
-    # barely moves it, a long unbroken failure streak does.
-    score = 1.0 / (1.0 + h.consecutive_errors)
+    # barely moves it, a long unbroken failure streak does. A scrape source
+    # stuck on a sustained empty streak (is_structurally_empty — 200s but 0
+    # items parsed, e.g. selector drift or a captcha wall) decays the same
+    # way: that failure mode never increments consecutive_errors on its own,
+    # so without this it would otherwise score a perfect 1.0 forever.
+    penalty = h.consecutive_errors
+    if is_structurally_empty(src, h):
+        penalty += h.consecutive_empty - settings.source_empty_streak_threshold + 1
+    score = 1.0 / (1.0 + penalty)
     return score, True
 
 
@@ -137,7 +204,7 @@ def _component_media_prior(src: dict) -> float | None:
     """Quality prior by media_kind — first-hand darknet-forum data is the
     most valuable signal this system can find. None (no opinion) for
     sources not yet classified by research/classify.py."""
-    media_kind = src.get("media_kind")
+    media_kind = _resolve_media_kind(src.get("media_kind"))
     if media_kind not in VALID_MEDIA_KINDS:
         return None
     return settings.media_kind_prior.get(media_kind, 0.6)
@@ -159,7 +226,7 @@ def bucket_counts(sources: list[dict]) -> dict:
         r = src.get("region")
         if r in VALID_REGIONS:
             region[r] = region.get(r, 0) + 1
-        m = src.get("media_kind")
+        m = _resolve_media_kind(src.get("media_kind"))
         if m in VALID_MEDIA_KINDS:
             media_kind[m] = media_kind.get(m, 0) + 1
     return {
@@ -184,7 +251,7 @@ def _component_diversity(src: dict, buckets: dict) -> float | None:
     if region in VALID_REGIONS and buckets.get("region_total"):
         share = buckets["region"].get(region, 0) / buckets["region_total"]
         shares.append(max(0.0, min(1.0, 1.0 - share)))
-    media_kind = src.get("media_kind")
+    media_kind = _resolve_media_kind(src.get("media_kind"))
     if media_kind in VALID_MEDIA_KINDS and buckets.get("media_kind_total"):
         share = buckets["media_kind"].get(media_kind, 0) / buckets["media_kind_total"]
         shares.append(max(0.0, min(1.0, 1.0 - share)))
@@ -254,7 +321,7 @@ async def compute_all(conn) -> dict[str, dict]:
     raw: dict[str, dict] = {}
     for src in sources:
         sid = src["id"]
-        health_score, ever_succeeded = _component_health(sid)
+        health_score, ever_succeeded = _component_health(src)
         components = {
             "yield": _component_yield(yield_stats.get(sid)),
             "case_contribution": _component_case_contribution(
@@ -334,23 +401,39 @@ def should_apply_heal(*, value: dict | None, probe_ok: bool) -> bool:
     return True
 
 
-def should_prune(*, value: dict | None, min_history: bool) -> bool:
+def should_prune(*, value: dict | None, min_history: bool, degraded: bool = False) -> bool:
     """Purpose-driven prune guardrail: a source is pruned when it's "dead"
-    (never produced a successful fetch), or "marginal" with corroborating
-    zero-value evidence (no case contribution at all AND net-negative
-    feedback). A "marginal" source with some case contribution, or with no
-    feedback opinion either way, is left alone — marginal isn't a verdict on
-    its own, only dead-with-evidence is. `min_history` (the source has had a
-    real run history for at least the value-scoring window) gates BOTH
-    branches — a brand-new source that hasn't had a chance to prove itself
-    yet is never pruned just for having no data."""
+    (never produced a successful fetch), "degraded" (is_structurally_empty —
+    a scrape source 200ing but parsing 0 items for a sustained streak) with
+    zero case contribution, or "marginal" with corroborating zero-value
+    evidence (no case contribution at all AND net-negative feedback).
+
+    The degraded branch deliberately does NOT require negative feedback the
+    way the marginal branch does: a source nobody has ever reviewed has no
+    feedback either way, so gating on it would let an objectively broken
+    scraper (parsing nothing, contributing nothing) sit forever just because
+    no analyst happened to flag it. Health-component decay alone
+    (_component_health) isn't enough either — a source can still rank
+    "valuable" on other components (e.g. stale case_contribution from before
+    it broke) while parsing nothing today. Caller (research/heal.py) only
+    passes degraded=True after heal has already had a chance to fix it.
+
+    A "marginal" source with some case contribution, or with no feedback
+    opinion either way and not structurally empty, is left alone — marginal
+    isn't a verdict on its own, only dead/degraded/marginal-with-evidence is.
+    `min_history` (the source has had a real run history for at least the
+    value-scoring window) gates every branch — a brand-new source that
+    hasn't had a chance to prove itself yet is never pruned just for having
+    no data."""
     if value is None or not min_history:
         return False
     if value["classification"] == "dead":
         return True
+    components = value.get("components", {})
+    no_contribution = components.get("case_contribution") in (None, 0.0)
+    if degraded and no_contribution:
+        return True
     if value["classification"] == "marginal":
-        components = value.get("components", {})
-        no_contribution = components.get("case_contribution") in (None, 0.0)
         feedback_score = components.get("feedback")
         negative_feedback = feedback_score is not None and feedback_score < 0.5
         return no_contribution and negative_feedback
