@@ -112,7 +112,8 @@ async def _read_hermes_sessions(state_db, *, since_epoch: float) -> list[aiosqli
             SELECT id, started_at, model, input_tokens, output_tokens,
                    cache_read_tokens, cache_write_tokens, estimated_cost_usd, actual_cost_usd
             FROM sessions
-            WHERE source = 'cli' AND started_at >= :since AND input_tokens > 0
+            WHERE source = 'cli' AND started_at >= :since
+                  AND (input_tokens > 0 OR output_tokens > 0)
             ORDER BY started_at
             """,
             {"since": since_epoch},

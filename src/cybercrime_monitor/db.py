@@ -1526,35 +1526,26 @@ async def max_ingested_hermes_started_at(conn: aiosqlite.Connection) -> str | No
 
 async def burn_rate(conn: aiosqlite.Connection, *, window_seconds: int) -> dict:
     """Real (measured) token burn rate over the trailing window — tokens/hour
-    plus a source/model breakdown. Powers GET /api/tokens and the Activity
-    tab's burn-rate widget."""
+    plus total input/output counts. Powers GET /api/tokens and the Activity
+    tab's burn-rate widget. No source/model breakdown: the UI dropped that
+    panel (hermes' fallback chain makes per-model attribution misleading) and
+    there's no other consumer, so it isn't computed here either."""
     since = (_utcnow() - timedelta(seconds=window_seconds)).isoformat()
     rows = await conn.execute_fetchall(
         """
-        SELECT source, model,
-               SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens,
-               SUM(COALESCE(cost_usd, 0)) AS cost_usd
+        SELECT SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens,
+               SUM(COALESCE(cost_usd, 0)) AS cost_usd,
+               SUM(CASE WHEN cost_usd IS NOT NULL THEN 1 ELSE 0 END) AS n_cost
         FROM token_usage
         WHERE ts >= :since
-        GROUP BY source, model
         """,
         {"since": since},
     )
-    total_input = total_output = 0
-    total_cost = 0.0
-    have_cost = False
-    by_source: dict[str, int] = {}
-    by_model: dict[str, int] = {}
-    for r in rows:
-        tokens = (r["input_tokens"] or 0) + (r["output_tokens"] or 0)
-        total_input += r["input_tokens"] or 0
-        total_output += r["output_tokens"] or 0
-        if r["cost_usd"]:
-            total_cost += r["cost_usd"]
-            have_cost = True
-        by_source[r["source"]] = by_source.get(r["source"], 0) + tokens
-        model_key = r["model"] or "unknown"
-        by_model[model_key] = by_model.get(model_key, 0) + tokens
+    r = rows[0] if rows else None
+    total_input = (r["input_tokens"] or 0) if r else 0
+    total_output = (r["output_tokens"] or 0) if r else 0
+    total_cost = (r["cost_usd"] or 0.0) if r else 0.0
+    have_cost = bool(r and r["n_cost"])
 
     total_tokens = total_input + total_output
     hours = window_seconds / 3600.0
@@ -1563,8 +1554,6 @@ async def burn_rate(conn: aiosqlite.Connection, *, window_seconds: int) -> dict:
         "tokens_per_hour": round(total_tokens / hours, 1) if hours > 0 else 0,
         "input_tokens": total_input,
         "output_tokens": total_output,
-        "by_source": by_source,
-        "by_model": by_model,
         "cost_usd_per_hour": round(total_cost / hours, 4) if have_cost and hours > 0 else None,
     }
 
