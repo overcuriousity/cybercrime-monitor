@@ -24,6 +24,7 @@ from ..db import (
     get_account_by_hash,
     get_bookmarked_case_ids,
     remove_bookmark,
+    set_account_theme,
     touch_account_last_seen,
     count_cases,
     count_cases_needing_research,
@@ -150,15 +151,15 @@ async def resolve_identity(
     and where it's merely optional context (e.g. /api/cases' bookmarked
     filter, /api/status' auth.role)."""
     if not x_admin_token:
-        return {"role": "none", "account_id": None}
+        return {"role": "none", "account_id": None, "theme": None}
     if _is_valid_admin_token(x_admin_token):
         account = await ensure_admin_account(db, _hash_token(x_admin_token))
-        return {"role": "admin", "account_id": account["id"]}
+        return {"role": "admin", "account_id": account["id"], "theme": account.get("theme")}
     account = await get_account_by_hash(db, _hash_token(x_admin_token))
     if account is None:
-        return {"role": "none", "account_id": None}
+        return {"role": "none", "account_id": None, "theme": None}
     await touch_account_last_seen(db, account["id"])
-    return {"role": "user", "account_id": account["id"]}
+    return {"role": "user", "account_id": account["id"], "theme": account.get("theme")}
 
 
 async def require_user(identity: dict = Depends(resolve_identity)) -> dict:
@@ -244,6 +245,18 @@ async def api_case_bookmark_add(case_id: int, db=Depends(get_db), identity: dict
 @router.delete("/api/cases/{case_id}/bookmark")
 async def api_case_bookmark_remove(case_id: int, db=Depends(get_db), identity: dict = Depends(require_user)):
     await remove_bookmark(db, account_id=identity["account_id"], case_id=case_id)
+    return {"status": "ok"}
+
+
+class ThemeUpdate(BaseModel):
+    theme: str
+
+
+@router.put("/api/account/theme")
+async def api_account_theme(body: ThemeUpdate, db=Depends(get_db), identity: dict = Depends(require_user)):
+    if body.theme not in ("light", "dark"):
+        raise HTTPException(status_code=400, detail="theme must be 'light' or 'dark'")
+    await set_account_theme(db, account_id=identity["account_id"], theme=body.theme)
     return {"status": "ok"}
 
 
@@ -616,7 +629,7 @@ async def api_status(request: Request, db=Depends(get_db), identity: dict = Depe
         # Unlike "admin.enabled" (only reports whether a token is
         # *configured*), this reflects whether the caller's own token is
         # actually valid — see resolve_identity.
-        "auth": {"role": identity["role"]},
+        "auth": {"role": identity["role"], "theme": identity.get("theme")},
         "scheduler": {"running": scheduler_running, "jobs": jobs},
         "sources": {
             "total": len(enabled_sources),

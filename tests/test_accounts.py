@@ -150,23 +150,25 @@ async def test_resolve_identity_roles(db_conn, monkeypatch):
     monkeypatch.setattr(app_settings, "admin_token", ADMIN_TOKEN)
 
     none_identity = await routes_module.resolve_identity(x_admin_token=None, db=db_conn)
-    assert none_identity == {"role": "none", "account_id": None}
+    assert none_identity == {"role": "none", "account_id": None, "theme": None}
 
     admin_identity = await routes_module.resolve_identity(x_admin_token=ADMIN_TOKEN, db=db_conn)
     assert admin_identity["role"] == "admin"
     assert admin_identity["account_id"] is not None
+    assert admin_identity["theme"] is None
 
     # The admin account is lazily provisioned and stable across calls.
     admin_identity_2 = await routes_module.resolve_identity(x_admin_token=ADMIN_TOKEN, db=db_conn)
     assert admin_identity_2["account_id"] == admin_identity["account_id"]
 
     bogus_identity = await routes_module.resolve_identity(x_admin_token="garbage", db=db_conn)
-    assert bogus_identity == {"role": "none", "account_id": None}
+    assert bogus_identity == {"role": "none", "account_id": None, "theme": None}
 
     key_hash = hashlib.sha256(b"some-user-key").hexdigest()
     await db_module.create_account(db_conn, token_hash=key_hash)
     user_identity = await routes_module.resolve_identity(x_admin_token="some-user-key", db=db_conn)
     assert user_identity["role"] == "user"
+    assert user_identity["theme"] is None
 
 
 @pytest.mark.asyncio
@@ -325,3 +327,55 @@ def test_status_reports_auth_role(client, monkeypatch):
 
         resp = client.get("/api/status", headers={"X-Admin-Token": "wrong"})
         assert resp.json()["auth"]["role"] == "none"
+
+
+# ── routes.py: theme endpoint ───────────────────────────────────────────────
+
+
+def test_theme_requires_auth(client, monkeypatch):
+    monkeypatch.setattr(app_settings, "admin_token", ADMIN_TOKEN)
+    with client:
+        resp = client.put("/api/account/theme", json={"theme": "light"})
+        assert resp.status_code == 403
+
+        resp = client.put(
+            "/api/account/theme",
+            json={"theme": "light"},
+            headers={"X-Admin-Token": "wrong"},
+        )
+        assert resp.status_code == 403
+
+
+def test_theme_validation_and_round_trip(client, monkeypatch):
+    monkeypatch.setattr(app_settings, "admin_token", ADMIN_TOKEN)
+    with client:
+        # Invalid theme value
+        resp = client.put(
+            "/api/account/theme",
+            json={"theme": "purple"},
+            headers={"X-Admin-Token": ADMIN_TOKEN},
+        )
+        assert resp.status_code == 400
+
+        # Set light
+        resp = client.put(
+            "/api/account/theme",
+            json={"theme": "light"},
+            headers={"X-Admin-Token": ADMIN_TOKEN},
+        )
+        assert resp.status_code == 200
+
+        # Round-trip via /api/status
+        resp = client.get("/api/status", headers={"X-Admin-Token": ADMIN_TOKEN})
+        assert resp.json()["auth"]["theme"] == "light"
+
+        # Set dark
+        resp = client.put(
+            "/api/account/theme",
+            json={"theme": "dark"},
+            headers={"X-Admin-Token": ADMIN_TOKEN},
+        )
+        assert resp.status_code == 200
+
+        resp = client.get("/api/status", headers={"X-Admin-Token": ADMIN_TOKEN})
+        assert resp.json()["auth"]["theme"] == "dark"

@@ -42,7 +42,6 @@ const feedList       = document.getElementById('feed-list');
 const feedEmpty      = document.getElementById('feed-empty');
 const loadMoreBtn    = document.getElementById('load-more');
 const newBanner      = document.getElementById('new-items-banner');
-const totalCount     = document.getElementById('total-count');
 const sseStatus      = document.getElementById('sse-status');
 const sourceFilters  = document.getElementById('source-filters');
 const sourceLegend   = document.getElementById('source-legend');
@@ -67,6 +66,78 @@ const clusterSizeInput = document.getElementById('cluster-size-input');
 const adminTokenInput = document.getElementById('admin-token');
 const adminTokenStatus = document.getElementById('admin-token-status');
 
+// ── Theme ──────────────────────────────────────────────────────────────────
+const THEME_KEY = 'mm_theme';
+const themeToggle = document.getElementById('theme-toggle');
+
+function getEffectiveTheme() {
+  return document.documentElement.dataset.theme || 'dark';
+}
+
+function applyTheme(theme) {
+  document.documentElement.dataset.theme = theme;
+  localStorage.setItem(THEME_KEY, theme);
+  themeToggle.textContent = theme === 'light' ? '☀️' : '🌙';
+  refreshChartTheme();
+}
+
+function refreshChartTheme() {
+  const style = getComputedStyle(document.documentElement);
+  const textMuted = style.getPropertyValue('--text-muted').trim() || '#71717a';
+  const border = style.getPropertyValue('--border').trim() || '#27272a';
+  Chart.defaults.color = textMuted;
+  Chart.defaults.borderColor = border;
+  Object.values(Chart.instances).forEach(c => c.update());
+}
+
+function initTheme() {
+  const stored = localStorage.getItem(THEME_KEY);
+  const theme = stored || 'light';
+  applyTheme(theme);
+
+  themeToggle.addEventListener('click', async () => {
+    const next = getEffectiveTheme() === 'light' ? 'dark' : 'light';
+    applyTheme(next);
+    if (currentRole !== 'none') {
+      try {
+        await fetch('/api/account/theme', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', ...adminHeaders() },
+          body: JSON.stringify({ theme: next }),
+        });
+      } catch (e) {
+        console.error('Failed to persist theme', e);
+      }
+    }
+  });
+}
+
+// ── Drawers ────────────────────────────────────────────────────────────────
+const feedDrawerToggle = document.getElementById('feed-drawer-toggle');
+const caseDrawerToggle = document.getElementById('case-drawer-toggle');
+const drawerBackdrop = document.getElementById('drawer-backdrop');
+
+function initDrawers() {
+  feedDrawerToggle.addEventListener('click', () => {
+    document.querySelector('.sidebar').classList.toggle('open');
+    drawerBackdrop.classList.remove('hidden');
+  });
+  caseDrawerToggle.addEventListener('click', () => {
+    document.querySelector('.case-rail').classList.toggle('open');
+    drawerBackdrop.classList.remove('hidden');
+  });
+  drawerBackdrop.addEventListener('click', closeDrawers);
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeDrawers();
+  });
+}
+
+function closeDrawers() {
+  document.querySelector('.sidebar').classList.remove('open');
+  document.querySelector('.case-rail').classList.remove('open');
+  drawerBackdrop.classList.add('hidden');
+}
+
 // ── Init ───────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
   initTabs();
@@ -89,6 +160,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   initActivity();
   initLandscape();
   initInvestigate();
+  initTheme();
+  initDrawers();
 
   searchInput.addEventListener('input', debounce(() => {
     state.filters.search = searchInput.value.trim();
@@ -433,7 +506,6 @@ async function applyFilters() {
   state.items = data.items || [];
   state.offset = state.items.length;
   state.hasMore = state.items.length < data.total;
-  totalCount.textContent = `${data.total.toLocaleString()} items`;
 
   renderItems(state.items, false);
   feedEmpty.classList.toggle('hidden', state.items.length > 0);
@@ -780,7 +852,6 @@ function handleLiveItem(item) {
     feedList.prepend(card);
     state.items.unshift(item);
     if (state.items.length > MAX_FEED_ITEMS) state.items.length = MAX_FEED_ITEMS;
-    totalCount.textContent = `${(state.items.length).toLocaleString()} items`;
   } else {
     state.pendingLive.push(item);
     newBanner.classList.remove('hidden');
@@ -1111,8 +1182,7 @@ const CHART_PALETTE = [
 ];
 
 function initDashboard() {
-  Chart.defaults.color = '#71717a';
-  Chart.defaults.borderColor = '#27272a';
+  refreshChartTheme();
   Chart.defaults.font.size = 11;
 }
 
@@ -2135,6 +2205,7 @@ async function selectCase(id) {
   document.querySelectorAll('[data-case-id]').forEach(el => {
     el.classList.toggle('selected', Number(el.dataset.caseId) === id);
   });
+  closeDrawers();
   try {
     const { case: c, items, research_runs, related_cases } = await api(`/api/cases/${id}`, { headers: adminHeaders() });
     renderCaseDetail(c, items, research_runs || [], related_cases || []);
@@ -2525,6 +2596,12 @@ function renderQueuesPanel(s) {
   semanticSearchEnabled = !!(s.semantic_search && s.semantic_search.enabled);
   setSearchModeToggleEnabled(searchModeToggle, semanticSearchEnabled);
   setSearchModeToggleEnabled(caseSearchModeToggle, semanticSearchEnabled);
+
+  // Adopt server-stored theme if no local override exists
+  const storedTheme = localStorage.getItem(THEME_KEY);
+  if (!storedTheme && s.auth && s.auth.theme) {
+    applyTheme(s.auth.theme);
+  }
 
   renderQueuesChart(s);
   renderQueuesSummary(s);
