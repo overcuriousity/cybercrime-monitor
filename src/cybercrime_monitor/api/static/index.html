@@ -368,23 +368,21 @@
         <h3>Token burn rate (5m buckets, last hour)</h3>
         <div class="chart-canvas"><canvas id="chart-token-burn"></canvas></div>
       </div>
-      <div class="chart-card" id="burn-breakdown-card">
-        <h3>By source / model (1h)</h3>
-        <div id="burn-breakdown-list"></div>
-      </div>
     </section>
 
     <!-- Live subsystem queue depths — formerly the global status bar, moved
-         here so all operational state lives in one place. -->
-    <section class="status-bar" id="queues-panel" title="Subsystem queues — refreshes every 10s">
-      <span class="status-pill" id="status-scheduler">scheduler: —</span>
-      <span class="status-pill" id="status-sources">sources: —</span>
-      <span class="status-pill" id="status-classifier">classifier: —</span>
-      <span class="status-pill" id="status-correlation">correlator: —</span>
-      <span class="status-pill" id="status-research">research: —</span>
-      <span class="status-pill" id="status-heal">heal: —</span>
-      <span class="status-pill" id="status-investigate">investigate: —</span>
-      <span class="status-pill" id="status-kev">KEV: —</span>
+         here so all operational state lives in one place. A bar chart so
+         magnitude (e.g. "how big is the research backlog") is visible at a
+         glance, not just a pass/fail pill. -->
+    <section class="chart-row" id="queues-panel" title="Subsystem queues — refreshes every 10s">
+      <div class="chart-card chart-card-wide">
+        <h3>Subsystem queues</h3>
+        <div class="chart-canvas chart-canvas-tall"><canvas id="chart-queues"></canvas></div>
+      </div>
+      <div class="chart-card" id="queues-summary-card">
+        <h3>Status</h3>
+        <div id="queues-summary-list"></div>
+      </div>
     </section>
 
     <div class="case-toolbar">

@@ -2323,7 +2323,6 @@ async function updateQueuesPanel() {
     renderQueuesPanel(s);
   } catch (e) {
     console.error('Failed to load status', e);
-    setStatusPill('status-scheduler', 'status: unreachable', 'error');
   }
 }
 
@@ -2335,52 +2334,75 @@ function renderQueuesPanel(s) {
   setSearchModeToggleEnabled(searchModeToggle, semanticSearchEnabled);
   setSearchModeToggleEnabled(caseSearchModeToggle, semanticSearchEnabled);
 
-  const sched = s.scheduler || {};
-  setStatusPill('status-scheduler', sched.running ? 'scheduler: running' : 'scheduler: stopped', sched.running ? 'ok' : 'error');
-
-  const src = s.sources || {};
-  const srcText = `sources: ${src.total - src.failing_count}/${src.total} healthy`;
-  setStatusPill('status-sources', srcText, src.failing_count > 0 ? 'warn' : 'ok');
-
-  const cls = s.classifier || {};
-  const clsText = cls.backend === 'none'
-    ? 'classifier: disabled'
-    : cls.using_fallback
-      ? `classifier: ${cls.backlog || 0} backlog (hermes fallback)`
-      : `classifier: ${cls.backlog || 0} backlog`;
-  const clsState = cls.consecutive_errors >= 3 ? 'error' : (cls.using_fallback ? 'warn' : (cls.backlog > 50 ? 'warn' : 'ok'));
-  setStatusPill('status-classifier', clsText, clsState);
-
-  const corr = s.correlation || {};
-  const corrText = `correlator: ${corr.backlog || 0} backlog`;
-  const corrState = corr.consecutive_errors >= 3 ? 'error' : (corr.backlog > 50 ? 'warn' : 'ok');
-  setStatusPill('status-correlation', corrText, corrState);
-
-  const res = s.research || {};
-  const resText = res.running > 0
-    ? `research: running (${res.running})`
-    : `research: ${res.queued || 0} queued`;
-  setStatusPill('status-research', resText, res.consecutive_errors >= 3 ? 'error' : (res.running > 0 ? 'active' : 'ok'));
-
-  const heal = s.heal || {};
-  const pending = (heal.proposals || {}).pending || 0;
-  const healText = `heal: ${pending} pending`;
-  setStatusPill('status-heal', healText, heal.consecutive_errors >= 3 ? 'error' : (pending > 0 ? 'active' : 'ok'));
-
-  const inv = s.investigate || {};
-  const invText = `investigate: ${inv.queued || 0} queued`;
-  setStatusPill('status-investigate', invText, inv.consecutive_errors >= 3 ? 'error' : (inv.queued > 0 ? 'active' : 'ok'));
-
-  const kev = s.kev || {};
-  const kevText = `KEV: ${(kev.count || 0).toLocaleString()}`;
-  setStatusPill('status-kev', kevText, 'ok');
+  renderQueuesChart(s);
+  renderQueuesSummary(s);
 }
 
-function setStatusPill(id, text, state) {
-  const el = document.getElementById(id);
-  if (!el) return;
-  el.textContent = text;
-  el.className = 'status-pill status-' + state;
+// Magnitude (not just ok/warn/error) is the point here — a pill saying
+// "research: active" doesn't say whether that's 2 cases or 200, which was
+// the whole complaint about the old status-pill row. A bar per queue
+// depth makes that visible at a glance.
+function renderQueuesChart(s) {
+  const cls = s.classifier || {};
+  const corr = s.correlation || {};
+  const res = s.research || {};
+  const heal = s.heal || {};
+  const inv = s.investigate || {};
+
+  const labels = ['Classifier backlog', 'Correlator backlog', 'Research running', 'Research queued', 'Investigate queued', 'Heal pending'];
+  const data = [
+    cls.backlog || 0,
+    corr.backlog || 0,
+    res.running || 0,
+    res.queued || 0,
+    inv.queued || 0,
+    (heal.proposals || {}).pending || 0,
+  ];
+  const errorFlags = [
+    cls.consecutive_errors >= 3, corr.consecutive_errors >= 3,
+    res.consecutive_errors >= 3, res.consecutive_errors >= 3,
+    inv.consecutive_errors >= 3, heal.consecutive_errors >= 3,
+  ];
+  const colors = errorFlags.map(err => err ? PRIO_COLORS.critical : PRIO_COLORS.warn);
+
+  upsertChart('chart-queues', {
+    type: 'bar',
+    data: { labels, datasets: [{ label: 'queue depth', data, backgroundColor: colors }] },
+    options: {
+      indexAxis: 'y',
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { x: { beginAtZero: true, ticks: { precision: 0 } } },
+    },
+  });
+}
+
+function renderQueuesSummary(s) {
+  const list = document.getElementById('queues-summary-list');
+  list.innerHTML = '';
+
+  const sched = s.scheduler || {};
+  const src = s.sources || {};
+  const cls = s.classifier || {};
+  const kev = s.kev || {};
+
+  const lines = [
+    [sched.running ? 'scheduler: running' : 'scheduler: stopped', sched.running ? 'ok' : 'error'],
+    [`sources: ${src.total - src.failing_count}/${src.total} healthy`, src.failing_count > 0 ? 'warn' : 'ok'],
+    [
+      cls.backend === 'none' ? 'classifier: disabled' : cls.using_fallback ? 'classifier: hermes fallback' : 'classifier: primary backend',
+      cls.consecutive_errors >= 3 ? 'error' : (cls.using_fallback ? 'warn' : 'ok'),
+    ],
+    [`KEV catalog: ${(kev.count || 0).toLocaleString()}`, 'ok'],
+  ];
+
+  lines.forEach(([text, state]) => {
+    const row = document.createElement('div');
+    row.className = 'status-line status-' + state;
+    row.textContent = text;
+    list.appendChild(row);
+  });
 }
 
 // SSE may also push lightweight status events from background jobs.
@@ -2419,7 +2441,13 @@ function renderTokenBurn(data) {
     burn.output_tokens != null ? burn.output_tokens.toLocaleString() : '—';
 
   renderTokenBurnChart(data.timeseries || []);
-  renderTokenBurnBreakdown(burn);
+  // Deliberately no by-source/by-model breakdown here: which provider/model
+  // hermes' config *names* as primary is frequently not what's actually
+  // serving traffic once that provider is rate-limited/exhausted and hermes
+  // falls through its own fallback chain — see hermes/usage_ingest.py's
+  // docstring. The aggregate tokens/hour figure above is accurate regardless
+  // of which provider served it; a per-model breakdown here would just be
+  // misleading about "what's primary."
 }
 
 function renderTokenBurnChart(timeseries) {
@@ -2432,7 +2460,7 @@ function renderTokenBurnChart(timeseries) {
       datasets: [{
         label: 'tokens',
         data,
-        borderColor: 'var(--accent)',
+        borderColor: PRIO_COLORS.warn,
         backgroundColor: 'transparent',
         tension: 0.25,
         pointRadius: 0,
@@ -2444,40 +2472,6 @@ function renderTokenBurnChart(timeseries) {
       plugins: { legend: { display: false } },
       scales: { y: { beginAtZero: true } },
     },
-  });
-}
-
-function renderTokenBurnBreakdown(burn) {
-  const list = document.getElementById('burn-breakdown-list');
-  list.innerHTML = '';
-
-  const bySource = burn.by_source || {};
-  const byModel = burn.by_model || {};
-  const entries = [
-    ...Object.entries(bySource).map(([k, v]) => [`source: ${k}`, v]),
-    ...Object.entries(byModel).map(([k, v]) => [`model: ${k}`, v]),
-  ];
-
-  if (!entries.length) {
-    const empty = document.createElement('p');
-    empty.className = 'hint';
-    empty.textContent = 'No token usage recorded yet.';
-    list.appendChild(empty);
-    return;
-  }
-
-  entries.forEach(([label, tokens]) => {
-    const row = document.createElement('div');
-    row.className = 'emerging-row';
-    const labelEl = document.createElement('span');
-    labelEl.className = 'emerging-label';
-    labelEl.textContent = label;
-    row.appendChild(labelEl);
-    const valueEl = document.createElement('span');
-    valueEl.className = 'emerging-delta';
-    valueEl.textContent = Math.round(tokens).toLocaleString();
-    row.appendChild(valueEl);
-    list.appendChild(row);
   });
 }
 

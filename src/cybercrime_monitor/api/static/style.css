@@ -174,44 +174,37 @@ header {
 .tab:hover { color: var(--text); }
 .tab.active { color: var(--text); border-bottom-color: var(--accent); }
 
-/* ── Subsystem queues panel (Activity tab) ───────────────────────────────────
-   Formerly a global bar above all tabs; now scoped to the Activity tab
-   alongside the burn-rate widgets and activity log — see index.html's
-   #queues-panel and app.js's updateQueuesPanel. */
-.status-bar {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 0;
-  margin-bottom: 14px;
-  border-bottom: 1px solid var(--border);
-  font-size: 0.75rem;
-  min-height: 28px;
+/* ── Activity tab operational widgets (burn rate, queues) ────────────────────
+   #tab-activity.active is a flex column; without flex-shrink:0 these rows
+   get compressed by flexbox when content exceeds the viewport, while their
+   children (charts, the sticky .case-toolbar below) keep their natural
+   size — the mismatch visually overlapped the sticky toolbar on top of
+   these rows. flex-shrink:0 keeps each row at its natural height instead. */
+#burn-rate-row,
+#queues-panel {
+  flex-shrink: 0;
 }
-.status-pill {
-  display: inline-flex;
+.status-line {
+  display: flex;
   align-items: center;
   gap: 6px;
-  padding: 2px 8px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-left: 2px solid var(--border);
-  color: var(--text-muted);
-  white-space: nowrap;
+  font-size: 0.78rem;
   font-family: var(--font-mono);
+  color: var(--text-muted);
+  padding: 3px 0;
 }
-.status-pill.status-ok      { color: var(--prio-info);  border-left-color: var(--prio-info); }
-.status-pill.status-warn    { color: var(--prio-warn);  border-left-color: var(--prio-warn); }
-.status-pill.status-error   { color: var(--prio-critical); border-left-color: var(--prio-critical); }
-.status-pill.status-active  { color: var(--accent);     border-left-color: var(--accent); }
-.status-pill::before {
+.status-line::before {
   content: '';
   display: inline-block;
-  width: 5px;
-  height: 5px;
+  width: 6px;
+  height: 6px;
+  flex-shrink: 0;
   background: currentColor;
 }
+.status-line.status-ok     { color: var(--prio-info); }
+.status-line.status-warn   { color: var(--prio-warn); }
+.status-line.status-error  { color: var(--prio-critical); }
+.status-line.status-active { color: var(--accent); }
 
 /* ── Tab layout ─────────────────────────────────────────────────────────── */
 .tab-content { display: none; }
@@ -610,6 +603,7 @@ mark { background: var(--prio-warn-bg); color: var(--prio-warn); padding: 0 2px;
 }
 
 .chart-canvas { position: relative; height: 140px; width: 100%; }
+.chart-canvas-tall { height: 220px; }
 
 /* ── Settings / Investigate pane ──────────────────────────────────────────── */
 .settings-pane { max-width: 860px; }
