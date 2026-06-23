@@ -69,6 +69,24 @@ def record_error(source_id: str, error: str) -> None:
     h.consecutive_errors += 1
 
 
+def reset_streaks(source_id: str) -> None:
+    """Clear the consecutive-error/consecutive-empty streaks for a source
+    whose config research/heal.py's _probe_and_apply just changed (a new
+    URL is a fresh start — the old streak describes the broken config, not
+    this one). Without this, a source heal just fixed would still read as
+    "structurally empty" (sources/value.py's is_structurally_empty) until
+    its next tick actually runs, since those counters only reset on a
+    *successful* fetch — letting the same tick's prune pass immediately
+    undo the fix it was meant to give a chance to work. Lifetime stats
+    (total_items_fetched) are untouched — only the streak counters that
+    drive the broken/degraded signal."""
+    h = _health.get(source_id)
+    if h is None:
+        return
+    h.consecutive_errors = 0
+    h.consecutive_empty = 0
+
+
 def get(source_id: str) -> SourceHealth | None:
     return _health.get(source_id)
 

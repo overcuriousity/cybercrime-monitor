@@ -239,6 +239,13 @@ class Settings(BaseSettings):
     # A source must accumulate this many consecutive collector errors before
     # the self-healing job will spend a Hermes run investigating it.
     hermes_heal_error_threshold: int = 5
+    # A scrape-access source (sources/value.py's access_for) must accumulate
+    # this many consecutive *successful-but-empty* fetches (health.py's
+    # consecutive_empty — 200 OK, 0 items parsed) before it's treated as
+    # "structurally empty"/degraded: investigated by heal, and eligible for
+    # prune if heal can't fix it. Keep in sync with app.js's
+    # _EMPTY_STREAK_THRESHOLD, which drives the same "degraded" dashboard dot.
+    source_empty_streak_threshold: int = 5
     # Truly agentic self-improvement loop (research/heal.py + writer.py):
     # validated heal fixes are written straight to sources.yaml and the
     # collector is live-rescheduled, low-value sources are auto-disabled/
@@ -316,10 +323,21 @@ class Settings(BaseSettings):
     # Quality prior by media kind (sources/value.py._component_media_prior) —
     # first-hand darknet-forum data is the most valuable signal this system
     # can find, ahead of forensic writeups, feeds, press and blogs.
+    # Widened from the original 5-kind set (darknet_forum/forensic/feed/
+    # press/blog) to cover the full range of cybercrime-monitor source kinds
+    # — see sources/value.py's VALID_MEDIA_KINDS. The old "feed" value is
+    # aliased to "threat_feed" (_MEDIA_KIND_ALIASES) rather than migrated, so
+    # existing config/DB rows keep resolving without a one-time rewrite.
     media_kind_prior: dict[str, float] = {
         "darknet_forum": 1.0,
+        "leak_site": 0.9,
+        "marketplace": 0.85,
         "forensic": 0.85,
-        "feed": 0.7,
+        "forum": 0.8,
+        "paste": 0.75,
+        "threat_feed": 0.7,
+        "breach_service": 0.7,
+        "social": 0.65,
         "press": 0.6,
         "blog": 0.55,
     }
