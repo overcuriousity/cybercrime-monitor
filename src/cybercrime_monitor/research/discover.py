@@ -156,7 +156,7 @@ _TARGET_REGIONS = ("eu", "us", "ru_cn")
 # so it wins ties (it's always wanted regardless of balance).
 _MEDIA_KINDS_BY_PRIORITY = (
     "darknet_forum", "forum", "marketplace", "leak_site", "paste",
-    "forensic", "press", "blog", "threat_feed",
+    "forensic", "press", "blog", "threat_feed", "breach_service", "social",
 )
 
 

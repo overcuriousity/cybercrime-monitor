@@ -108,7 +108,10 @@ def access_for(source: dict) -> str:
     default, e.g. a JSON-API paste source), falling back to the type's
     default. Unknown/missing type defaults to "feed" — the conservative
     choice, since it never triggers degraded-on-empty."""
-    return source.get("access") or ACCESS_BY_TYPE.get(source.get("type"), "feed")
+    explicit = source.get("access")
+    if explicit is not None and explicit != "":
+        return explicit
+    return ACCESS_BY_TYPE.get(source.get("type") or "", "feed")
 
 
 def is_structurally_empty(source: dict, h) -> bool:
@@ -164,12 +167,14 @@ def _component_health(src: dict) -> tuple[float | None, bool]:
         return 0.0, False
     # Decays toward 0 as consecutive_errors climbs; a single transient error
     # barely moves it, a long unbroken failure streak does. A scrape source
-    # stuck on a sustained empty streak (is_structurally_empty — 200s but 0
+    # stuck on a sustained empty streak (is_structurally_empty -- 200s but 0
     # items parsed, e.g. selector drift or a captcha wall) decays the same
     # way: that failure mode never increments consecutive_errors on its own,
     # so without this it would otherwise score a perfect 1.0 forever.
     penalty = h.consecutive_errors
     if is_structurally_empty(src, h):
+        # At threshold (e.g. 5): +1. At 6: +2. etc. So a degraded source gets
+        # the same decay curve as one with consecutive_errors=1, 2, 3...
         penalty += h.consecutive_empty - settings.source_empty_streak_threshold + 1
     score = 1.0 / (1.0 + penalty)
     return score, True
