@@ -262,6 +262,33 @@ def build_scheduler(db_conn, sse_broadcaster) -> AsyncIOScheduler:
     else:
         log.info("Retention disabled (retention_days <= 0)")
 
+    if settings.account_expiry_days > 0:
+        from datetime import datetime, timedelta, timezone
+
+        async def _run_account_expiry(conn) -> None:
+            try:
+                cutoff = (datetime.now(timezone.utc) - timedelta(days=settings.account_expiry_days)).isoformat()
+                n = await db_module.prune_expired_accounts(conn, cutoff_iso=cutoff)
+                if n:
+                    log.info("[account_expiry] pruned %d unused account(s)", n)
+            except Exception as exc:
+                log.error("[account_expiry] prune failed: %s", exc)
+
+        scheduler.add_job(
+            _run_account_expiry,
+            trigger=IntervalTrigger(seconds=86400),
+            id="_account_expiry",
+            name="Self-service account expiry pruning",
+            next_run_time=_offset_now(150),
+            misfire_grace_time=3600,
+            max_instances=1,
+            coalesce=True,
+            kwargs={"conn": db_conn},
+        )
+        log.info("Scheduled account expiry job (account_expiry_days=%d)", settings.account_expiry_days)
+    else:
+        log.info("Account expiry disabled (account_expiry_days <= 0)")
+
     if settings.significance_decay_interval_seconds > 0:
         async def _decay_significance(conn) -> None:
             try:

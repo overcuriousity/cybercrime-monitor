@@ -86,10 +86,24 @@ def create_app() -> FastAPI:
     if settings.rate_limit_per_minute > 0:
         bucket = _TokenBucket(settings.rate_limit_per_minute)
 
+        # Account creation gets its own, much stricter bucket — it's the one
+        # publicly-reachable write that can grow the DB without bound if left
+        # at the general API rate (see settings.account_create_rate_per_minute
+        # and the proof-of-work check in routes.py's POST /api/accounts).
+        accounts_bucket = (
+            _TokenBucket(settings.account_create_rate_per_minute)
+            if settings.account_create_rate_per_minute > 0
+            else None
+        )
+        _ACCOUNTS_PATHS = {"/api/accounts", "/api/accounts/challenge"}
+
         @app.middleware("http")
         async def rate_limit_middleware(request: Request, call_next):
             if request.url.path.startswith("/api/"):
                 client_ip = request.client.host if request.client else "unknown"
+                if accounts_bucket is not None and request.url.path in _ACCOUNTS_PATHS:
+                    if not accounts_bucket.allow(client_ip):
+                        return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
                 if not bucket.allow(client_ip):
                     return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
             return await call_next(request)

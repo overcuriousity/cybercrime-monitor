@@ -29,7 +29,8 @@
       <span id="sse-status" class="sse-status disconnected" title="Live feed status">●</span>
     </div>
     <div class="admin-controls">
-      <input type="password" id="admin-token" class="admin-token-input" placeholder="Admin token" autocomplete="off" title="Unlocks admin-gated features (targeted investigation, research trigger, filtered items)">
+      <input type="password" id="admin-token" class="admin-token-input" placeholder="Access key" autocomplete="off" title="Admin token, or a self-service access key created below. Unlocks bookmarking; the admin token additionally unlocks Investigate, research trigger and filtered items.">
+      <button id="account-create-btn" class="account-create-btn" type="button" title="Create a free access key for bookmarking cases">+ Account</button>
       <span id="admin-token-status" class="admin-token-status hidden"></span>
     </div>
     <nav class="tabs">
@@ -37,7 +38,7 @@
       <button class="tab" data-tab="feed">Feed</button>
       <button class="tab" data-tab="cases">Cases</button>
       <button class="tab" data-tab="activity">Activity</button>
-      <button class="tab" data-tab="settings">Investigate</button>
+      <button class="tab hidden" data-tab="settings" id="tab-btn-settings">Investigate</button>
     </nav>
   </header>
 
@@ -218,6 +219,9 @@
         </select>
         <label class="matched-only-row">
           <input type="checkbox" id="case-kev-only"> KEV only
+        </label>
+        <label class="matched-only-row hidden" id="case-bookmark-only-row">
+          <input type="checkbox" id="case-bookmark-only"> ★ Bookmarked only
         </label>
         <input type="date" id="case-since-input" title="From">
         <input type="date" id="case-until-input" title="To">
@@ -449,6 +453,24 @@
       </div>
       <h3>Recent investigations</h3>
       <div id="inv-list"></div>
+    </div>
+  </div>
+
+  <!-- ── New-account key reveal (shown once, never recoverable) ─────────── -->
+  <div id="account-key-overlay" class="account-key-overlay hidden">
+    <div class="account-key-panel">
+      <h3>Your access key</h3>
+      <p class="hint">Save this now — it won't be shown again. Paste it into the access key field any time to bookmark cases from this browser or another.</p>
+      <div id="account-key-working" class="hidden">Solving proof-of-work…</div>
+      <div id="account-key-error" class="error-box hidden"></div>
+      <div id="account-key-result" class="hidden">
+        <code id="account-key-value"></code>
+        <div class="settings-actions">
+          <button id="account-key-copy" class="btn-primary" type="button">Copy</button>
+          <button id="account-key-use" type="button">Use this key now</button>
+          <button id="account-key-close" class="link-button" type="button">Close</button>
+        </div>
+      </div>
     </div>
   </div>
 

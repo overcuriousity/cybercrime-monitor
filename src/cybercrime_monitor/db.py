@@ -498,6 +498,36 @@ CREATE TABLE IF NOT EXISTS vec_index_state (
     PRIMARY KEY (kind, ref_id)
 );
 
+-- Self-service accounts (api/routes.py: resolve_identity). Not a real user
+-- system — there's no password, just a high-entropy access key minted by
+-- POST /api/accounts and matched here by sha256 hash. Only the hash is ever
+-- stored; the plaintext key is shown to the caller exactly once and is not
+-- recoverable. is_admin rows are lazily created the first time the
+-- configured admin_token is presented, so admin bookmarks have a stable
+-- account_id without a separate "admin account" creation step.
+CREATE TABLE IF NOT EXISTS accounts (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    token_hash   TEXT NOT NULL UNIQUE,
+    is_admin     INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_accounts_last_seen ON accounts(last_seen_at);
+
+-- One row per (account, case) bookmark. The sole capability accounts have
+-- today (settings.account_expiry_days docstring) — notifications on
+-- bookmarked cases are deferred to a later iteration.
+CREATE TABLE IF NOT EXISTS bookmarks (
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    case_id    INTEGER NOT NULL REFERENCES cases(id)    ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (account_id, case_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_bookmarks_account ON bookmarks(account_id);
+CREATE INDEX IF NOT EXISTS idx_bookmarks_case ON bookmarks(case_id);
+
 -- Resolves one effective priority rank + false_positive flag per item, from
 -- the LLM extraction's significance — the sole classification signal (the
 -- old regex-matcher fallback was removed; an item simply has no priority
@@ -2223,6 +2253,7 @@ def _build_cases_where(
     until: str | None = None,
     country: str | None = None,
     id_in: list[int] | None = None,
+    bookmarked_by: int | None = None,
 ) -> tuple[str, dict]:
     parts = []
     params: dict = {}
@@ -2280,6 +2311,11 @@ def _build_cases_where(
             parts.append(f"id IN ({placeholders})")
             for i, v in enumerate(id_in):
                 params[f"idin{i}"] = v
+    if bookmarked_by is not None:
+        parts.append(
+            "EXISTS (SELECT 1 FROM bookmarks b WHERE b.case_id = cases.id AND b.account_id = :bookmarked_by)"
+        )
+        params["bookmarked_by"] = bookmarked_by
     where = ("WHERE " + " AND ".join(parts)) if parts else ""
     return where, params
 
@@ -2299,6 +2335,7 @@ async def fetch_cases(
     until: str | None = None,
     country: str | None = None,
     id_in: list[int] | None = None,
+    bookmarked_by: int | None = None,
 ) -> list[dict]:
     """Case-centric counterpart to fetch_items — see that function's
     docstring for the shared filter/pagination shape this mirrors.
@@ -2307,11 +2344,13 @@ async def fetch_cases(
     bound on last_seen — a timeframe search ("what happened last week").
     `cve_id`/`ioc` back the case detail pane's indicator-pivot chips (click
     a CVE/IoC -> every case sharing it). `country` narrows to a single
-    victim country (the Cases-tab map's click-to-filter)."""
+    victim country (the Cases-tab map's click-to-filter). `bookmarked_by`
+    scopes to one account's bookmarks (the Cases-tab "bookmarked only"
+    filter)."""
     where, params = _build_cases_where(
         min_significance=min_significance, crime_type=crime_type, in_kev=in_kev,
         search=search, cve_id=cve_id, ioc=ioc, since=since, until=until,
-        country=country, id_in=id_in,
+        country=country, id_in=id_in, bookmarked_by=bookmarked_by,
     )
     rows = await conn.execute_fetchall(
         f"""
@@ -2347,6 +2386,7 @@ async def count_cases(
     since: str | None = None,
     until: str | None = None,
     country: str | None = None,
+    bookmarked_by: int | None = None,
 ) -> int:
     """Landscape's "cases opened in window" count (first_seen-based via
     since_iso) can be combined with the same last_seen filters used by
@@ -2354,6 +2394,7 @@ async def count_cases(
     where, params = _build_cases_where(
         min_significance=min_significance, crime_type=crime_type, in_kev=in_kev,
         search=search, cve_id=cve_id, ioc=ioc, since=since, until=until, country=country,
+        bookmarked_by=bookmarked_by,
     )
     if since_iso:
         if where:
@@ -3856,3 +3897,90 @@ async def run_significance_decay(conn: aiosqlite.Connection, *, now: datetime | 
     if decayed:
         await conn.commit()
     return decayed
+
+
+# ── Self-service accounts + bookmarks (api/routes.py: resolve_identity) ─────
+# See accounts/bookmarks table comments in _SCHEMA above for the design
+# rationale (hash-only storage, lazy admin-account provisioning, bookmarks as
+# the sole capability for now).
+
+
+async def create_account(conn: aiosqlite.Connection, *, token_hash: str, is_admin: bool = False) -> int:
+    now = _utcnow().isoformat()
+    cur = await conn.execute(
+        """
+        INSERT INTO accounts (token_hash, is_admin, created_at, last_seen_at)
+        VALUES (:token_hash, :is_admin, :created_at, :last_seen_at)
+        """,
+        {"token_hash": token_hash, "is_admin": 1 if is_admin else 0, "created_at": now, "last_seen_at": now},
+    )
+    await conn.commit()
+    return cur.lastrowid
+
+
+async def get_account_by_hash(conn: aiosqlite.Connection, token_hash: str) -> dict | None:
+    rows = await conn.execute_fetchall(
+        "SELECT * FROM accounts WHERE token_hash = :token_hash", {"token_hash": token_hash}
+    )
+    return dict(rows[0]) if rows else None
+
+
+async def ensure_admin_account(conn: aiosqlite.Connection, token_hash: str) -> dict:
+    """Lazily provisions (and returns) the single admin account row the first
+    time the configured admin_token is presented, so admin bookmarks have a
+    stable account_id without a separate enrollment step. Idempotent — a
+    second call just returns the existing row and refreshes last_seen_at."""
+    existing = await get_account_by_hash(conn, token_hash)
+    if existing is None:
+        await create_account(conn, token_hash=token_hash, is_admin=True)
+        existing = await get_account_by_hash(conn, token_hash)
+    else:
+        await touch_account_last_seen(conn, existing["id"])
+        existing = await get_account_by_hash(conn, token_hash)
+    return existing
+
+
+async def touch_account_last_seen(conn: aiosqlite.Connection, account_id: int) -> None:
+    await conn.execute(
+        "UPDATE accounts SET last_seen_at = :now WHERE id = :id",
+        {"now": _utcnow().isoformat(), "id": account_id},
+    )
+    await conn.commit()
+
+
+async def add_bookmark(conn: aiosqlite.Connection, *, account_id: int, case_id: int) -> None:
+    await conn.execute(
+        """
+        INSERT OR IGNORE INTO bookmarks (account_id, case_id, created_at)
+        VALUES (:account_id, :case_id, :created_at)
+        """,
+        {"account_id": account_id, "case_id": case_id, "created_at": _utcnow().isoformat()},
+    )
+    await conn.commit()
+
+
+async def remove_bookmark(conn: aiosqlite.Connection, *, account_id: int, case_id: int) -> None:
+    await conn.execute(
+        "DELETE FROM bookmarks WHERE account_id = :account_id AND case_id = :case_id",
+        {"account_id": account_id, "case_id": case_id},
+    )
+    await conn.commit()
+
+
+async def get_bookmarked_case_ids(conn: aiosqlite.Connection, account_id: int) -> list[int]:
+    rows = await conn.execute_fetchall(
+        "SELECT case_id FROM bookmarks WHERE account_id = :account_id", {"account_id": account_id}
+    )
+    return [r["case_id"] for r in rows]
+
+
+async def prune_expired_accounts(conn: aiosqlite.Connection, *, cutoff_iso: str) -> int:
+    """Deletes non-admin accounts that haven't been used (no valid-token
+    request) since cutoff_iso — see settings.account_expiry_days. Cascades
+    to bookmarks via ON DELETE CASCADE. The admin account never expires."""
+    cur = await conn.execute(
+        "DELETE FROM accounts WHERE is_admin = 0 AND last_seen_at < :cutoff",
+        {"cutoff": cutoff_iso},
+    )
+    await conn.commit()
+    return cur.rowcount or 0
