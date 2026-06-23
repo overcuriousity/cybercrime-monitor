@@ -28,10 +28,8 @@ see research/heal.py's _min_history.
 
 Runs on its own APScheduler interval (scheduler.py's "_discover" job).
 """
-import asyncio
 import logging
 import re
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from selectolax.parser import HTMLParser
@@ -39,7 +37,8 @@ from selectolax.parser import HTMLParser
 from .. import db
 from .. import prompts
 from ..api.sse import broadcaster
-from ..hermes.runner import run_agent
+from ..health_registry import HealthRegistry
+from ..hermes.runner import run_agent, run_dispatch_prompt
 from ..http import clearnet_client, tor_client
 from ..scheduler import load_sources, reschedule_source
 from ..settings import settings
@@ -48,52 +47,12 @@ from ..sources import writer as source_writer
 
 log = logging.getLogger(__name__)
 
-
-@dataclass
-class DiscoverHealth:
-    last_run_at: str | None = None
-    last_success_at: str | None = None
-    last_processed_count: int = 0
-    last_error: str | None = None
-    last_error_at: str | None = None
-    consecutive_errors: int = 0
-
-
-_health = DiscoverHealth()
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _emit(payload: dict) -> None:
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(broadcaster.broadcast_status("discover", payload))
-    except RuntimeError:
-        pass
-
-
-def record_run_start() -> None:
-    _health.last_run_at = _now_iso()
-
-
-def record_success(added_count: int) -> None:
-    _health.last_success_at = _now_iso()
-    _health.last_processed_count = added_count
-    _health.consecutive_errors = 0
-    _emit({"last_processed_count": added_count})
-
-
-def record_error(error: str) -> None:
-    _health.last_error = error[:300]
-    _health.last_error_at = _now_iso()
-    _health.consecutive_errors += 1
-    _emit({"error": error[:300], "consecutive_errors": _health.consecutive_errors})
-
-
-def get() -> DiscoverHealth:
-    return _health
+# See health_registry.py for the shared implementation.
+_registry = HealthRegistry("discover")
+record_run_start = _registry.record_run_start
+record_success = _registry.record_success
+record_error = _registry.record_error
+get = _registry.get
 
 
 async def _log_activity(
@@ -274,13 +233,7 @@ async def run_discover_batch(db_conn, scheduler=None, sse_broadcaster=None) -> i
             underrepresented=_underrepresented_summary(existing),
             batch_size=batch_size,
         )
-        result = await run_agent(
-            prompt,
-            toolsets=settings.hermes_toolsets,
-            timeout=settings.hermes_timeout_seconds,
-            model=settings.hermes_model or None,
-            expect_json=True,
-        )
+        result = await run_dispatch_prompt(prompt)
         if not result.ok or result.data is None:
             record_error(result.error or "no parseable result")
             log.warning("[discover] hermes run failed: %s", result.error)

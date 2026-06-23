@@ -37,9 +37,13 @@ RANK_SIG: dict[int, str] = {1: "info", 2: "warn", 3: "critical"}
 
 def significance_score(sig: str) -> float:
     """Normalized 0..1 score for a significance level, derived from its
-    rank — e.g. for case.significance_score. Unknown values default to the
-    info rank (1) rather than raising, matching the rest of this module's
-    lenient .get(..., 1) convention."""
+    rank — e.g. for case.significance_score. `false_positive` is below the
+    info/warn/critical ladder (see module docstring) and scores 0.0 rather
+    than falling through to the lenient default. Other unknown values default
+    to the info rank (1) rather than raising, matching the rest of this
+    module's lenient .get(..., 1) convention."""
+    if sig == "false_positive":
+        return 0.0
     return SIG_RANK.get(sig, 1) / 3.0
 
 

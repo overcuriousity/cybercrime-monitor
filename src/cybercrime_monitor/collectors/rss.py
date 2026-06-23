@@ -4,16 +4,15 @@ tor_forum.py, most of which are disabled in sources.yaml due to layout
 drift). Modeled directly on nitter.py, which is itself just an RSS reader
 for a single account."""
 import logging
-from datetime import datetime
-from email.utils import parsedate_to_datetime
 
 import feedparser
 
 from .. import health
 from ..http import clearnet_client
 from ..models import Item
+from ._text import parse_date as _parse_feed_date
+from ._text import strip_html as _strip_html
 from .base import BaseCollector
-from .nitter import _strip_html
 
 log = logging.getLogger(__name__)
 
@@ -60,16 +59,3 @@ class RSSCollector(BaseCollector):
                 )
             )
         return items
-
-
-def _parse_feed_date(s: str) -> datetime | None:
-    if not s:
-        return None
-    try:
-        return parsedate_to_datetime(s)
-    except Exception:
-        pass
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except Exception:
-        return None

@@ -114,6 +114,30 @@ def access_for(source: dict) -> str:
     return ACCESS_BY_TYPE.get(source.get("type") or "", "feed")
 
 
+def validate_sources(sources: list[dict]) -> None:
+    """Startup check: warn when a configured source's `type` isn't in
+    ACCESS_BY_TYPE (so access_for() silently falls back to the conservative
+    "feed" default, never triggering the degraded/structurally-empty signal)
+    or when an explicit `access` override isn't one of VALID_ACCESS. Catches
+    a new collector type that forgot to register here before it ships and
+    quietly never alerts on breakage."""
+    for source in sources:
+        sid = source.get("id", "<unknown>")
+        explicit = source.get("access")
+        if explicit is not None and explicit != "" and explicit not in VALID_ACCESS:
+            log.warning(
+                "source %r has access=%r, not one of %s", sid, explicit, sorted(VALID_ACCESS)
+            )
+            continue
+        src_type = source.get("type")
+        if (explicit is None or explicit == "") and src_type not in ACCESS_BY_TYPE:
+            log.warning(
+                "source %r has unregistered type=%r — access_for() will default to "
+                "'feed', which never triggers degraded-on-empty detection; add it to "
+                "ACCESS_BY_TYPE or set an explicit 'access' field", sid, src_type
+            )
+
+
 def is_structurally_empty(source: dict, h) -> bool:
     """A scrape-access source returning successful (200) responses but
     parsing 0 items for a sustained streak — selector drift or a captcha/

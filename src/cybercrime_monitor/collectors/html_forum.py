@@ -1,7 +1,6 @@
 """Generic clearnet forum listing scraper using selectolax."""
 import asyncio
 import logging
-from datetime import datetime
 from typing import Any
 from urllib.parse import urljoin
 
@@ -10,6 +9,7 @@ from selectolax.parser import HTMLParser
 from .. import health
 from ..http import clearnet_client
 from ..models import Item
+from ._text import parse_date as _parse_date
 from .base import BaseCollector
 
 log = logging.getLogger(__name__)
@@ -71,18 +71,3 @@ class HTMLForumCollector(BaseCollector):
             )
 
         return items
-
-
-def _parse_date(s: str) -> datetime | None:
-    for fmt in (
-        "%Y-%m-%dT%H:%M:%S%z",
-        "%Y-%m-%dT%H:%M:%SZ",
-        "%Y-%m-%d %H:%M:%S",
-        "%m/%d/%Y, %I:%M %p",
-        "%d-%m-%Y",
-    ):
-        try:
-            return datetime.strptime(s.strip(), fmt)
-        except ValueError:
-            pass
-    return None

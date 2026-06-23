@@ -7,10 +7,10 @@ API: https://api.ransomware.live/v2/recentvictims (v2, free tier, no auth,
 rate-limited to 1 req/min — keep interval_seconds >= 90 in sources.yaml).
 """
 import logging
-from datetime import datetime
 
 from ..http import clearnet_client
 from ..models import Item
+from ._text import parse_date as _parse_date
 from .base import BaseCollector
 
 log = logging.getLogger(__name__)
@@ -82,16 +82,3 @@ class RansomwareLiveCollector(BaseCollector):
                 )
             )
         return items
-
-
-def _parse_date(s: str) -> datetime | None:
-    if not s:
-        return None
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except Exception:
-        pass
-    try:
-        return datetime.strptime(s, "%Y-%m-%d")
-    except Exception:
-        return None

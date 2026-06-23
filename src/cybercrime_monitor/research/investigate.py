@@ -33,16 +33,15 @@ minutes, same cost class as research/agent.py). The submitting API call
 nudges the job to run immediately rather than waiting out the interval —
 same pattern as the case-research force-trigger.
 """
-import asyncio
 import logging
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from .. import db
 from .. import prompts
 from ..api.sse import broadcaster
 from ..collectors.base import _content_key, _dedupe_key
-from ..hermes.runner import _is_transient, run_agent
+from ..health_registry import HealthRegistry
+from ..hermes.runner import _is_transient, run_dispatch_prompt
 from ..models import Item
 from ..pipeline.correlate import _correlate_one
 from ..scheduler import load_sources
@@ -54,53 +53,14 @@ log = logging.getLogger(__name__)
 
 # ── Runtime health registry (mirrors research/agent.py) ──────────────────────
 # Surfaced via /api/status so the dashboard can show whether an investigation
-# is currently running or backing up.
+# is currently running or backing up. See health_registry.py for the shared
+# implementation.
 
-@dataclass
-class InvestigateHealth:
-    last_run_at: str | None = None
-    last_success_at: str | None = None
-    last_processed_count: int = 0
-    last_error: str | None = None
-    last_error_at: str | None = None
-    consecutive_errors: int = 0
-
-
-_health = InvestigateHealth()
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _emit(payload: dict) -> None:
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(broadcaster.broadcast_status("investigate", payload))
-    except RuntimeError:
-        pass
-
-
-def record_run_start() -> None:
-    _health.last_run_at = _now_iso()
-
-
-def record_success(processed_count: int) -> None:
-    _health.last_success_at = _now_iso()
-    _health.last_processed_count = processed_count
-    _health.consecutive_errors = 0
-    _emit({"last_processed_count": processed_count})
-
-
-def record_error(error: str) -> None:
-    _health.last_error = error[:300]
-    _health.last_error_at = _now_iso()
-    _health.consecutive_errors += 1
-    _emit({"error": error[:300], "consecutive_errors": _health.consecutive_errors})
-
-
-def get() -> InvestigateHealth:
-    return _health
+_registry = HealthRegistry("investigate")
+record_run_start = _registry.record_run_start
+record_success = _registry.record_success
+record_error = _registry.record_error
+get = _registry.get
 
 
 async def _log_activity(
@@ -235,10 +195,7 @@ async def _investigate_one(db_conn, inv: dict, scheduler, sse_broadcaster) -> No
     local_items = await db.fetch_items(db_conn, limit=_LOCAL_CONTEXT_LIMIT, search=_search_terms(brief))
 
     prompt = _build_prompt(brief, existing_sources, local_items)
-    result = await run_agent(
-        prompt, toolsets=settings.hermes_toolsets, timeout=settings.hermes_timeout_seconds,
-        model=settings.hermes_model or None, expect_json=True,
-    )
+    result = await run_dispatch_prompt(prompt)
 
     if not result.ok or result.data is None:
         error = result.error or "no parseable result"

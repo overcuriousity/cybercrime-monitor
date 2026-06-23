@@ -1,11 +1,12 @@
 """HaveIBeenPwned breach catalog collector — diffs on each poll."""
 import json
 import logging
-from datetime import datetime
 from pathlib import Path
 
 from ..http import clearnet_client
 from ..models import Item
+from ._text import parse_date as _parse_date
+from ._text import strip_html as _strip_html
 from .base import BaseCollector
 
 log = logging.getLogger(__name__)
@@ -98,17 +99,3 @@ def _save_seen(seen: set[str]) -> None:
     tmp = _STATE_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(sorted(seen)))
     tmp.replace(_STATE_FILE)
-
-
-def _parse_date(s: str) -> datetime | None:
-    if not s:
-        return None
-    try:
-        return datetime.strptime(s, "%Y-%m-%d")
-    except ValueError:
-        return None
-
-
-def _strip_html(s: str) -> str:
-    import re
-    return re.sub(r"<[^>]+>", "", s).strip()
