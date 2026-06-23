@@ -451,5 +451,29 @@ class Settings(BaseSettings):
     # 0 disables rate limiting entirely.
     rate_limit_per_minute: int = 120
 
+    # ── Self-service accounts (bookmarks only, for now) ─────────────────────
+    # Anyone can mint an access key (POST /api/accounts) and paste it into the
+    # same X-Admin-Token field the admin token uses. The admin token itself
+    # always qualifies as an access key too (see routes.py:resolve_identity).
+    # The only capability today is bookmarking cases; notifications are
+    # explicitly deferred. There is no hard cap on the number of accounts —
+    # growth is bounded by the proof-of-work + rate limit on creation below,
+    # and by pruning accounts that go unused for account_expiry_days.
+    account_expiry_days: int = 90
+    # Proof-of-work difficulty for POST /api/accounts: the client must find a
+    # solution whose sha256("{nonce}:{solution}") has this many leading zero
+    # bits (see routes.py's _pow_verify). Raises the cost of mass account
+    # creation without requiring any state server-side beyond the per-IP rate
+    # limit below. ~20 bits is a ~1-3s solve on a laptop in JS.
+    account_pow_bits: int = 20
+    # Dedicated per-IP limiter for POST /api/accounts and the challenge
+    # endpoint — much stricter than the general rate_limit_per_minute above,
+    # since account creation is the one publicly-reachable write that can
+    # grow the DB without bound if left at the general API rate.
+    account_create_rate_per_minute: int = 5
+    # How long a PoW challenge (routes.py: GET /api/accounts/challenge)
+    # remains solvable before its signature is rejected as expired.
+    account_challenge_ttl_seconds: int = 120
+
 
 settings = Settings()

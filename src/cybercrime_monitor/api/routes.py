@@ -1,8 +1,11 @@
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
 import re
+import secrets
+import time
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
@@ -14,7 +17,14 @@ from ..embeddings import backend as embed_backend
 from ..embeddings import index as vec_index
 from ..llm import health as llm_health
 from ..db import (
+    add_bookmark,
     burn_rate,
+    create_account,
+    ensure_admin_account,
+    get_account_by_hash,
+    get_bookmarked_case_ids,
+    remove_bookmark,
+    touch_account_last_seen,
     count_cases,
     count_cases_needing_research,
     count_heal_proposals_by_status,
@@ -114,6 +124,127 @@ async def require_admin(x_admin_token: str | None = Header(default=None)):
     rather than silently public."""
     if not _is_valid_admin_token(x_admin_token):
         raise HTTPException(status_code=403, detail="Admin token required")
+
+
+# ── Self-service accounts ────────────────────────────────────────────────────
+# A very small "is someone logged in" layer on top of the admin token, not a
+# real multi-tenant user system: anyone can mint an access key (POST
+# /api/accounts) and paste it into the same X-Admin-Token field the admin
+# token uses. The admin token always also qualifies as an access key (lazily
+# provisioned as its own accounts row below) so admin bookmarks work the same
+# way. The only capability accounts have today is bookmarking cases — see
+# db.py's accounts/bookmarks table comments for the storage rationale
+# (hash-only, key shown once, non-recoverable).
+
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+async def resolve_identity(
+    x_admin_token: str | None = Header(default=None), db=Depends(get_db)
+) -> dict:
+    """Maps the X-Admin-Token header to one of three identities:
+    role="admin" (matches settings.admin_token), role="user" (matches a
+    self-service account's stored key hash), or role="none" (no/invalid
+    token). Used both where an identity is required (require_user below)
+    and where it's merely optional context (e.g. /api/cases' bookmarked
+    filter, /api/status' auth.role)."""
+    if not x_admin_token:
+        return {"role": "none", "account_id": None}
+    if _is_valid_admin_token(x_admin_token):
+        account = await ensure_admin_account(db, _hash_token(x_admin_token))
+        return {"role": "admin", "account_id": account["id"]}
+    account = await get_account_by_hash(db, _hash_token(x_admin_token))
+    if account is None:
+        return {"role": "none", "account_id": None}
+    await touch_account_last_seen(db, account["id"])
+    return {"role": "user", "account_id": account["id"]}
+
+
+async def require_user(identity: dict = Depends(resolve_identity)) -> dict:
+    """Gate for account-only actions (bookmarking). Accepts either role
+    (admin or user) — the admin token is always also a valid access key."""
+    if identity["role"] == "none":
+        raise HTTPException(status_code=403, detail="Valid access key required")
+    return identity
+
+
+# Proof-of-work challenge/response for POST /api/accounts (see settings.
+# account_pow_bits/account_challenge_ttl_seconds) — raises the cost of mass
+# account creation beyond what the per-IP rate limit alone bounds (api/
+# app.py's dedicated accounts bucket), without needing any server-side
+# challenge storage: the challenge is self-contained and HMAC-signed, so
+# verifying a solution doesn't require having seen the challenge issued.
+_POW_SECRET = secrets.token_bytes(32)
+
+
+def _pow_sign(nonce: str, bits: int, expires_at: int) -> str:
+    msg = f"{nonce}:{bits}:{expires_at}".encode("utf-8")
+    return hmac.new(_POW_SECRET, msg, hashlib.sha256).hexdigest()
+
+
+def _leading_zero_bits(digest: bytes) -> int:
+    count = 0
+    for byte in digest:
+        if byte == 0:
+            count += 8
+            continue
+        count += 8 - byte.bit_length()
+        break
+    return count
+
+
+class AccountCreate(BaseModel):
+    nonce: str
+    bits: int
+    expires_at: int
+    sig: str
+    solution: str
+
+
+@router.get("/api/accounts/challenge")
+async def api_accounts_challenge():
+    nonce = secrets.token_urlsafe(16)
+    bits = settings.account_pow_bits
+    expires_at = int(time.time()) + settings.account_challenge_ttl_seconds
+    return {
+        "nonce": nonce,
+        "bits": bits,
+        "expires_at": expires_at,
+        "sig": _pow_sign(nonce, bits, expires_at),
+    }
+
+
+@router.post("/api/accounts")
+async def api_accounts_create(body: AccountCreate, db=Depends(get_db)):
+    if not hmac.compare_digest(body.sig, _pow_sign(body.nonce, body.bits, body.expires_at)):
+        raise HTTPException(status_code=400, detail="invalid challenge")
+    if time.time() > body.expires_at:
+        raise HTTPException(status_code=400, detail="challenge expired")
+    digest = hashlib.sha256(f"{body.nonce}:{body.solution}".encode("utf-8")).digest()
+    if _leading_zero_bits(digest) < body.bits:
+        raise HTTPException(status_code=400, detail="proof-of-work check failed")
+
+    access_key = secrets.token_urlsafe(32)
+    await create_account(db, token_hash=_hash_token(access_key))
+    # Shown exactly once — only the hash is ever persisted (see db.py's
+    # accounts table comment), so this response is the caller's only chance
+    # to see the plaintext key.
+    return {"access_key": access_key}
+
+
+@router.post("/api/cases/{case_id}/bookmark")
+async def api_case_bookmark_add(case_id: int, db=Depends(get_db), identity: dict = Depends(require_user)):
+    if await get_case_by_id(db, case_id) is None:
+        raise HTTPException(status_code=404, detail="Case not found")
+    await add_bookmark(db, account_id=identity["account_id"], case_id=case_id)
+    return {"status": "ok"}
+
+
+@router.delete("/api/cases/{case_id}/bookmark")
+async def api_case_bookmark_remove(case_id: int, db=Depends(get_db), identity: dict = Depends(require_user)):
+    await remove_bookmark(db, account_id=identity["account_id"], case_id=case_id)
+    return {"status": "ok"}
 
 
 # ── Semantic search ──────────────────────────────────────────────────────────
@@ -431,7 +562,7 @@ async def api_classifier_recent(db=Depends(get_db), since: str = Query(...)):
 
 
 @router.get("/api/status")
-async def api_status(request: Request, db=Depends(get_db)):
+async def api_status(request: Request, db=Depends(get_db), identity: dict = Depends(resolve_identity)):
     """Unified live subsystem status — scheduler, collectors, classifier,
     case correlator, KEV refresh, hermes-agent research/heal. Read-only and
     safe for public dashboard use (only counts/scheduler metadata)."""
@@ -482,6 +613,10 @@ async def api_status(request: Request, db=Depends(get_db)):
 
     return {
         "admin": {"enabled": bool(settings.admin_token)},
+        # Unlike "admin.enabled" (only reports whether a token is
+        # *configured*), this reflects whether the caller's own token is
+        # actually valid — see resolve_identity.
+        "auth": {"role": identity["role"]},
         "scheduler": {"running": scheduler_running, "jobs": jobs},
         "sources": {
             "total": len(enabled_sources),
@@ -609,9 +744,30 @@ async def api_cases(
     until: str | None = Query(default=None),
     country: str | None = Query(default=None),
     mode: str = Query(default="keyword", pattern="^(keyword|semantic)$"),  # "keyword" | "semantic"
+    bookmarked: bool = Query(default=False),
+    identity: dict = Depends(resolve_identity),
 ):
     since_norm = _normalize_date_filter(since, end_of_day=False)
     until_norm = _normalize_date_filter(until, end_of_day=True)
+
+    # "Bookmarked only" needs an actual account — an unauthenticated caller
+    # asking for it gets an empty result rather than silently falling back
+    # to the unfiltered list (bookmarked_by=None in fetch_cases/count_cases
+    # means "no bookmark filter", not "no bookmarks").
+    if bookmarked and identity["account_id"] is None:
+        return {"total": 0, "cases": [], "mode": mode}
+    bookmarked_by = identity["account_id"] if bookmarked else None
+
+    bookmarked_ids: set[int] = set()
+    if identity["account_id"] is not None:
+        bookmarked_ids = set(await get_bookmarked_case_ids(db, identity["account_id"]))
+
+    def _annotate(cases: list[dict]) -> list[dict]:
+        if identity["account_id"] is None:
+            return cases
+        for c in cases:
+            c["bookmarked"] = c["id"] in bookmarked_ids
+        return cases
 
     if mode == "semantic" and search:
         try:
@@ -633,10 +789,11 @@ async def api_cases(
             until=until_norm,
             country=country,
             id_in=ranked_ids,
+            bookmarked_by=bookmarked_by,
         )
         by_id = {case["id"]: case for case in candidates}
         page, total = _paginate_ranked(by_id, ranked_ids, limit=limit, offset=offset)
-        return {"total": total, "cases": page, "mode": "semantic"}
+        return {"total": total, "cases": _annotate(page), "mode": "semantic"}
 
     cases = await fetch_cases(
         db,
@@ -651,6 +808,7 @@ async def api_cases(
         since=since_norm,
         until=until_norm,
         country=country,
+        bookmarked_by=bookmarked_by,
     )
     total = await count_cases(
         db,
@@ -663,8 +821,9 @@ async def api_cases(
         since=since_norm,
         until=until_norm,
         country=country,
+        bookmarked_by=bookmarked_by,
     )
-    return {"total": total, "cases": cases, "mode": "keyword"}
+    return {"total": total, "cases": _annotate(cases), "mode": "keyword"}
 
 
 @router.get("/api/cases/by-country")
@@ -746,8 +905,10 @@ async def _load_case_bundle(db, case_id: int) -> tuple[dict, list[dict], list[di
 
 
 @router.get("/api/cases/{case_id}")
-async def api_case_detail(case_id: int, db=Depends(get_db)):
+async def api_case_detail(case_id: int, db=Depends(get_db), identity: dict = Depends(resolve_identity)):
     case, items, research_runs, related = await _load_case_bundle(db, case_id)
+    if identity["account_id"] is not None:
+        case["bookmarked"] = case_id in set(await get_bookmarked_case_ids(db, identity["account_id"]))
     return {"case": case, "items": items, "research_runs": research_runs, "related_cases": related}
 
 

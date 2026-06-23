@@ -9,6 +9,8 @@ from cybercrime_monitor.settings import settings as app_settings
 class _FakeScheduler:
     """Stand-in for APScheduler so route tests don't start background jobs."""
 
+    running = True
+
     def start(self):
         pass
 
@@ -17,6 +19,9 @@ class _FakeScheduler:
 
     def get_job(self, job_id):
         return None
+
+    def get_jobs(self):
+        return []
 
 
 @pytest_asyncio.fixture

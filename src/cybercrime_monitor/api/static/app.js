@@ -787,6 +787,11 @@ function handleLiveItem(item) {
 // trigger. It lives in the header toolbar so it is reachable from every tab.
 const ADMIN_TOKEN_KEY = 'mm_admin_token';
 let adminEnabledServerSide = true;
+// Server-validated identity for the token currently in the field — set from
+// /api/status' auth.role (see updateQueuesPanel). Unlike hasAdminToken()
+// below (which only knows "a token is typed"), this reflects whether the
+// server actually accepted it: 'admin' | 'user' | 'none'.
+let currentRole = 'none';
 
 function initAdminAuth() {
   adminTokenInput.value = localStorage.getItem(ADMIN_TOKEN_KEY) || '';
@@ -795,6 +800,7 @@ function initAdminAuth() {
     updateAdminUiState();
   });
   updateAdminUiState();
+  initAccountCreation();
 }
 
 function adminHeaders() {
@@ -807,6 +813,19 @@ function hasAdminToken() {
 
 function updateAdminUiState() {
   const token = adminTokenInput.value.trim();
+
+  // Investigate is entirely admin-gated server-side, so there's no point
+  // showing the tab to anyone whose token doesn't actually validate as
+  // admin — bounce off it if it's currently selected and just disappeared.
+  const investigateBtn = document.getElementById('tab-btn-settings');
+  const showInvestigate = currentRole === 'admin';
+  investigateBtn.classList.toggle('hidden', !showInvestigate);
+  if (!showInvestigate && investigateBtn.classList.contains('active')) {
+    document.querySelector('.tab[data-tab="landscape"]').click();
+  }
+
+  document.getElementById('case-bookmark-only-row').classList.toggle('hidden', currentRole === 'none');
+
   if (!adminEnabledServerSide) {
     adminTokenInput.classList.add('hidden');
     adminTokenStatus.classList.add('hidden');
@@ -814,15 +833,111 @@ function updateAdminUiState() {
     return;
   }
   adminTokenInput.classList.remove('hidden');
-  if (token) {
+  if (currentRole === 'admin') {
     adminTokenStatus.textContent = '🔒 admin';
     adminTokenStatus.classList.remove('hidden', 'error');
+  } else if (currentRole === 'user') {
+    adminTokenStatus.textContent = '👤 account';
+    adminTokenStatus.classList.remove('hidden', 'error');
+  } else if (token) {
+    adminTokenStatus.textContent = 'Invalid access key';
+    adminTokenStatus.classList.remove('hidden');
+    adminTokenStatus.classList.add('error');
   } else {
-    adminTokenStatus.textContent = 'Admin token required for research/investigate';
+    adminTokenStatus.textContent = 'No access key set';
     adminTokenStatus.classList.remove('hidden');
     adminTokenStatus.classList.add('error');
   }
-  document.getElementById('show-filtered-row').classList.toggle('hidden', !token);
+  document.getElementById('show-filtered-row').classList.toggle('hidden', currentRole !== 'admin');
+}
+
+// ── Self-service account creation (proof-of-work gated) ──────────────────────
+// POST /api/accounts mints a high-entropy access key after the client solves
+// a small proof-of-work challenge (api/routes.py's account_pow_bits) — there
+// is no password, no email, nothing to brute-force or inject; the only cost
+// of creating one is the PoW solve time plus the dedicated per-IP rate limit
+// on the endpoint. The key is shown exactly once (account-key-overlay) since
+// only its hash is ever stored server-side.
+function initAccountCreation() {
+  document.getElementById('account-create-btn').addEventListener('click', createAccount);
+  document.getElementById('account-key-close').addEventListener('click', closeAccountKeyOverlay);
+  document.getElementById('account-key-use').addEventListener('click', () => {
+    const key = document.getElementById('account-key-value').textContent;
+    adminTokenInput.value = key;
+    localStorage.setItem(ADMIN_TOKEN_KEY, key);
+    updateAdminUiState();
+    updateQueuesPanel();
+    closeAccountKeyOverlay();
+  });
+  document.getElementById('account-key-copy').addEventListener('click', async () => {
+    const key = document.getElementById('account-key-value').textContent;
+    try {
+      await navigator.clipboard.writeText(key);
+    } catch (e) {
+      console.error('Clipboard copy failed', e);
+    }
+  });
+}
+
+function closeAccountKeyOverlay() {
+  document.getElementById('account-key-overlay').classList.add('hidden');
+}
+
+async function createAccount() {
+  const overlay = document.getElementById('account-key-overlay');
+  const working = document.getElementById('account-key-working');
+  const errBox = document.getElementById('account-key-error');
+  const result = document.getElementById('account-key-result');
+  overlay.classList.remove('hidden');
+  working.classList.remove('hidden');
+  errBox.classList.add('hidden');
+  result.classList.add('hidden');
+  try {
+    const challenge = await api('/api/accounts/challenge');
+    const solution = await solvePow(challenge.nonce, challenge.bits);
+    const data = await api('/api/accounts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...challenge, solution }),
+    });
+    document.getElementById('account-key-value').textContent = data.access_key;
+    result.classList.remove('hidden');
+  } catch (e) {
+    errBox.textContent = (e.body && e.body.detail) || String(e);
+    errBox.classList.remove('hidden');
+  } finally {
+    working.classList.add('hidden');
+  }
+}
+
+// Brute-force search for a solution string whose sha256("{nonce}:{solution}")
+// has `bits` leading zero bits — verified server-side the same way (routes.py's
+// _leading_zero_bits). Runs on the main thread in small async-yielding
+// batches; at the default ~20 bits this is a ~1-3s solve, acceptable for a
+// one-time action without the complexity of a Web Worker.
+async function solvePow(nonce, bits) {
+  const fullBytes = Math.floor(bits / 8);
+  const remBits = bits % 8;
+  let counter = 0;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    for (let i = 0; i < 2000; i++, counter++) {
+      const candidate = String(counter);
+      const digest = new Uint8Array(
+        await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${nonce}:${candidate}`))
+      );
+      let ok = true;
+      for (let b = 0; b < fullBytes; b++) {
+        if (digest[b] !== 0) { ok = false; break; }
+      }
+      if (ok && remBits > 0) {
+        ok = (digest[fullBytes] >> (8 - remBits)) === 0;
+      }
+      if (ok) return candidate;
+    }
+    // Yield to the event loop between batches so the UI stays responsive.
+    await new Promise(r => setTimeout(r, 0));
+  }
 }
 
 // ── Investigate tab ────────────────────────────────────────────────────────
@@ -1518,7 +1633,7 @@ const casesState = {
   pageSize: 50,
   hasMore: false,
   selectedId: null,
-  filters: { search: '', searchMode: 'keyword', significance: '', kevOnly: false, crimeType: '', since: '', until: '', cveId: '', ioc: '', country: '' },
+  filters: { search: '', searchMode: 'keyword', significance: '', kevOnly: false, crimeType: '', since: '', until: '', cveId: '', ioc: '', country: '', bookmarked: false },
 };
 const CASE_FILTERS_DEFAULT = { ...casesState.filters };
 
@@ -1529,6 +1644,7 @@ const caseSearchInput  = document.getElementById('case-search-input');
 const caseSearchModeToggle = document.getElementById('case-search-mode-toggle');
 const caseSearchModeHint   = document.getElementById('case-search-mode-hint');
 const caseKevOnlyCb    = document.getElementById('case-kev-only');
+const caseBookmarkOnlyCb = document.getElementById('case-bookmark-only');
 const caseSignificanceSelect = document.getElementById('case-significance-select');
 const caseCrimeTypeSelect    = document.getElementById('case-crime-type-select');
 const caseCountrySelect      = document.getElementById('case-country-select');
@@ -1565,6 +1681,10 @@ function initCases() {
     casesState.filters.kevOnly = caseKevOnlyCb.checked;
     applyCaseFilters();
   });
+  caseBookmarkOnlyCb.addEventListener('change', () => {
+    casesState.filters.bookmarked = caseBookmarkOnlyCb.checked;
+    applyCaseFilters();
+  });
   caseSignificanceSelect.addEventListener('change', () => {
     casesState.filters.significance = caseSignificanceSelect.value;
     applyCaseFilters();
@@ -1589,6 +1709,7 @@ function initCases() {
     casesState.filters = { ...CASE_FILTERS_DEFAULT };
     caseSearchInput.value = '';
     caseKevOnlyCb.checked = false;
+    caseBookmarkOnlyCb.checked = false;
     caseSignificanceSelect.value = '';
     caseCrimeTypeSelect.value = '';
     caseCountrySelect.value = '';
@@ -1628,6 +1749,7 @@ function caseQueryParams(extra = {}) {
   if (casesState.filters.until) params.set('until', casesState.filters.until);
   if (casesState.filters.cveId) params.set('cve_id', casesState.filters.cveId);
   if (casesState.filters.ioc) params.set('ioc', casesState.filters.ioc);
+  if (casesState.filters.bookmarked) params.set('bookmarked', 'true');
   Object.entries(extra).forEach(([k, v]) => params.set(k, v));
   return params.toString();
 }
@@ -1640,6 +1762,7 @@ function pivotCasesByIndicator(kind, value) {
   casesState.filters = { ...CASE_FILTERS_DEFAULT, [kind]: value };
   caseSearchInput.value = '';
   caseKevOnlyCb.checked = false;
+  caseBookmarkOnlyCb.checked = false;
   caseSignificanceSelect.value = '';
   caseCrimeTypeSelect.value = '';
   caseCountrySelect.value = '';
@@ -1667,7 +1790,13 @@ function updateIndicatorPivotBanner() {
 async function applyCaseFilters() {
   casesState.offset = 0;
   try {
-    const data = await api('/api/cases?' + caseQueryParams({ limit: casesState.pageSize, offset: 0 }));
+    // adminHeaders() so the server can annotate each case's bookmarked
+    // state (and apply the bookmarked-only filter) for the caller's
+    // identity — see api/routes.py's api_cases.
+    const data = await api(
+      '/api/cases?' + caseQueryParams({ limit: casesState.pageSize, offset: 0 }),
+      { headers: adminHeaders() }
+    );
     if (data.semantic_unavailable) showSemanticUnavailableHint(caseSearchModeHint);
     casesState.cases = data.cases;
     casesState.hasMore = data.cases.length === casesState.pageSize && data.total > casesState.pageSize;
@@ -1681,7 +1810,10 @@ async function applyCaseFilters() {
 async function loadMoreCases() {
   casesState.offset += casesState.pageSize;
   try {
-    const data = await api('/api/cases?' + caseQueryParams({ limit: casesState.pageSize, offset: casesState.offset }));
+    const data = await api(
+      '/api/cases?' + caseQueryParams({ limit: casesState.pageSize, offset: casesState.offset }),
+      { headers: adminHeaders() }
+    );
     casesState.cases = casesState.cases.concat(data.cases);
     casesState.hasMore = data.cases.length === casesState.pageSize;
     renderCasesList();
@@ -1925,6 +2057,10 @@ function buildCaseCard(c) {
   time.title = 'last corroborating report';
   meta.appendChild(time);
 
+  if (currentRole !== 'none') {
+    meta.appendChild(buildBookmarkToggle(c));
+  }
+
   card.appendChild(meta);
 
   const titleDiv = document.createElement('div');
@@ -1947,13 +2083,50 @@ function buildCaseCard(c) {
   return card;
 }
 
+// Star toggle for bookmarking a case (POST/DELETE /api/cases/{id}/bookmark)
+// — shared by the case-list card and the case-detail header. Requires any
+// validated identity (admin or self-service account); hidden entirely for
+// role 'none' by callers. Stops propagation so clicking the star on a card
+// doesn't also trigger selectCase.
+function buildBookmarkToggle(c) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'bookmark-toggle tag-chip' + (c.bookmarked ? ' bookmark-active' : '');
+  btn.textContent = c.bookmarked ? '★' : '☆';
+  btn.title = c.bookmarked ? 'Remove bookmark' : 'Bookmark this case';
+  btn.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    btn.disabled = true;
+    try {
+      await fetch(`/api/cases/${c.id}/bookmark`, {
+        method: c.bookmarked ? 'DELETE' : 'POST',
+        headers: adminHeaders(),
+      });
+      c.bookmarked = !c.bookmarked;
+      btn.textContent = c.bookmarked ? '★' : '☆';
+      btn.title = c.bookmarked ? 'Remove bookmark' : 'Bookmark this case';
+      btn.classList.toggle('bookmark-active', c.bookmarked);
+      // "Bookmarked only" view should drop a case the instant it's
+      // unbookmarked rather than waiting for the next filter round-trip.
+      if (casesState.filters.bookmarked && !c.bookmarked) {
+        applyCaseFilters();
+      }
+    } catch (e2) {
+      console.error('Bookmark toggle failed', e2);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+  return btn;
+}
+
 async function selectCase(id) {
   casesState.selectedId = id;
   document.querySelectorAll('[data-case-id]').forEach(el => {
     el.classList.toggle('selected', Number(el.dataset.caseId) === id);
   });
   try {
-    const { case: c, items, research_runs, related_cases } = await api(`/api/cases/${id}`);
+    const { case: c, items, research_runs, related_cases } = await api(`/api/cases/${id}`, { headers: adminHeaders() });
     renderCaseDetail(c, items, research_runs || [], related_cases || []);
   } catch (e) {
     console.error('Failed to load case detail', e);
@@ -2013,6 +2186,9 @@ function renderCaseDetail(c, items, researchRuns, relatedCases) {
     chip.className = 'tag-chip prio-' + c.significance;
     chip.textContent = c.significance.toUpperCase();
     header.appendChild(chip);
+  }
+  if (currentRole !== 'none') {
+    header.appendChild(buildBookmarkToggle(c));
   }
   const exportLink = document.createElement('a');
   exportLink.className = 'link-button';
@@ -2321,7 +2497,10 @@ function initQueuesPanel() {
 
 async function updateQueuesPanel() {
   try {
-    const s = await api('/api/status');
+    // Sent with adminHeaders() so the server resolves *our* token's actual
+    // role (s.auth.role) — admin.enabled only says a token is configured,
+    // not that ours is valid (see api/routes.py's resolve_identity).
+    const s = await api('/api/status', { headers: adminHeaders() });
     renderQueuesPanel(s);
   } catch (e) {
     console.error('Failed to load status', e);
@@ -2330,6 +2509,7 @@ async function updateQueuesPanel() {
 
 function renderQueuesPanel(s) {
   adminEnabledServerSide = !!(s.admin && s.admin.enabled);
+  currentRole = (s.auth && s.auth.role) || 'none';
   updateAdminUiState();
 
   semanticSearchEnabled = !!(s.semantic_search && s.semantic_search.enabled);
