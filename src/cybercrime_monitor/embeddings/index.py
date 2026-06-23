@@ -161,6 +161,8 @@ async def get_vector(conn, kind: str, ref_id: int) -> list[float] | None:
     raw = rows[0]["embedding"]
     # Inverse of sqlite_vec.serialize_float32 (pack("%sf" % len(vector), ...))
     # — native byte order/size, same process family that wrote it.
+    if len(raw) % 4 != 0:
+        return None
     count = len(raw) // 4
     return list(struct.unpack("%sf" % count, raw))
 

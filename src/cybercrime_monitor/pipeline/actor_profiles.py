@@ -27,15 +27,20 @@ async def refresh_actor_profiles(conn) -> int:
     attributed to that actor. Returns the number of actor profiles written."""
     rows = await db.get_attributed_cases_for_actor_profiles(conn)
 
+    # Materialized table: clear it first so actors that lost all their
+    # attributed cases (deleted/re-attributed) don't linger forever.
+    await conn.execute("DELETE FROM actor_profiles")
+
     groups: dict[str, dict] = {}
     for row in rows:
         key = row["attribution"].strip().lower()
         if not key:
             continue
+        display_name = row["attribution"].strip()
         g = groups.setdefault(
             key,
             {
-                "display_name": row["attribution"].strip(),
+                "display_name": display_name,
                 "cve_ids": set(),
                 "mitre_techniques": set(),
                 "sectors": set(),
@@ -47,6 +52,11 @@ async def refresh_actor_profiles(conn) -> int:
                 "last_seen": None,
             },
         )
+        # Rows arrive in no guaranteed order — pick a deterministic casing
+        # (lexicographically smallest, case-insensitively) so the displayed
+        # label doesn't flap between refreshes.
+        if display_name.casefold() < g["display_name"].casefold():
+            g["display_name"] = display_name
         g["cve_ids"].update(row["cve_ids"])
         g["mitre_techniques"].update(row["mitre_techniques"])
         g["iocs"].update(row["iocs"])
@@ -57,9 +67,9 @@ async def refresh_actor_profiles(conn) -> int:
         if row["damaged_party"]:
             g["victims"].add(row["damaged_party"])
         g["case_ids"].append(row["id"])
-        if g["first_seen"] is None or (row["first_seen"] or "") < g["first_seen"]:
+        if row["first_seen"] and (g["first_seen"] is None or row["first_seen"] < g["first_seen"]):
             g["first_seen"] = row["first_seen"]
-        if g["last_seen"] is None or (row["last_seen"] or "") > g["last_seen"]:
+        if row["last_seen"] and (g["last_seen"] is None or row["last_seen"] > g["last_seen"]):
             g["last_seen"] = row["last_seen"]
 
     for actor, g in groups.items():
@@ -79,6 +89,5 @@ async def refresh_actor_profiles(conn) -> int:
             first_seen=g["first_seen"],
             last_seen=g["last_seen"],
         )
-    if groups:
-        await conn.commit()
+    await conn.commit()
     return len(groups)

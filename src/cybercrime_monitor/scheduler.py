@@ -467,8 +467,11 @@ def build_scheduler(db_conn, sse_broadcaster) -> AsyncIOScheduler:
             elif classification == "marginal":
                 factor = settings.adaptive_poll_marginal_factor
             else:
-                # "dead" sources are heal/prune's concern, not a polling-speed one.
-                continue
+                # "dead" sources are heal/prune's concern, not a polling-speed one —
+                # but if this source was previously sped up under a different
+                # classification, revert it to the configured base interval
+                # rather than leaving it stuck at the old adaptive interval.
+                factor = 1.0
             base = src.get("interval_seconds", 600)
             new_interval = int(round(base * factor))
             new_interval = max(
