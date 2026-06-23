@@ -14,6 +14,7 @@ from ..embeddings import backend as embed_backend
 from ..embeddings import index as vec_index
 from ..llm import health as llm_health
 from ..db import (
+    burn_rate,
     count_cases,
     count_cases_needing_research,
     count_heal_proposals_by_status,
@@ -39,6 +40,7 @@ from ..db import (
     list_investigations,
     log_ai_activity,
     merge_cases,
+    token_timeseries,
     stats_cases_by_actor,
     stats_cases_by_country,
     stats_cases_by_sector,
@@ -553,6 +555,19 @@ async def api_status(request: Request, db=Depends(get_db)):
             "consecutive_errors": ih.consecutive_errors,
             "queued": await count_queued_investigations(db),
         },
+    }
+
+
+@router.get("/api/tokens")
+async def api_tokens(db=Depends(get_db)):
+    """Real (measured, not estimated) LLM token burn rate — see db.token_usage's
+    schema comment. Read-only and public-safe (aggregate counts only), same
+    spirit as /api/status. Powers the Activity tab's burn-rate widget."""
+    return {
+        "burn": await burn_rate(db, window_seconds=settings.burn_rate_window_seconds),
+        "timeseries": await token_timeseries(
+            db, window_seconds=settings.burn_rate_window_seconds, bucket_seconds=300
+        ),
     }
 
 

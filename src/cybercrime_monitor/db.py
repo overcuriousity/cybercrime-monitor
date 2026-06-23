@@ -416,6 +416,34 @@ CREATE TABLE IF NOT EXISTS ai_activity (
 CREATE INDEX IF NOT EXISTS idx_ai_activity_ts ON ai_activity(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_ai_activity_subsystem ON ai_activity(subsystem);
 
+-- Measured (not estimated) LLM token usage, from two sources: direct
+-- OpenAI-compatible calls in llm/backend.py (the response's own `usage`
+-- field — exact input/output counts) and hermes-agent CLI runs, whose token
+-- counts are tracked by hermes itself in its own ~/.hermes/state.db and
+-- copied in here by hermes/usage_ingest.py. This table is the sole backing
+-- store for the Activity tab's real-time tokens/hour burn-rate widget (see
+-- GET /api/tokens) — no estimation/heuristic path exists anywhere.
+-- hermes_session_id is set only for hermes-agent rows and is the idempotency
+-- key the ingester upserts on (a session's counts can grow across polls
+-- while it's still running).
+CREATE TABLE IF NOT EXISTS token_usage (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                 TEXT NOT NULL, -- wall-clock ISO timestamp of the call/session start
+    source             TEXT NOT NULL, -- 'direct-llm' | 'hermes-agent'
+    subsystem          TEXT, -- classifier | correlator (direct-llm only; NULL for hermes-agent)
+    model              TEXT,
+    input_tokens       INTEGER NOT NULL DEFAULT 0,
+    output_tokens      INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd           REAL, -- nullable — only populated when the source reports a real cost
+    hermes_session_id  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_token_usage_ts ON token_usage(ts);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_token_usage_hermes_session
+    ON token_usage(hermes_session_id) WHERE hermes_session_id IS NOT NULL;
+
 -- Investigator-submitted targeted-research briefs (POST /api/investigations,
 -- see research/investigate.py). One row per submission. case_id is set only
 -- if Hermes reported a confident match and findings were integrated — most
@@ -1393,6 +1421,162 @@ async def list_ai_activity(
             d["detail"] = {}
         events.append(d)
     return {"total": total, "events": events}
+
+
+# ── Token usage / burn-rate ──────────────────────────────────────────────────
+# See token_usage's schema comment above — direct-llm rows are written
+# per-call by llm/backend.py, hermes-agent rows are upserted by
+# hermes/usage_ingest.py from hermes' own state.db.
+
+async def log_token_usage(
+    conn: aiosqlite.Connection,
+    *,
+    source: str,
+    model: str | None,
+    input_tokens: int,
+    output_tokens: int,
+    subsystem: str | None = None,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    cost_usd: float | None = None,
+) -> None:
+    """Insert one direct-llm usage row and commit. Never raises — token
+    accounting is observability, not a path that should be able to take down
+    extraction/correlation if it misbehaves."""
+    try:
+        await conn.execute(
+            """
+            INSERT INTO token_usage
+                (ts, source, subsystem, model, input_tokens, output_tokens,
+                 cache_read_tokens, cache_write_tokens, cost_usd)
+            VALUES
+                (:ts, :source, :subsystem, :model, :input_tokens, :output_tokens,
+                 :cache_read_tokens, :cache_write_tokens, :cost_usd)
+            """,
+            {
+                "ts": _utcnow().isoformat(),
+                "source": source,
+                "subsystem": subsystem,
+                "model": model,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cache_read_tokens": cache_read_tokens,
+                "cache_write_tokens": cache_write_tokens,
+                "cost_usd": cost_usd,
+            },
+        )
+        await conn.commit()
+    except Exception as exc:
+        log.warning("[token_usage] failed to log direct-llm usage: %s", exc)
+
+
+async def upsert_hermes_token_usage(
+    conn: aiosqlite.Connection,
+    *,
+    session_id: str,
+    ts: str,
+    model: str | None,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    cost_usd: float | None = None,
+) -> None:
+    """Insert or refresh one hermes-agent session's token usage, keyed on
+    hermes' own session id — a session still running when the ingester polls
+    has growing counts, so this corrects the row in place rather than
+    duplicating it (same idea as upsert_extraction)."""
+    await conn.execute(
+        """
+        INSERT INTO token_usage
+            (ts, source, subsystem, model, input_tokens, output_tokens,
+             cache_read_tokens, cache_write_tokens, cost_usd, hermes_session_id)
+        VALUES
+            (:ts, 'hermes-agent', NULL, :model, :input_tokens, :output_tokens,
+             :cache_read_tokens, :cache_write_tokens, :cost_usd, :session_id)
+        ON CONFLICT(hermes_session_id) WHERE hermes_session_id IS NOT NULL DO UPDATE SET
+            model=excluded.model, input_tokens=excluded.input_tokens,
+            output_tokens=excluded.output_tokens, cache_read_tokens=excluded.cache_read_tokens,
+            cache_write_tokens=excluded.cache_write_tokens, cost_usd=excluded.cost_usd
+        """,
+        {
+            "ts": ts,
+            "model": model,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_write_tokens": cache_write_tokens,
+            "cost_usd": cost_usd,
+            "session_id": session_id,
+        },
+    )
+    await conn.commit()
+
+
+async def max_ingested_hermes_started_at(conn: aiosqlite.Connection) -> str | None:
+    """High-water mark for hermes/usage_ingest.py — the most recent ts among
+    already-ingested hermes-agent rows, so each poll only re-scans hermes'
+    state.db from there (minus a small overlap the caller applies, to catch
+    in-progress sessions whose counts grew since the last poll)."""
+    rows = await conn.execute_fetchall(
+        "SELECT MAX(ts) AS m FROM token_usage WHERE source = 'hermes-agent'"
+    )
+    return rows[0]["m"] if rows and rows[0]["m"] else None
+
+
+async def burn_rate(conn: aiosqlite.Connection, *, window_seconds: int) -> dict:
+    """Real (measured) token burn rate over the trailing window — tokens/hour
+    plus total input/output counts. Powers GET /api/tokens and the Activity
+    tab's burn-rate widget. No source/model breakdown: the UI dropped that
+    panel (hermes' fallback chain makes per-model attribution misleading) and
+    there's no other consumer, so it isn't computed here either."""
+    since = (_utcnow() - timedelta(seconds=window_seconds)).isoformat()
+    rows = await conn.execute_fetchall(
+        """
+        SELECT SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens,
+               SUM(COALESCE(cost_usd, 0)) AS cost_usd,
+               SUM(CASE WHEN cost_usd IS NOT NULL THEN 1 ELSE 0 END) AS n_cost
+        FROM token_usage
+        WHERE ts >= :since
+        """,
+        {"since": since},
+    )
+    r = rows[0] if rows else None
+    total_input = (r["input_tokens"] or 0) if r else 0
+    total_output = (r["output_tokens"] or 0) if r else 0
+    total_cost = (r["cost_usd"] or 0.0) if r else 0.0
+    have_cost = bool(r and r["n_cost"])
+
+    total_tokens = total_input + total_output
+    hours = window_seconds / 3600.0
+    return {
+        "window_seconds": window_seconds,
+        "tokens_per_hour": round(total_tokens / hours, 1) if hours > 0 else 0,
+        "input_tokens": total_input,
+        "output_tokens": total_output,
+        "cost_usd_per_hour": round(total_cost / hours, 4) if have_cost and hours > 0 else None,
+    }
+
+
+async def token_timeseries(conn: aiosqlite.Connection, *, window_seconds: int, bucket_seconds: int) -> list[dict]:
+    """Bucketed token totals over the trailing window, for the Activity
+    tab's burn-rate sparkline. Bucketing happens in Python (SQLite has no
+    native epoch-bucket function over an ISO TEXT column here) — fine at this
+    volume since the window is bounded."""
+    since_dt = _utcnow() - timedelta(seconds=window_seconds)
+    rows = await conn.execute_fetchall(
+        "SELECT ts, input_tokens, output_tokens FROM token_usage WHERE ts >= :since ORDER BY ts",
+        {"since": since_dt.isoformat()},
+    )
+    buckets: dict[int, int] = {}
+    for r in rows:
+        try:
+            t = datetime.fromisoformat(r["ts"])
+        except ValueError:
+            continue
+        bucket = int(t.timestamp() // bucket_seconds) * bucket_seconds
+        buckets[bucket] = buckets.get(bucket, 0) + (r["input_tokens"] or 0) + (r["output_tokens"] or 0)
+    return [{"t": t, "tokens": tokens} for t, tokens in sorted(buckets.items())]
 
 
 # ── Source health persistence ────────────────────────────────────────────────

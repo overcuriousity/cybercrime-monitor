@@ -126,7 +126,7 @@ async def _extract_batch(db_conn) -> int:
     # latency roughly N-fold, which matters because get_unextracted_items
     # serves LIFO: a slow per-item loop is exactly what lets a sustained
     # ingest burst starve older items indefinitely.
-    extractions = await backend.extract_batch(batch)
+    extractions = await backend.extract_batch(batch, conn=db_conn)
 
     critical_count = 0
     false_positive_count = 0

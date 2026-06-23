@@ -305,6 +305,24 @@ def build_scheduler(db_conn, sse_broadcaster) -> AsyncIOScheduler:
         )
         log.info("Scheduled CISA KEV catalog refresh job")
 
+    if settings.token_ingest_interval_seconds > 0:
+        from .hermes.usage_ingest import ingest_hermes_token_usage
+
+        scheduler.add_job(
+            ingest_hermes_token_usage,
+            trigger=IntervalTrigger(seconds=settings.token_ingest_interval_seconds),
+            id="_token_ingest",
+            name="hermes-agent token usage ingest",
+            next_run_time=_offset_now(20),
+            misfire_grace_time=settings.token_ingest_interval_seconds,
+            max_instances=1,
+            coalesce=True,
+            kwargs={"conn": db_conn},
+        )
+        log.info("Scheduled hermes-agent token usage ingest job")
+    else:
+        log.info("hermes-agent token usage ingest disabled (token_ingest_interval_seconds <= 0)")
+
     if settings.hermes_research_interval_seconds > 0:
         from .research.agent import run_research_batch
 
