@@ -2278,7 +2278,15 @@ async def merge_cases(
 
 
 async def get_case_by_id(conn: aiosqlite.Connection, case_id: int) -> dict | None:
-    rows = await conn.execute_fetchall("SELECT * FROM cases WHERE id = :id", {"id": case_id})
+    rows = await conn.execute_fetchall(
+        "SELECT id, case_key, title, summary, crime_type, attribution, attribution_confidence, "
+        "damaged_party, damaged_party_sector, damaged_party_country, significance, significance_score, "
+        "status, cve_ids, in_kev, first_seen, last_seen, source_count, extra, iocs, "
+        "research_requested_at, cvss_max, cwe_ids, epss_max, mitre_techniques, "
+        "priority_boost, priority_boost_at, requested_by "
+        "FROM cases WHERE id = :id",
+        {"id": case_id},
+    )
     return dict(rows[0]) if rows else None
 
 
@@ -2768,7 +2776,8 @@ async def apply_research_findings(
 
 async def get_research_runs_for_case(conn: aiosqlite.Connection, case_id: int) -> list[dict]:
     rows = await conn.execute_fetchall(
-        "SELECT * FROM research_runs WHERE case_id = :case_id ORDER BY started_at DESC",
+        "SELECT id, case_id, status, findings, sources, error, model, started_at, finished_at "
+        "FROM research_runs WHERE case_id = :case_id ORDER BY started_at DESC",
         {"case_id": case_id},
     )
     out = []
@@ -2834,7 +2843,8 @@ async def get_queued_investigations(conn: aiosqlite.Connection, *, limit: int) -
     row is skipped until next_retry_at elapses — see requeue_investigation."""
     rows = await conn.execute_fetchall(
         """
-        SELECT * FROM investigations
+        SELECT id, brief, status, created_at, finished_at, case_id, findings, error, attempts, next_retry_at
+        FROM investigations
         WHERE status IN ('queued', 'running')
           AND (next_retry_at IS NULL OR next_retry_at <= :now)
         ORDER BY id ASC LIMIT :limit
@@ -2916,7 +2926,7 @@ async def finish_investigation(
 
 async def list_investigations(conn: aiosqlite.Connection, *, limit: int = 50) -> list[dict]:
     rows = await conn.execute_fetchall(
-        "SELECT * FROM investigations ORDER BY id DESC LIMIT :limit", {"limit": limit}
+        "SELECT id, brief, status, created_at, finished_at, case_id, findings, error, attempts, next_retry_at FROM investigations ORDER BY id DESC LIMIT :limit", {"limit": limit}
     )
     out = []
     for r in rows:
@@ -2928,7 +2938,7 @@ async def list_investigations(conn: aiosqlite.Connection, *, limit: int = 50) ->
 
 async def get_investigation(conn: aiosqlite.Connection, investigation_id: int) -> dict | None:
     rows = await conn.execute_fetchall(
-        "SELECT * FROM investigations WHERE id = :id", {"id": investigation_id}
+        "SELECT id, brief, status, created_at, finished_at, case_id, findings, error, attempts, next_retry_at FROM investigations WHERE id = :id", {"id": investigation_id}
     )
     if not rows:
         return None
@@ -3939,7 +3949,12 @@ async def get_cases_by_ids(conn: aiosqlite.Connection, ids: list[int]) -> list[d
         return []
     placeholders = ",".join("?" * len(ids))
     rows = await conn.execute_fetchall(
-        f"SELECT * FROM cases WHERE id IN ({placeholders})", list(ids)
+        f"SELECT id, case_key, title, summary, crime_type, attribution, attribution_confidence, "
+        "damaged_party, damaged_party_sector, damaged_party_country, significance, significance_score, "
+        "status, cve_ids, in_kev, first_seen, last_seen, source_count, extra, iocs, "
+        "research_requested_at, cvss_max, cwe_ids, epss_max, mitre_techniques, "
+        "priority_boost, priority_boost_at, requested_by "
+        f"FROM cases WHERE id IN ({placeholders})", list(ids)
     )
     out = []
     for r in rows:
@@ -4047,7 +4062,7 @@ async def list_campaigns(conn: aiosqlite.Connection) -> list[dict]:
 async def get_campaign(conn: aiosqlite.Connection, campaign_id: int) -> dict | None:
     """Campaign detail with decoded JSON fields and member case rows."""
     rows = await conn.execute_fetchall(
-        "SELECT * FROM campaigns WHERE id = :id", {"id": campaign_id}
+        "SELECT id, campaign_key, title, summary, case_ids, case_count, dominant_actor, crime_types, sectors, countries, cve_ids, iocs, in_kev, significance, first_seen, last_seen, max_link_score, computed_at FROM campaigns WHERE id = :id", {"id": campaign_id}
     )
     if not rows:
         return None

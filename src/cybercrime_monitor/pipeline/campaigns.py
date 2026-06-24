@@ -50,9 +50,10 @@ class _UnionFind:
             self._rank[rx] += 1
 
 
-def _build_components(edges: list[dict]) -> dict[int, list[int]]:
+def _build_components(edges: list[dict]) -> tuple[dict[int, list[int]], dict[int, float]]:
     """Given edges [{case_a, case_b, score}, ...], return
-    {root_id: sorted([member_id, ...])} for components with ≥ 2 members."""
+    ({root_id: sorted([member_id, ...])}, {root_id: max_score}) for components
+    with >= 2 members."""
     uf = _UnionFind()
     for e in edges:
         uf.union(e["case_a"], e["case_b"])
@@ -68,7 +69,19 @@ def _build_components(edges: list[dict]) -> dict[int, list[int]]:
         root = uf.find(node_id)
         groups.setdefault(root, []).append(node_id)
 
-    return {k: sorted(v) for k, v in groups.items() if len(v) >= 2}
+    components = {k: sorted(v) for k, v in groups.items() if len(v) >= 2}
+
+    # Precompute per-component max edge scores in one pass over edges (O(|E|))
+    component_max_score: dict[int, float] = {}
+    for e in edges:
+        a, b, score = e["case_a"], e["case_b"], e["score"]
+        ra, rb = uf.find(a), uf.find(b)
+        # Both endpoints share the same root after union-find, but guard anyway
+        root = ra if ra in components else rb
+        if root in components:
+            component_max_score[root] = max(component_max_score.get(root, 0.0), score)
+
+    return components, component_max_score
 
 
 # ── Token-free title / summary derivation ────────────────────────────────────
@@ -146,16 +159,11 @@ async def refresh_campaigns(conn) -> int:
         await db.clear_campaigns(conn)
         return 0
 
-    components = _build_components(edges)
+    components, component_max_score = _build_components(edges)
     if not components:
-        log.info("[campaigns] no components ≥ 2 above score %.2f", settings.campaign_min_link_score)
+        log.info("[campaigns] no components >= 2 above score %.2f", settings.campaign_min_link_score)
         await db.clear_campaigns(conn)
         return 0
-
-    # Build an edge score lookup keyed (lo, hi) — same convention as case_links PK
-    edge_scores: dict[tuple[int, int], float] = {
-        (e["case_a"], e["case_b"]): e["score"] for e in edges
-    }
 
     # Bulk-fetch all member cases in one query
     all_member_ids = sorted({cid for members in components.values() for cid in members})
@@ -164,7 +172,7 @@ async def refresh_campaigns(conn) -> int:
     await db.clear_campaigns(conn)
 
     written = 0
-    for _root, member_ids in sorted(components.items()):
+    for root, member_ids in sorted(components.items()):
         member_cases = [all_cases[mid] for mid in member_ids if mid in all_cases]
         if len(member_cases) < 2:
             continue
@@ -220,14 +228,8 @@ async def refresh_campaigns(conn) -> int:
         case_keys = [c.get("case_key") or str(c["id"]) for c in member_cases]
         campaign_key = min(case_keys)
 
-        # Max link score among edges within this component
-        max_score = 0.0
-        for i, a in enumerate(member_ids):
-            for b in member_ids[i + 1:]:
-                lo, hi = (a, b) if a < b else (b, a)
-                s = edge_scores.get((lo, hi), 0.0)
-                if s > max_score:
-                    max_score = s
+        # Max link score was precomputed during the edge scan above
+        max_score = component_max_score.get(root, 0.0)
 
         crime_list = sorted(crime_types)
         sector_list = sorted(sectors)

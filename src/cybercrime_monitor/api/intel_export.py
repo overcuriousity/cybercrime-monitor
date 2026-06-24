@@ -529,9 +529,16 @@ def campaign_to_misp_event(
     tlp_tag = _TLP_TAGS.get(tlp.lower(), "tlp:amber")
     sig = campaign.get("significance", "info")
 
-    # Estimate a synthetic confidence from member count + significance
+    # Synthetic confidence: start from member count, but cap at the highest
+    # member case_export_confidence so a large cluster of low-confidence cases
+    # doesn't score artificially high.
     n = campaign.get("case_count", len(member_cases)) or 1
-    synthetic_confidence = min(100.0, 30.0 + n * 10.0)
+    base_confidence = min(100.0, 30.0 + n * 10.0)
+    max_member_confidence = max(
+        (case_export_confidence(c) for c in member_cases),
+        default=0.0,
+    )
+    synthetic_confidence = min(base_confidence, max_member_confidence)
 
     attributes: list[dict] = []
 
