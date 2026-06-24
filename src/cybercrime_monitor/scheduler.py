@@ -612,6 +612,35 @@ def build_scheduler(db_conn, sse_broadcaster) -> AsyncIOScheduler:
     )
     log.info("Scheduled case cross-correlation job")
 
+    if settings.campaign_refresh_interval_seconds > 0:
+        from .pipeline.campaigns import refresh_campaigns
+
+        async def _refresh_campaigns(conn) -> None:
+            if settings.campaign_refresh_interval_seconds <= 0:
+                return
+            try:
+                n = await refresh_campaigns(conn)
+                log.info("[campaigns] refreshed %d campaign(s)", n)
+            except Exception as exc:
+                log.error("[campaigns] refresh failed: %s", exc)
+
+        scheduler.add_job(
+            _refresh_campaigns,
+            trigger=IntervalTrigger(seconds=settings.campaign_refresh_interval_seconds),
+            id="_campaigns",
+            name="Machine-derived campaign clustering",
+            # Offset 80: runs after cross-correlation (offset 75) so case_links
+            # are already fresh when we build connected components.
+            next_run_time=_offset_now(80),
+            misfire_grace_time=settings.campaign_refresh_interval_seconds,
+            max_instances=1,
+            coalesce=True,
+            kwargs={"conn": db_conn},
+        )
+        log.info("Scheduled campaign clustering job")
+    else:
+        log.info("Campaign clustering disabled (campaign_refresh_interval_seconds <= 0)")
+
     return scheduler
 
 

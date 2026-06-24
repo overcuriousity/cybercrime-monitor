@@ -542,6 +542,41 @@ SELECT i.id AS item_id,
        COALESCE(e.false_positive, 0) AS false_positive
 FROM items i
 LEFT JOIN extractions e ON e.item_id = i.id;
+
+-- Machine-derived campaign clusters (roadmap #3, pipeline/campaigns.py) —
+-- connected-components over the case_links graph; refreshed by the campaigns
+-- scheduler job (mirrors actor_profiles' cadence/kill-switch pattern).
+-- campaign_key = lex-smallest member case_key (deterministic anchor).
+-- DELETE-then-insert on each refresh so disbanded clusters disappear.
+CREATE TABLE IF NOT EXISTS campaigns (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_key   TEXT NOT NULL UNIQUE,
+    title          TEXT NOT NULL,
+    summary        TEXT NOT NULL DEFAULT '',
+    case_ids       TEXT NOT NULL DEFAULT '[]',
+    case_count     INTEGER NOT NULL DEFAULT 0,
+    dominant_actor TEXT,
+    crime_types    TEXT NOT NULL DEFAULT '[]',
+    sectors        TEXT NOT NULL DEFAULT '[]',
+    countries      TEXT NOT NULL DEFAULT '[]',
+    cve_ids        TEXT NOT NULL DEFAULT '[]',
+    iocs           TEXT NOT NULL DEFAULT '[]',
+    in_kev         INTEGER NOT NULL DEFAULT 0,
+    significance   TEXT NOT NULL DEFAULT 'info',
+    first_seen     TEXT,
+    last_seen      TEXT,
+    max_link_score REAL NOT NULL DEFAULT 0.0,
+    computed_at    TEXT NOT NULL
+);
+
+-- O(1) reverse-lookup: which campaign does a case belong to?
+-- Used by the MISP single-case export to embed part-of-campaign RelatedEvent.
+CREATE TABLE IF NOT EXISTS case_campaign (
+    case_id     INTEGER PRIMARY KEY REFERENCES cases(id) ON DELETE CASCADE,
+    campaign_id INTEGER NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_case_campaign_campaign ON case_campaign(campaign_id);
 """
 
 
@@ -3805,6 +3840,257 @@ async def bump_case_significance_one_rung(conn: aiosqlite.Connection, *, case_id
     )
     await conn.commit()
     return True
+
+
+# ── Machine confidence signals (roadmap #2) ──────────────────────────────────
+# Batch helpers for api/intel_export.py's enriched case_export_confidence()
+# so the MISP feed path issues a constant number of DB queries regardless of
+# how many cases it scores (two batched SELECTs, not N per-case round-trips).
+
+async def get_case_feedback_signals(
+    conn: aiosqlite.Connection, case_ids: list[int]
+) -> dict[int, dict[str, dict[str, int]]]:
+    """Batch per-case verdict counts split by feedback origin ("human" / "agent").
+
+    Covers BOTH feedback paths:
+    - Direct case-level feedback  (feedback.case_id)
+    - Item-level feedback linked into the case via case_items
+      (feedback.item_id → case_items.item_id → case_items.case_id)
+
+    Returns {case_id: {"human": {verdict: count}, "agent": {verdict: count}}}.
+    Missing case_ids produce no entry (treat as no feedback — score neutral).
+    """
+    if not case_ids:
+        return {}
+    placeholders = ",".join("?" * len(case_ids))
+    rows = await conn.execute_fetchall(
+        f"""
+        SELECT f.case_id AS case_id, f.origin AS origin, f.verdict AS verdict, COUNT(*) AS n
+        FROM feedback f
+        WHERE f.case_id IN ({placeholders})
+        GROUP BY f.case_id, f.origin, f.verdict
+
+        UNION ALL
+
+        SELECT ci.case_id AS case_id, f.origin AS origin, f.verdict AS verdict, COUNT(*) AS n
+        FROM feedback f
+        JOIN case_items ci ON ci.item_id = f.item_id
+        WHERE ci.case_id IN ({placeholders}) AND f.item_id IS NOT NULL
+        GROUP BY ci.case_id, f.origin, f.verdict
+        """,
+        list(case_ids) + list(case_ids),
+    )
+    out: dict[int, dict[str, dict[str, int]]] = {}
+    for r in rows:
+        by_origin = out.setdefault(r["case_id"], {})
+        by_verdict = by_origin.setdefault(r["origin"], {})
+        by_verdict[r["verdict"]] = by_verdict.get(r["verdict"], 0) + r["n"]
+    return out
+
+
+async def get_case_false_positive_signals(
+    conn: aiosqlite.Connection, case_ids: list[int]
+) -> dict[int, dict[str, int]]:
+    """Batch per-case extraction false_positive counts.
+
+    Joins cases → case_items → items → extractions and counts how many
+    extractions are flagged false_positive vs. total.
+    Returns {case_id: {"item_count": n, "fp_count": m}}.
+    """
+    if not case_ids:
+        return {}
+    placeholders = ",".join("?" * len(case_ids))
+    rows = await conn.execute_fetchall(
+        f"""
+        SELECT ci.case_id AS case_id,
+               COUNT(*) AS item_count,
+               SUM(CASE WHEN COALESCE(e.false_positive, 0) = 1 THEN 1 ELSE 0 END) AS fp_count
+        FROM case_items ci
+        JOIN items i ON i.id = ci.item_id
+        LEFT JOIN extractions e ON e.item_id = i.id
+        WHERE ci.case_id IN ({placeholders})
+        GROUP BY ci.case_id
+        """,
+        list(case_ids),
+    )
+    return {r["case_id"]: {"item_count": r["item_count"], "fp_count": r["fp_count"]} for r in rows}
+
+
+# ── Campaign clustering helpers (roadmap #3) ──────────────────────────────────
+
+async def get_all_case_links(
+    conn: aiosqlite.Connection, *, min_score: float = 0.0
+) -> list[dict]:
+    """Unbounded edge reader for pipeline/campaigns.py's connected-components
+    pass. Reads the full case_links table above `min_score` — intentionally
+    NOT using get_case_links (which is per-node, bidirectional, and LIMIT 20).
+    Edges are stored case_a < case_b by convention so the graph is undirected."""
+    rows = await conn.execute_fetchall(
+        "SELECT case_a, case_b, score FROM case_links WHERE score >= :min_score",
+        {"min_score": min_score},
+    )
+    return [dict(r) for r in rows]
+
+
+async def get_cases_by_ids(conn: aiosqlite.Connection, ids: list[int]) -> list[dict]:
+    """Fetch case rows for a list of ids — thin reader for campaign aggregation.
+    JSON fields (cve_ids, iocs) are decoded."""
+    if not ids:
+        return []
+    placeholders = ",".join("?" * len(ids))
+    rows = await conn.execute_fetchall(
+        f"SELECT * FROM cases WHERE id IN ({placeholders})", list(ids)
+    )
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["cve_ids"] = json.loads(d["cve_ids"]) if d["cve_ids"] else []
+        d["iocs"] = json.loads(d["iocs"]) if d["iocs"] else []
+        out.append(d)
+    return out
+
+
+async def clear_campaigns(conn: aiosqlite.Connection) -> None:
+    """Delete all campaign rows (and cascade-delete case_campaign rows).
+    Called at the start of each refresh_campaigns pass before re-inserting."""
+    await conn.execute("DELETE FROM campaigns")
+    await conn.commit()
+
+
+async def save_campaign(
+    conn: aiosqlite.Connection,
+    *,
+    campaign_key: str,
+    title: str,
+    summary: str,
+    case_ids: list[int],
+    dominant_actor: str | None,
+    crime_types: list[str],
+    sectors: list[str],
+    countries: list[str],
+    cve_ids: list[str],
+    iocs: list[str],
+    in_kev: bool,
+    significance: str,
+    first_seen: str | None,
+    last_seen: str | None,
+    max_link_score: float,
+) -> int:
+    """Insert one campaign row and rebuild its case_campaign index entries.
+    Returns the new campaign id."""
+    cur = await conn.execute(
+        """
+        INSERT INTO campaigns (
+            campaign_key, title, summary, case_ids, case_count, dominant_actor,
+            crime_types, sectors, countries, cve_ids, iocs, in_kev, significance,
+            first_seen, last_seen, max_link_score, computed_at
+        ) VALUES (
+            :campaign_key, :title, :summary, :case_ids, :case_count, :dominant_actor,
+            :crime_types, :sectors, :countries, :cve_ids, :iocs, :in_kev, :significance,
+            :first_seen, :last_seen, :max_link_score, :computed_at
+        )
+        """,
+        {
+            "campaign_key": campaign_key,
+            "title": title,
+            "summary": summary,
+            "case_ids": json.dumps(case_ids),
+            "case_count": len(case_ids),
+            "dominant_actor": dominant_actor,
+            "crime_types": json.dumps(crime_types),
+            "sectors": json.dumps(sectors),
+            "countries": json.dumps(countries),
+            "cve_ids": json.dumps(cve_ids),
+            "iocs": json.dumps(iocs),
+            "in_kev": int(in_kev),
+            "significance": significance,
+            "first_seen": first_seen,
+            "last_seen": last_seen,
+            "max_link_score": max_link_score,
+            "computed_at": _utcnow().isoformat(),
+        },
+    )
+    campaign_id = cur.lastrowid
+    # Rebuild case_campaign reverse-lookup entries for this campaign.
+    for cid in case_ids:
+        await conn.execute(
+            """
+            INSERT OR REPLACE INTO case_campaign (case_id, campaign_id)
+            VALUES (:case_id, :campaign_id)
+            """,
+            {"case_id": cid, "campaign_id": campaign_id},
+        )
+    return campaign_id
+
+
+async def list_campaigns(conn: aiosqlite.Connection) -> list[dict]:
+    """All materialized campaigns, newest first (by last_seen then computed_at)."""
+    rows = await conn.execute_fetchall(
+        """
+        SELECT id, campaign_key, title, summary, case_count, dominant_actor,
+               crime_types, sectors, countries, cve_ids, in_kev, significance,
+               first_seen, last_seen, max_link_score, computed_at
+        FROM campaigns
+        ORDER BY COALESCE(last_seen, computed_at) DESC
+        """
+    )
+    out = []
+    for r in rows:
+        d = dict(r)
+        for f in ("crime_types", "sectors", "countries", "cve_ids"):
+            d[f] = json.loads(d[f]) if d[f] else []
+        d["in_kev"] = bool(d["in_kev"])
+        out.append(d)
+    return out
+
+
+async def get_campaign(conn: aiosqlite.Connection, campaign_id: int) -> dict | None:
+    """Campaign detail with decoded JSON fields and member case rows."""
+    rows = await conn.execute_fetchall(
+        "SELECT * FROM campaigns WHERE id = :id", {"id": campaign_id}
+    )
+    if not rows:
+        return None
+    d = dict(rows[0])
+    for f in ("case_ids", "crime_types", "sectors", "countries", "cve_ids", "iocs"):
+        d[f] = json.loads(d[f]) if d[f] else []
+    d["in_kev"] = bool(d["in_kev"])
+    # Fetch member cases for detail view
+    member_cases = await get_cases_by_ids(conn, d["case_ids"])
+    d["cases"] = member_cases
+    return d
+
+
+async def get_campaign_for_case(conn: aiosqlite.Connection, case_id: int) -> int | None:
+    """Return the campaign_id the given case belongs to, or None."""
+    rows = await conn.execute_fetchall(
+        "SELECT campaign_id FROM case_campaign WHERE case_id = :case_id",
+        {"case_id": case_id},
+    )
+    return rows[0]["campaign_id"] if rows else None
+
+
+async def get_campaign_key_for_cases(
+    conn: aiosqlite.Connection, case_ids: list[int]
+) -> dict[int, str]:
+    """Batch lookup: {case_id: campaign_key} for cases that belong to a campaign.
+
+    Used by the MISP export paths to attach campaign_id in a single query
+    rather than one per-case round-trip (O(1) query count regardless of N).
+    """
+    if not case_ids:
+        return {}
+    placeholders = ",".join("?" * len(case_ids))
+    rows = await conn.execute_fetchall(
+        f"""
+        SELECT cc.case_id, camp.campaign_key
+        FROM case_campaign cc
+        JOIN campaigns camp ON camp.id = cc.campaign_id
+        WHERE cc.case_id IN ({placeholders})
+        """,
+        list(case_ids),
+    )
+    return {r["case_id"]: r["campaign_key"] for r in rows}
 
 
 _PRIORITY_BOOST_EPSILON = 0.05

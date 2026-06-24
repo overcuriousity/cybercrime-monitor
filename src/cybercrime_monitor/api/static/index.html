@@ -327,6 +327,11 @@
         <!-- populated by renderEmergingPanels (Phase 3) -->
       </section>
 
+      <section id="landscape-campaigns-section" class="landscape-campaigns-section hidden">
+        <h3>Active campaigns <span class="hint" style="margin:0;">(click to open)</span></h3>
+        <div id="landscape-campaigns-list" class="campaign-list"></div>
+      </section>
+
       <section class="case-map-section">
         <div class="case-map-header">
           <h3>Victim countries</h3>
@@ -345,6 +350,14 @@
       <div class="overlay-panel">
         <button id="actor-profile-close" class="overlay-close" type="button" aria-label="Close">&times;</button>
         <div id="actor-profile-content"></div>
+      </div>
+    </div>
+
+    <!-- Campaign overlay — hidden until a campaign card is clicked -->
+    <div id="campaign-overlay" class="overlay hidden">
+      <div class="overlay-panel">
+        <button id="campaign-close" class="overlay-close" type="button" aria-label="Close">&times;</button>
+        <div id="campaign-content"></div>
       </div>
     </div>
   </div>

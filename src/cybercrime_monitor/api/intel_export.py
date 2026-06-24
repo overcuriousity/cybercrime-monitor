@@ -2,19 +2,26 @@
 Pure-function renderers for interoperable threat-intel export formats —
 MISP event JSON and CSV/flat-IOC list.
 
-No I/O, no LLM calls. Every function is deterministic computation over the
-case bundle already produced by _load_case_bundle (routes.py) or the list
-of case dicts returned by fetch_cases (db.py). Token-free by construction.
+No LLM calls. Every function is deterministic computation over the case bundle
+already produced by _load_case_bundle (routes.py) or the list of case dicts
+returned by fetch_cases (db.py). Token-free by construction.
 
 Machine confidence scoring (case_export_confidence) replaces a human curation
-layer with existing machine signals: source_count, attribution_confidence,
-significance_score, in_kev. This value drives MISP's threat_level_id field
-and the /api/feed/misp gate (cases below settings.intel_feed_min_confidence
-are excluded from the feed without any human intervention).
+layer with machine signals: source_count, attribution_confidence,
+significance_score, in_kev, analyst/agent feedback verdicts (weighted by
+settings.feedback_agent_weight), and extractions.false_positive ratio.
 
-Campaign hand-off (roadmap #3): case_to_misp_event accepts an optional
-campaign_id so that, once machine-derived campaign clustering lands, member
-cases can emit MISP RelatedEvent links without reworking this renderer.
+The feedback and false_positive signals are pre-attached to the case dict by
+routes.py's _attach_confidence_signals() helper before scoring — this batches
+the DB queries across all cases so the feed path stays O(1) queries regardless
+of case count. Case dicts that have not been through _attach_confidence_signals
+(i.e. their "feedback_score" / "fp_ratio" keys are absent) default to neutral
+(no penalty, no bonus) so callers that skip the attach step still get a valid
+score from the base signals alone.
+
+Campaign clustering (roadmap #3): case_to_misp_event accepts an optional
+campaign_id so member cases emit a MISP part-of-campaign RelatedEvent.
+campaign_to_misp_event() emits the synthetic cluster event.
 """
 import csv
 import io
@@ -116,30 +123,85 @@ def _attr_uuid(case_key: str, role: str, value: str, ns: uuid.UUID) -> str:
 
 # ── Machine confidence scoring ───────────────────────────────────────────────
 # Replaces a human "this case is good enough to export" verdict with a
-# deterministic combination of existing machine signals that are already on
-# every case dict from fetch_cases / _load_case_bundle — no extra DB queries.
+# deterministic combination of machine signals — no LLM, no human input.
+#
+# The feedback and false_positive signals are pre-attached by routes.py's
+# _attach_confidence_signals() before scoring bulk case lists (two batch DB
+# queries rather than N per-case round-trips).  Absent keys default to neutral
+# so this function never raises on a bare case dict.
+
+_POSITIVE_VERDICTS = frozenset({"useful"})
+_NEGATIVE_VERDICTS = frozenset({"not_useful", "noise", "wrong_attribution"})
+
+
+def feedback_score(by_origin: dict[str, dict[str, int]]) -> float | None:
+    """Weighted net-positive feedback score in 0..1, or None if no feedback.
+
+    Mirrors sources/value.py's _component_feedback weighting:
+    - human verdicts count at weight 1.0
+    - agent verdicts (research/evaluator.py) count at settings.feedback_agent_weight (0.5)
+
+    Returns None when there are no feedback rows at all (so the caller can
+    apply neutral adjustment rather than penalising absence of feedback).
+    """
+    from ..settings import settings as _settings
+
+    origin_weights = {"human": 1.0, "agent": _settings.feedback_agent_weight}
+    weighted_pos = 0.0
+    weighted_total = 0.0
+
+    for origin, verdicts in by_origin.items():
+        w = origin_weights.get(origin, 0.5)
+        for verdict, n in verdicts.items():
+            wn = w * n
+            if verdict in _POSITIVE_VERDICTS:
+                weighted_pos += wn
+            if verdict in _POSITIVE_VERDICTS | _NEGATIVE_VERDICTS:
+                weighted_total += wn
+
+    if weighted_total == 0.0:
+        return None
+    return weighted_pos / weighted_total
+
 
 def case_export_confidence(case: dict) -> float:
     """Return a 0..100 machine-confidence score for export worthiness.
 
-    Components (all token-free, all from existing case fields):
-    - significance_score (0..1 → 0..40 pts, largest weight — the LLM's
-      own assessment of how specific/ongoing/impactful the incident is).
-    - source_count corroboration (capped at 5 → 0..25 pts — multiple
-      independent sources reduce the chance of a single bad actor or a
-      misclassified benign article).
-    - attribution_confidence (0..1 → 0..20 pts — research-verified attribution
-      raises score even for lower-significance cases worth tracking).
-    - CISA KEV membership (+10 pts — deterministic external confirmation of
-      active exploitation, a strong "this matters" signal).
-    - base floor (+5 pts — any correlated case has passed at least the
-      extraction + correlation pipeline, which filters out false positives).
+    Base signals (always available from the case dict):
+    - significance_score (0..1 → 0..35 pts) — LLM assessment of incident specificity.
+    - source_count corroboration (capped at 5 → 0..20 pts) — multiple sources
+      reduce single-source noise risk.
+    - attribution_confidence (0..1 → 0..15 pts) — research-verified attribution.
+    - CISA KEV membership (+10 pts) — external confirmation of active exploitation.
+    - base floor (+5 pts) — any correlated case has passed extraction + correlation.
+
+    Enrichment signals (pre-attached by _attach_confidence_signals; absent = neutral):
+    - feedback adjustment: (feedback_score − 0.5) × 30 → −15..+15 pts.
+      A case where analysts/evaluators mostly said "useful" earns a bonus; mostly
+      "noise" or "wrong_attribution" earns a penalty. Agent verdicts count at
+      settings.feedback_agent_weight (default 0.5) of a human verdict.
+    - false_positive penalty: fp_ratio × 25 → 0..25 pts deducted.
+      A case where most of its extractions were flagged false_positive by the LLM
+      loses up to 25 pts — enough to push it below the 50-pt feed gate.
+
+    Score is clamped to [0, 100].
     """
-    sig_pts = (case.get("significance_score") or 0.0) * 40.0
-    src_pts = min(case.get("source_count") or 0, 5) * 5.0   # 0..25
-    attr_pts = (case.get("attribution_confidence") or 0.0) * 20.0
+    sig_pts = (case.get("significance_score") or 0.0) * 35.0
+    src_pts = min(case.get("source_count") or 0, 5) * 4.0    # 0..20
+    attr_pts = (case.get("attribution_confidence") or 0.0) * 15.0
     kev_pts = 10.0 if case.get("in_kev") else 0.0
-    return min(100.0, sig_pts + src_pts + attr_pts + kev_pts + 5.0)
+    base = 5.0
+
+    # Feedback adjustment (pre-attached by _attach_confidence_signals)
+    fb_val = case.get("feedback_score")
+    fb_pts = (fb_val - 0.5) * 30.0 if fb_val is not None else 0.0  # −15..+15
+
+    # False-positive penalty (pre-attached by _attach_confidence_signals)
+    fp_val = case.get("fp_ratio")
+    fp_pts = (fp_val * 25.0) if fp_val is not None else 0.0  # 0..25
+
+    raw = sig_pts + src_pts + attr_pts + kev_pts + base + fb_pts - fp_pts
+    return max(0.0, min(100.0, raw))
 
 
 def _threat_level_id(significance: str, confidence: float) -> str:
@@ -435,3 +497,134 @@ def cases_to_ioc_list(cases: list[dict]) -> str:
                 seen.add(normalized)
                 lines.append(ioc.strip())
     return "\n".join(lines)
+
+
+# ── Campaign MISP export (roadmap #3) ────────────────────────────────────────
+
+def campaign_to_misp_event(
+    campaign: dict,
+    member_cases: list[dict],
+    *,
+    tlp: str = "amber",
+    namespace: uuid.UUID | None = None,
+) -> dict:
+    """Render a machine-derived campaign as a synthetic MISP cluster event.
+
+    The cluster event:
+    - UUID derived deterministically from campaign_key so re-exporting the
+      same campaign updates rather than duplicates the MISP event.
+    - Union of all member IOCs and CVEs as attributes.
+    - Sector/country/crime-type/actor tags from aggregate fields.
+    - RelatedEvent links to each member case's stable MISP event UUID.
+    - threat_level_id from the campaign's max member significance.
+
+    Token-free — pure dict construction.
+    """
+    ns = namespace or _DEFAULT_NAMESPACE
+    campaign_key = campaign.get("campaign_key", str(campaign.get("id", "")))
+    # Stable UUID: same scheme as _event_uuid but with "campaign:" prefix so
+    # it can never collide with a case UUID sharing the same key string.
+    campaign_uuid = str(uuid.uuid5(ns, f"campaign:{campaign_key}"))
+
+    tlp_tag = _TLP_TAGS.get(tlp.lower(), "tlp:amber")
+    sig = campaign.get("significance", "info")
+
+    # Estimate a synthetic confidence from member count + significance
+    n = campaign.get("case_count", len(member_cases)) or 1
+    synthetic_confidence = min(100.0, 30.0 + n * 10.0)
+
+    attributes: list[dict] = []
+
+    # Campaign summary
+    if campaign.get("summary"):
+        attributes.append({
+            "uuid": str(uuid.uuid5(ns, f"campaign-summary:{campaign_key}")),
+            "type": "text",
+            "category": "Internal reference",
+            "value": campaign["summary"],
+            "to_ids": False,
+            "comment": "Machine-derived campaign summary",
+            "distribution": "5",
+        })
+
+    # Union of all member IOCs
+    all_iocs: set[str] = set(campaign.get("iocs") or [])
+    for case in member_cases:
+        all_iocs.update(case.get("iocs") or [])
+    for ioc_value in sorted(all_iocs):
+        misp_type, category, to_ids = _classify_ioc(ioc_value)
+        attributes.append({
+            "uuid": _attr_uuid(campaign_key, misp_type, ioc_value, ns),
+            "type": misp_type,
+            "category": category,
+            "value": ioc_value,
+            "to_ids": to_ids,
+            "comment": "Campaign-level IOC (union of member cases)",
+            "distribution": "5",
+        })
+
+    # Union of all member CVEs
+    all_cves: set[str] = set(campaign.get("cve_ids") or [])
+    for case in member_cases:
+        all_cves.update(case.get("cve_ids") or [])
+    for cve in sorted(all_cves):
+        attributes.append({
+            "uuid": _attr_uuid(campaign_key, "vulnerability", cve, ns),
+            "type": "vulnerability",
+            "category": "External analysis",
+            "value": cve,
+            "to_ids": False,
+            "comment": "Campaign-level CVE (union of member cases)",
+            "distribution": "5",
+        })
+
+    # Dominant actor as threat-actor attribute
+    if campaign.get("dominant_actor"):
+        attributes.append({
+            "uuid": str(uuid.uuid5(ns, f"campaign-actor:{campaign_key}")),
+            "type": "threat-actor",
+            "category": "Attribution",
+            "value": campaign["dominant_actor"],
+            "to_ids": False,
+            "comment": "Machine-derived dominant actor (majority vote over member cases)",
+            "distribution": "5",
+        })
+
+    # Tags
+    tags: list[dict] = [{"name": tlp_tag}]
+    for sector in (campaign.get("sectors") or [])[:3]:
+        tags.append({"name": f"sector:{sector.lower()}"})
+    for country in (campaign.get("countries") or [])[:3]:
+        tags.append({"name": f"country:{country.lower()}"})
+    for crime_type in (campaign.get("crime_types") or [])[:2]:
+        tags.append({"name": f"cybercrime-monitor:crime-type={crime_type}"})
+    if campaign.get("in_kev"):
+        tags.append({"name": "cisa:kev"})
+    tags.append({"name": "cybercrime-monitor:cluster=campaign"})
+
+    # RelatedEvent: one entry per member case, linking to its stable event UUID
+    related_events: list[dict] = []
+    for case in member_cases:
+        case_key = case.get("case_key") or str(case.get("id", ""))
+        if case_key:
+            related_events.append({
+                "id": _event_uuid(case_key, ns),
+                "relationship_type": "contains",
+                "comment": case.get("title", ""),
+            })
+
+    event: dict = {
+        "uuid": campaign_uuid,
+        "info": campaign.get("title", f"Campaign cluster {campaign_key}"),
+        "date": (campaign.get("first_seen") or "")[:10] or None,
+        "threat_level_id": _threat_level_id(sig, synthetic_confidence),
+        "analysis": "1",  # Ongoing — machine-derived clusters are continuously refined
+        "distribution": "0",
+        "published": False,
+        "Attribute": attributes,
+        "Tag": tags,
+    }
+    if related_events:
+        event["RelatedEvent"] = related_events
+
+    return {"Event": event}

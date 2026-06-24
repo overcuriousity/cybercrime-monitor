@@ -283,6 +283,17 @@ class Settings(BaseSettings):
     # disables the job; get_actor_profile then only returns whatever was
     # last materialized (or 404s if it never ran).
     actor_profiles_refresh_interval_seconds: int = 1800
+    # Machine-derived campaign clustering (roadmap #3, pipeline/campaigns.py)
+    # — connected-components over case_links, refreshed after every
+    # cross-correlation tick. Mirrors actor_profiles_refresh_interval_seconds'
+    # cadence/kill-switch shape. 0 disables the job; GET /api/campaigns then
+    # only returns whatever was last materialized (or an empty list).
+    campaign_refresh_interval_seconds: int = 1800
+    # Minimum case_links score for an edge to participate in campaign
+    # clustering. Set deliberately above cross_correlate's _MIN_LINK_SCORE
+    # (0.3) so a single weak shared-victim overlap can't silently merge
+    # unrelated campaigns — requires meaningful co-occurrence.
+    campaign_min_link_score: float = 0.4
     # Value-driven adaptive polling (quick win A1) — after each
     # _value_refresh tick, a source's *effective* poll interval is derived
     # from its cached sources/value.py classification instead of staying
