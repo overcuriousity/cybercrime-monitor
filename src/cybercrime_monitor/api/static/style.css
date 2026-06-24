@@ -1232,18 +1232,23 @@ mark { background: var(--prio-warn-bg); color: var(--prio-warn); padding: 0 2px;
 
 /* ── Campaign clustering panel (Landscape tab, roadmap #3) ─────────────────── */
 .landscape-campaigns-section {
-  padding: 0 18px 18px;
+  margin-top: 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  padding: 12px;
 }
 .landscape-campaigns-section h3 {
-  margin-bottom: 12px;
-  font-size: 0.95rem;
-  font-weight: 600;
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: var(--text-muted);
+  margin-bottom: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
 }
 .campaign-list {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  max-width: 900px;
 }
 .campaign-card {
   display: block;
