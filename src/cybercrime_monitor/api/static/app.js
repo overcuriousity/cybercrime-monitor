@@ -2271,12 +2271,37 @@ function renderCaseDetail(c, items, researchRuns, relatedCases) {
   if (currentRole !== 'none') {
     header.appendChild(buildBookmarkToggle(c));
   }
-  const exportLink = document.createElement('a');
-  exportLink.className = 'link-button';
-  exportLink.href = `/api/cases/${c.id}/export?format=md`;
-  exportLink.textContent = 'Export (.md)';
-  exportLink.setAttribute('download', '');
-  header.appendChild(exportLink);
+  // Export dropdown — four formats, all token-free (no AI cost).
+  const exportWrap = document.createElement('div');
+  exportWrap.className = 'export-dropdown';
+  const exportBtn = document.createElement('button');
+  exportBtn.type = 'button';
+  exportBtn.className = 'link-button export-dropdown-toggle';
+  exportBtn.textContent = 'Export ▾';
+  const exportMenu = document.createElement('div');
+  exportMenu.className = 'export-dropdown-menu hidden';
+  const exportFormats = [
+    { label: 'Markdown (.md)', format: 'md' },
+    { label: 'JSON', format: 'json' },
+    { label: 'MISP event', format: 'misp' },
+    { label: 'CSV', format: 'csv' },
+  ];
+  exportFormats.forEach(({ label, format }) => {
+    const a = document.createElement('a');
+    a.className = 'export-dropdown-item';
+    a.href = `/api/cases/${c.id}/export?format=${format}`;
+    a.textContent = label;
+    a.setAttribute('download', '');
+    exportMenu.appendChild(a);
+  });
+  exportBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    exportMenu.classList.toggle('hidden');
+  });
+  document.addEventListener('click', () => exportMenu.classList.add('hidden'), { once: false, capture: false });
+  exportWrap.appendChild(exportBtn);
+  exportWrap.appendChild(exportMenu);
+  header.appendChild(exportWrap);
 
   if (hasAdminToken()) {
     const mergeBtn = document.createElement('button');

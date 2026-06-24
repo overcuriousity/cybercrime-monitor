@@ -475,5 +475,35 @@ class Settings(BaseSettings):
     # remains solvable before its signature is rejected as expired.
     account_challenge_ttl_seconds: int = 120
 
+    # ── Threat-intel export (MISP / CSV) ────────────────────────────────────
+    # Token-free, deterministic export of case intel for import into a TIP
+    # (MISP) or spreadsheet tooling (CSV). See api/intel_export.py.
+    #
+    # intel_export_default_tlp: default TLP marking applied to every exported
+    # MISP event as a tag (tlp:clear/green/amber/amber+strict/red). Analysts
+    # set the sharing level in MISP before pushing to sync network — "amber"
+    # is the conservative default (your org and partners, don't republish).
+    intel_export_default_tlp: str = "amber"
+    # UUIDv5 namespace used to derive stable, deterministic event/attribute
+    # UUIDs for MISP (so re-exporting the same case updates rather than
+    # duplicates it). Override with a private UUID so your export namespace
+    # doesn't collide with anyone else running this software. The default is
+    # the RFC 4122 DNS namespace UUID (publicly specified, collision-free with
+    # case_key as the name component).
+    intel_export_namespace_uuid: str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    # Optional dedicated read-only token for the machine-to-machine MISP pull
+    # feed (GET /api/feed/misp). When non-empty, the feed accepts either this
+    # token OR the admin_token in the X-Admin-Token header. When empty, only
+    # the admin_token is accepted. Set to a long random string if you want to
+    # give a TIP read access without sharing the full admin token.
+    intel_feed_token: str = ""
+    # Machine-confidence gate for GET /api/feed/misp — cases whose
+    # case_export_confidence() score (0..100) is below this threshold are
+    # excluded from the feed. 0 disables the gate (all cases are included).
+    # The default (50) roughly requires at least warn-significance + 1 source
+    # OR info-significance + attribution + 2 sources before a case flows into
+    # an external TIP — keeps low-confidence / single-source noise out.
+    intel_feed_min_confidence: float = 50.0
+
 
 settings = Settings()

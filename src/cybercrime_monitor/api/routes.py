@@ -6,6 +6,7 @@ import logging
 import re
 import secrets
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
@@ -71,6 +72,13 @@ from ..research import investigate as investigate_health
 from ..scheduler import load_sources
 from ..settings import settings
 from ..sources import value as source_value
+from .intel_export import (
+    case_export_confidence,
+    case_to_misp_event,
+    cases_to_csv,
+    cases_to_ioc_list,
+    cases_to_misp_response,
+)
 from .sse import TooManySubscribers, broadcaster
 
 log = logging.getLogger(__name__)
@@ -896,6 +904,145 @@ async def api_cases_by_country(
     return {"by_country": by_country}
 
 
+def _require_feed_auth(x_admin_token: str | None = Header(default=None)) -> None:
+    """Gate for the MISP pull feed — accepts either the admin token or the
+    dedicated (read-only) feed token from settings.intel_feed_token. Fails
+    closed: if neither is configured the feed is unreachable, which is safer
+    than silently public. When a feed token is configured a downstream TIP
+    gets read access without sharing the full admin capabilities."""
+    if _is_valid_admin_token(x_admin_token):
+        return
+    feed_token = settings.intel_feed_token
+    if feed_token and x_admin_token and hmac.compare_digest(x_admin_token, feed_token):
+        return
+    raise HTTPException(status_code=403, detail="Admin token or feed token required")
+
+
+# ── Batch / feed export — registered before /api/cases/{case_id} so FastAPI's
+# router matches the literal path segment "export" rather than treating it as
+# an integer case_id. ──────────────────────────────────────────────────────────
+
+@router.get("/api/cases/export")
+async def api_cases_batch_export(
+    db=Depends(get_db),
+    format: str = Query(default="misp", pattern="^(misp|csv|ioc)$"),
+    min_significance: str | None = Query(default=None),
+    crime_type: str | None = Query(default=None),
+    in_kev: bool | None = Query(default=None),
+    search: str | None = Query(default=None),
+    cve_id: str | None = Query(default=None),
+    ioc: str | None = Query(default=None),
+    since: str | None = Query(default=None),
+    until: str | None = Query(default=None),
+    country: str | None = Query(default=None),
+    limit: int = Query(default=500, le=1000, ge=1),
+):
+    """Batch threat-intel export of a filtered set of cases. Honors the same
+    filter params as GET /api/cases (significance, crime_type, in_kev, search,
+    cve_id, ioc, since, until, country) so the caller can export exactly what
+    the Cases tab is showing.
+
+    Formats (?format=):
+    - misp (default): MISP REST-API-style response wrapping all matching cases
+      as MISP events. Individual events contain IOCs/CVEs/ATT&CK/attribution
+      but NOT per-case source URLs or research findings (use the single-case
+      endpoint for the full bundle). Token-free.
+    - csv:  Flat CSV, one row per case, list fields pipe-separated.
+    - ioc:  Deduplicated flat IOC list across all matching cases (one per line);
+            suitable for blocklists / firewall deny-lists.
+
+    No auth required — same access model as GET /api/cases (public read).
+    All formatting is token-free (api/intel_export.py, no LLM calls).
+    """
+    since_norm = _normalize_date_filter(since, end_of_day=False)
+    until_norm = _normalize_date_filter(until, end_of_day=True)
+    cases = await fetch_cases(
+        db,
+        limit=limit,
+        offset=0,
+        min_significance=min_significance,
+        crime_type=crime_type,
+        in_kev=in_kev,
+        search=search,
+        cve_id=cve_id,
+        ioc=ioc,
+        since=since_norm,
+        until=until_norm,
+        country=country,
+    )
+
+    ns = uuid.UUID(settings.intel_export_namespace_uuid)
+
+    if format == "misp":
+        body = cases_to_misp_response(
+            cases, tlp=settings.intel_export_default_tlp, namespace=ns
+        )
+        count = len(cases)
+        return JSONResponse(
+            body,
+            headers={"Content-Disposition": f'attachment; filename="cases-export-{count}.misp.json"'},
+        )
+
+    if format == "csv":
+        csv_text = cases_to_csv(cases)
+        return PlainTextResponse(
+            csv_text, media_type="text/csv",
+            headers={"Content-Disposition": 'attachment; filename="cases-export.csv"'},
+        )
+
+    # format == "ioc"
+    ioc_text = cases_to_ioc_list(cases)
+    return PlainTextResponse(
+        ioc_text, media_type="text/plain",
+        headers={"Content-Disposition": 'attachment; filename="ioc-feed.txt"'},
+    )
+
+
+@router.get("/api/feed/misp", dependencies=[Depends(_require_feed_auth)])
+async def api_feed_misp(
+    db=Depends(get_db),
+    since: str | None = Query(default=None),
+    min_confidence: float | None = Query(default=None, ge=0, le=100),
+    limit: int = Query(default=1000, le=5000, ge=1),
+):
+    """Machine-to-machine MISP pull feed for a Threat Intelligence Platform.
+
+    Returns confirmed, high-confidence cases as a MISP REST-API response that
+    a TIP can poll periodically. Gating is entirely machine-driven:
+    - cases.status must be 'confirmed' (set by the research agent when it
+      verifies an incident — never set by a human).
+    - case_export_confidence() must meet the threshold (settings.
+      intel_feed_min_confidence, default 50). Pass ?min_confidence= to
+      override per-request.
+
+    Use ?since= (ISO timestamp, e.g. 2025-01-01T00:00:00+00:00) as a cursor
+    for incremental polling — returns only cases last_seen after that point.
+    No ?since= returns all feed-eligible cases (for initial TIP population).
+
+    Auth: X-Admin-Token header (admin token or dedicated feed token from
+    settings.intel_feed_token — see _require_feed_auth above).
+    Token-free rendering — no LLM calls.
+    """
+    since_norm = _normalize_date_filter(since, end_of_day=False)
+    # Fetch confirmed cases since cursor (or all-time on first poll).
+    # We over-fetch and filter by confidence in Python so the confidence gate
+    # can be tuned without a DB schema change.
+    raw_cases = await fetch_cases(db, limit=limit, offset=0, since=since_norm)
+    confidence_floor = (
+        min_confidence if min_confidence is not None
+        else settings.intel_feed_min_confidence
+    )
+    eligible = [
+        c for c in raw_cases
+        if c.get("status") == "confirmed" and case_export_confidence(c) >= confidence_floor
+    ]
+    ns = uuid.UUID(settings.intel_export_namespace_uuid)
+    body = cases_to_misp_response(
+        eligible, tlp=settings.intel_export_default_tlp, namespace=ns
+    )
+    return JSONResponse(body, headers={"X-Feed-Case-Count": str(len(eligible))})
+
+
 async def _load_case_bundle(db, case_id: int) -> tuple[dict, list[dict], list[dict], list[dict]]:
     """Shared data fetch for the case detail pane and Markdown/JSON export.
     Returns (case, items, research_runs, related_cases) with JSON fields already
@@ -1027,23 +1174,51 @@ def _case_to_markdown(case: dict, items: list[dict], research_runs: list[dict], 
 
 @router.get("/api/cases/{case_id}/export")
 async def api_case_export(case_id: int, db=Depends(get_db), format: str = Query(default="md")):
-    """Markdown/JSON case report for sharing intel out of this single-
-    analyst console — same underlying data as GET /api/cases/{id}, just
-    rendered for a human reading it outside the dashboard rather than the
-    UI's detail pane."""
-    if format not in ("md", "json"):
-        raise HTTPException(status_code=400, detail="format must be 'md' or 'json'")
+    """Case report export. Supports four formats via ?format=:
+
+    - md   (default): Markdown report for human reading outside the dashboard.
+    - json: Raw JSON bundle (case + items + research_runs + related_cases).
+    - misp: MISP event JSON — full bundle with IOCs, CVEs, ATT&CK techniques,
+            attribution, source URLs, and TLP/confidence tags; ready for direct
+            import into MISP or any compatible TIP.
+    - csv:  Single-row CSV with all case fields; list values pipe-separated.
+
+    md/json are unchanged from prior behaviour. misp/csv are token-free
+    renderers (see api/intel_export.py) — no LLM calls.
+    """
+    if format not in ("md", "json", "misp", "csv"):
+        raise HTTPException(status_code=400, detail="format must be 'md', 'json', 'misp', or 'csv'")
 
     case, items, research_runs, related = await _load_case_bundle(db, case_id)
 
     if format == "json":
         return {"case": case, "items": items, "research_runs": research_runs, "related_cases": related}
 
-    markdown = _case_to_markdown(case, items, research_runs, related)
-    filename = f"case-{case_id}.md"
+    if format == "md":
+        markdown = _case_to_markdown(case, items, research_runs, related)
+        filename = f"case-{case_id}.md"
+        return PlainTextResponse(
+            markdown, media_type="text/markdown",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    if format == "misp":
+        ns = uuid.UUID(settings.intel_export_namespace_uuid)
+        event = case_to_misp_event(
+            case, items, research_runs, related,
+            tlp=settings.intel_export_default_tlp,
+            namespace=ns,
+        )
+        return JSONResponse(
+            event,
+            headers={"Content-Disposition": f'attachment; filename="case-{case_id}.misp.json"'},
+        )
+
+    # format == "csv"
+    csv_text = cases_to_csv([case])
     return PlainTextResponse(
-        markdown, media_type="text/markdown",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        csv_text, media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="case-{case_id}.csv"'},
     )
 
 
