@@ -196,14 +196,20 @@ async def _heal_one(db_conn, source: dict, *, scheduler, sse_broadcaster) -> Non
     result = await run_dispatch_prompt(prompt)
 
     if not result.ok or result.data is None:
-        await db.create_heal_proposal(
+        notes = (
+            f"hermes run failed: {result.error}"
+            if not result.ok
+            else "hermes returned no parseable JSON"
+        )
+        proposal_id = await db.create_heal_proposal(
             db_conn,
             source_id=source["id"],
             proposal={},
-            notes=f"hermes run failed: {result.error}",
+            notes=notes,
             action="heal",
         )
-        log.warning("[heal] source %s: hermes run failed (%s)", source["id"], result.error)
+        await db.update_heal_proposal_status(db_conn, proposal_id=proposal_id, status="rejected")
+        log.warning("[heal] source %s: %s", source["id"], notes)
         return
 
     data = result.data

@@ -70,7 +70,7 @@ async def _log_activity(
         log.error("[correlate] activity log failed: %s", exc)
 
 _OVERFETCH_MULTIPLIER = 5
-_BATCH_SIZE = 10
+_BATCH_SIZE = 3
 # How far back to look for a fuzzy-candidate case to merge into — an old,
 # long-closed case shouldn't silently reopen just because a new report
 # happens to share a victim name.

@@ -76,7 +76,7 @@ class Settings(BaseSettings):
     # Semantic dedup → case correlation (pipeline/correlate.py) — runs on its
     # own interval, decoupled from extraction, so a slow merge-adjudication
     # call never blocks either ingest or extraction.
-    correlate_interval_seconds: int = 45
+    correlate_interval_seconds: int = 300
     # Algorithmic (non-LLM) case-to-case relationship scan
     # (pipeline/cross_correlate.py) — separate from the above, which
     # dedupes raw items into cases; this links already-distinct cases that
