@@ -509,6 +509,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     token_hash   TEXT NOT NULL UNIQUE,
     is_admin     INTEGER NOT NULL DEFAULT 0,
+    theme        TEXT,
     created_at   TEXT NOT NULL,
     last_seen_at TEXT NOT NULL
 );
@@ -621,6 +622,11 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
     if "caused_by" not in activity_cols:
         await conn.execute("ALTER TABLE ai_activity ADD COLUMN caused_by INTEGER")
         log.info("Migrated ai_activity table: added caused_by column")
+
+    account_cols = {r["name"] for r in await conn.execute_fetchall("PRAGMA table_info(accounts)")}
+    if "theme" not in account_cols:
+        await conn.execute("ALTER TABLE accounts ADD COLUMN theme TEXT")
+        log.info("Migrated accounts table: added theme column")
 
     await _migrate_normalize_countries(conn)
 
@@ -3920,7 +3926,8 @@ async def create_account(conn: aiosqlite.Connection, *, token_hash: str, is_admi
 
 async def get_account_by_hash(conn: aiosqlite.Connection, token_hash: str) -> dict | None:
     rows = await conn.execute_fetchall(
-        "SELECT * FROM accounts WHERE token_hash = :token_hash", {"token_hash": token_hash}
+        "SELECT id, token_hash, is_admin, theme, created_at, last_seen_at FROM accounts WHERE token_hash = :token_hash",
+        {"token_hash": token_hash},
     )
     return dict(rows[0]) if rows else None
 
@@ -3938,6 +3945,14 @@ async def ensure_admin_account(conn: aiosqlite.Connection, token_hash: str) -> d
         await touch_account_last_seen(conn, existing["id"])
         existing = await get_account_by_hash(conn, token_hash)
     return existing
+
+
+async def set_account_theme(conn: aiosqlite.Connection, *, account_id: int, theme: str) -> None:
+    await conn.execute(
+        "UPDATE accounts SET theme = :theme WHERE id = :id",
+        {"theme": theme, "id": account_id},
+    )
+    await conn.commit()
 
 
 async def touch_account_last_seen(conn: aiosqlite.Connection, account_id: int) -> None:
