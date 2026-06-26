@@ -162,12 +162,14 @@ class Settings(BaseSettings):
     hermes_research_interval_seconds: int = 120
     # How many eligible cases get pulled per tick and dispatched concurrently
     # (bounded by hermes_max_concurrent_runs, not run in lockstep with this
-    # number) — see research/agent.py's run_research_batch. Larger than the
-    # concurrency cap on purpose: while hermes_max_concurrent_runs workers are
-    # busy, the rest of the batch just queues for the next free slot within
-    # the same tick, so the job stays continuously busy instead of going idle
-    # between short ticks.
-    hermes_research_batch_size: int = 8
+    # number) — see research/agent.py's run_research_batch. Slightly larger
+    # than the concurrency cap so there's always a next case ready when a
+    # slot opens, keeping both workers busy without idle gaps between pairs.
+    # Keep this small: asyncio.gather dispatches all cases simultaneously,
+    # so (batch_size - hermes_max_concurrent_runs) cases sit queued on the
+    # asyncio semaphore. A large queue starves the heal and investigate jobs,
+    # which share the same semaphore and fire on their own intervals.
+    hermes_research_batch_size: int = 4
     # A *failed* research run (timeout, hermes error, malformed response —
     # see research.agent's docstring on db.get_cases_needing_research) gets
     # retried much sooner than a successful one: 24h of "don't bother, we
@@ -445,12 +447,12 @@ class Settings(BaseSettings):
     # Items older than this are pruned (see db.py:prune_old_items, wired as a
     # daily job in scheduler.py) to keep the DB from growing unbounded.
     # Effective-critical cases/items are NEVER pruned regardless of age.
-    retention_days: int = 90
+    # 0 (default) disables pruning entirely — set explicitly to enable.
+    retention_days: int = 0
 
     # ai_activity rows are retained independently of items because the audit
-    # trail is often wanted longer than the raw feed. Defaults to the item
-    # retention so existing deployments behave the same until configured.
-    activity_retention_days: int = 90
+    # trail is often wanted longer than the raw feed. 0 disables pruning.
+    activity_retention_days: int = 0
 
     # ── Public-dashboard DoS resistance ─────────────────────────────────────
     # The dashboard is meant for one analyst's own browser tabs but is
