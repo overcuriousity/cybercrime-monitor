@@ -1077,9 +1077,11 @@ async def api_feed_misp(
     """
     since_norm = _normalize_date_filter(since, end_of_day=False)
     # Fetch confirmed cases since cursor (or all-time on first poll).
-    # We over-fetch and filter by confidence in Python so the confidence gate
-    # can be tuned without a DB schema change.
-    raw_cases = await fetch_cases(db, limit=limit, offset=0, since=since_norm)
+    # Status is filtered in the DB so non-confirmed cases never consume limit
+    # slots and push confirmed cases out of the result window.
+    # Confidence is still gated in Python — it depends on signals attached
+    # after the fetch, so it cannot be expressed in SQL without a schema change.
+    raw_cases = await fetch_cases(db, limit=limit, offset=0, since=since_norm, status="confirmed")
     # Batch-attach feedback + false_positive signals before scoring (roadmap #2)
     # — two batch DB queries, O(1) regardless of case count.
     await _attach_confidence_signals(db, raw_cases)
@@ -1089,7 +1091,7 @@ async def api_feed_misp(
     )
     eligible = [
         c for c in raw_cases
-        if c.get("status") == "confirmed" and case_export_confidence(c) >= confidence_floor
+        if case_export_confidence(c) >= confidence_floor
     ]
     ns = uuid.UUID(settings.intel_export_namespace_uuid)
     # Batch resolve campaign membership — one query, not one-per-case (roadmap #3)

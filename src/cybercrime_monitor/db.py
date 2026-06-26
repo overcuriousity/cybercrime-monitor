@@ -2303,6 +2303,7 @@ def _build_cases_where(
     country: str | None = None,
     id_in: list[int] | None = None,
     bookmarked_by: int | None = None,
+    status: str | None = None,
 ) -> tuple[str, dict]:
     parts = []
     params: dict = {}
@@ -2365,6 +2366,9 @@ def _build_cases_where(
             "EXISTS (SELECT 1 FROM bookmarks b WHERE b.case_id = cases.id AND b.account_id = :bookmarked_by)"
         )
         params["bookmarked_by"] = bookmarked_by
+    if status is not None:
+        parts.append("status = :status")
+        params["status"] = status
     where = ("WHERE " + " AND ".join(parts)) if parts else ""
     return where, params
 
@@ -2385,6 +2389,7 @@ async def fetch_cases(
     country: str | None = None,
     id_in: list[int] | None = None,
     bookmarked_by: int | None = None,
+    status: str | None = None,
 ) -> list[dict]:
     """Case-centric counterpart to fetch_items — see that function's
     docstring for the shared filter/pagination shape this mirrors.
@@ -2399,7 +2404,7 @@ async def fetch_cases(
     where, params = _build_cases_where(
         min_significance=min_significance, crime_type=crime_type, in_kev=in_kev,
         search=search, cve_id=cve_id, ioc=ioc, since=since, until=until,
-        country=country, id_in=id_in, bookmarked_by=bookmarked_by,
+        country=country, id_in=id_in, bookmarked_by=bookmarked_by, status=status,
     )
     rows = await conn.execute_fetchall(
         f"""
@@ -3039,14 +3044,14 @@ async def record_applied_change(
 
 
 async def get_heal_proposals(conn: aiosqlite.Connection, *, status: str | None = None) -> list[dict]:
-    if status:
+    if status is not None:
         rows = await conn.execute_fetchall(
             "SELECT * FROM source_heal_proposals WHERE status = :status ORDER BY created_at DESC",
             {"status": status},
         )
     else:
         rows = await conn.execute_fetchall(
-            "SELECT * FROM source_heal_proposals ORDER BY created_at DESC LIMIT 100"
+            "SELECT * FROM source_heal_proposals ORDER BY created_at DESC"
         )
     out = []
     for r in rows:
@@ -3967,9 +3972,10 @@ async def get_cases_by_ids(conn: aiosqlite.Connection, ids: list[int]) -> list[d
 
 async def clear_campaigns(conn: aiosqlite.Connection) -> None:
     """Delete all campaign rows (and cascade-delete case_campaign rows).
-    Called at the start of each refresh_campaigns pass before re-inserting."""
+    Called at the start of each refresh_campaigns pass before re-inserting.
+    Does NOT commit — the caller owns the transaction so the DELETE and the
+    subsequent re-inserts are atomic (a mid-loop failure rolls back both)."""
     await conn.execute("DELETE FROM campaigns")
-    await conn.commit()
 
 
 async def save_campaign(

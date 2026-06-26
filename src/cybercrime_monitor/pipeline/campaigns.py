@@ -157,12 +157,14 @@ async def refresh_campaigns(conn) -> int:
     if not edges:
         log.info("[campaigns] no case_links above %.2f — clearing", settings.campaign_min_link_score)
         await db.clear_campaigns(conn)
+        await conn.commit()
         return 0
 
     components, component_max_score = _build_components(edges)
     if not components:
         log.info("[campaigns] no components >= 2 above score %.2f", settings.campaign_min_link_score)
         await db.clear_campaigns(conn)
+        await conn.commit()
         return 0
 
     # Bulk-fetch all member cases in one query

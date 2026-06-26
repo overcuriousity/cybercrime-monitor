@@ -53,16 +53,13 @@ def _classify_ioc(value: str) -> tuple[str, str, bool]:
     attributes (crypto addresses, links) that a TIP should not auto-push to
     detection systems.
     """
-    # File hashes — longest pattern first to avoid mis-classifying a hash
-    # prefix as a shorter hash type.
+    # SHA256 first: 64 hex chars — no crypto address is this long, safe to
+    # check before the address patterns.
     if _SHA256_RE.match(value):
         return "sha256", "Payload delivery", True
-    if _SHA1_RE.match(value):
-        return "sha1", "Payload delivery", True
-    if _MD5_RE.match(value):
-        return "md5", "Payload delivery", True
-    # Ethereum/EVM (40 hex chars with 0x prefix — must come before bare hex
-    # patterns that could match the unprefixed part).
+    # Crypto addresses before shorter hashes: ETH addresses (40 hex, with or
+    # without 0x prefix) would match _SHA1_RE if checked later. Check all
+    # wallet formats here to prevent misclassification as file hashes.
     if _ETH_RE.match(value):
         return "cryptocurrency-address", "Financial fraud", False
     # Monero (long base58, checked before BTC to avoid length ambiguity).
@@ -70,6 +67,12 @@ def _classify_ioc(value: str) -> tuple[str, str, bool]:
         return "cryptocurrency-address", "Financial fraud", False
     if _BTC_RE.match(value):
         return "btc", "Financial fraud", False
+    # SHA1 / MD5 — after crypto addresses so 40-hex ETH (no 0x prefix) and
+    # 32-hex values aren't silently re-classified as file hashes.
+    if _SHA1_RE.match(value):
+        return "sha1", "Payload delivery", True
+    if _MD5_RE.match(value):
+        return "md5", "Payload delivery", True
     # IPv4/IPv6 — use ipaddress to reject out-of-range octets etc.
     if _IPV4_RE.match(value):
         try:

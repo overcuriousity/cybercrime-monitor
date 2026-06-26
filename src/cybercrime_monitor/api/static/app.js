@@ -2496,8 +2496,10 @@ function renderCaseDetail(c, items, researchRuns, relatedCases) {
   exportBtn.addEventListener('click', (e) => {
     e.stopPropagation();
     exportMenu.classList.toggle('hidden');
+    if (!exportMenu.classList.contains('hidden')) {
+      document.addEventListener('click', () => exportMenu.classList.add('hidden'), { once: true });
+    }
   });
-  document.addEventListener('click', () => exportMenu.classList.add('hidden'), { once: false, capture: false });
   exportWrap.appendChild(exportBtn);
   exportWrap.appendChild(exportMenu);
   header.appendChild(exportWrap);
