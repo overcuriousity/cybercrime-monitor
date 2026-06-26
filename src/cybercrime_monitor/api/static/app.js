@@ -1385,6 +1385,7 @@ async function loadLandscape() {
     renderLandscapeActors(stats.by_actor);
     renderLandscapeMap(stats.by_country);
     renderEmergingPanels();
+    renderCampaignPanel();
   } catch (e) {
     console.error('Failed to load landscape', e);
   }
@@ -1700,6 +1701,204 @@ function renderActorProfile(profile) {
 
 // expose for the actor leaderboard's onClick
 window.openActorProfile = openActorProfile;
+
+// ── Campaign clustering (roadmap #3) ──────────────────────────────────────
+// Machine-derived connected-components clusters over case_links — see
+// pipeline/campaigns.py and GET /api/campaigns*.
+const campaignOverlay  = document.getElementById('campaign-overlay');
+const campaignContent  = document.getElementById('campaign-content');
+const campaignClose    = document.getElementById('campaign-close');
+const campaignsSection = document.getElementById('landscape-campaigns-section');
+const campaignsList    = document.getElementById('landscape-campaigns-list');
+
+campaignClose.addEventListener('click', closeCampaign);
+campaignOverlay.addEventListener('click', (e) => {
+  if (e.target === campaignOverlay) closeCampaign();
+});
+
+function closeCampaign() {
+  campaignOverlay.classList.add('hidden');
+  campaignContent.innerHTML = '';
+}
+
+async function renderCampaignPanel() {
+  try {
+    const data = await api('/api/campaigns');
+    const campaigns = data.campaigns || [];
+    campaignsList.innerHTML = '';
+    if (!campaigns.length) {
+      campaignsSection.classList.add('hidden');
+      return;
+    }
+    campaignsSection.classList.remove('hidden');
+    campaigns.forEach(camp => {
+      const card = document.createElement('button');
+      card.className = 'campaign-card';
+      card.type = 'button';
+
+      const titleRow = document.createElement('div');
+      titleRow.className = 'campaign-card-title';
+      titleRow.textContent = camp.title;
+      card.appendChild(titleRow);
+
+      const meta = document.createElement('div');
+      meta.className = 'campaign-card-meta';
+      const parts = [`${camp.case_count} cases`];
+      if (camp.dominant_actor) parts.push(camp.dominant_actor);
+      if (camp.significance) parts.push(camp.significance);
+      meta.textContent = parts.join(' · ');
+      card.appendChild(meta);
+
+      if (camp.sectors && camp.sectors.length || camp.countries && camp.countries.length) {
+        const chips = document.createElement('div');
+        chips.className = 'item-meta';
+        (camp.sectors || []).slice(0, 3).forEach(s => {
+          const chip = document.createElement('span');
+          chip.className = 'tag-chip';
+          chip.textContent = s;
+          chips.appendChild(chip);
+        });
+        (camp.countries || []).slice(0, 3).forEach(c => {
+          const chip = document.createElement('span');
+          chip.className = 'tag-chip cluster-chip';
+          chip.textContent = c;
+          chips.appendChild(chip);
+        });
+        card.appendChild(chips);
+      }
+
+      card.addEventListener('click', () => openCampaign(camp.id));
+      campaignsList.appendChild(card);
+    });
+  } catch (e) {
+    console.error('Failed to load campaigns', e);
+    campaignsSection.classList.add('hidden');
+  }
+}
+
+async function openCampaign(id) {
+  campaignOverlay.classList.remove('hidden');
+  campaignContent.innerHTML = '';
+  const loading = document.createElement('p');
+  loading.className = 'hint';
+  loading.textContent = 'Loading campaign…';
+  campaignContent.appendChild(loading);
+
+  try {
+    const camp = await api(`/api/campaigns/${id}`);
+    renderCampaign(camp);
+  } catch (e) {
+    campaignContent.innerHTML = '';
+    const err = document.createElement('p');
+    err.className = 'hint';
+    err.textContent = `Failed to load campaign: ${e}`;
+    campaignContent.appendChild(err);
+  }
+}
+
+function renderCampaign(camp) {
+  campaignContent.innerHTML = '';
+
+  const h = document.createElement('h2');
+  h.textContent = camp.title;
+  campaignContent.appendChild(h);
+
+  // Stat gauges
+  const stats = document.createElement('div');
+  stats.className = 'gauge-row actor-profile-stats';
+  [
+    ['Cases', camp.case_count],
+    ['Sectors', (camp.sectors || []).length],
+    ['Countries', (camp.countries || []).length],
+    ['CVEs', (camp.cve_ids || []).length],
+  ].forEach(([label, value]) => {
+    const card = document.createElement('div');
+    card.className = 'gauge-card';
+    const v = document.createElement('div');
+    v.className = 'gauge-value';
+    v.textContent = value;
+    const l = document.createElement('div');
+    l.className = 'gauge-label';
+    l.textContent = label;
+    card.appendChild(v);
+    card.appendChild(l);
+    stats.appendChild(card);
+  });
+  campaignContent.appendChild(stats);
+
+  if (camp.first_seen || camp.last_seen) {
+    const range = document.createElement('p');
+    range.className = 'hint';
+    range.textContent = `Active ${fmtTime(camp.first_seen)} → ${fmtTime(camp.last_seen)}`;
+    campaignContent.appendChild(range);
+  }
+
+  if (camp.summary) {
+    const summary = document.createElement('p');
+    summary.className = 'hint';
+    summary.textContent = camp.summary;
+    campaignContent.appendChild(summary);
+  }
+
+  // Sector / country / crime-type chips
+  const allChips = [
+    ...(camp.sectors || []).map(s => ({ text: s, cls: 'tag-chip' })),
+    ...(camp.countries || []).map(c => ({ text: c, cls: 'tag-chip cluster-chip' })),
+    ...(camp.crime_types || []).map(t => ({ text: t.replace(/_/g, ' '), cls: 'tag-chip' })),
+  ];
+  if (allChips.length) {
+    const chipsWrap = document.createElement('div');
+    chipsWrap.className = 'item-meta';
+    allChips.forEach(({ text, cls }) => {
+      const chip = document.createElement('span');
+      chip.className = cls;
+      chip.textContent = text;
+      chipsWrap.appendChild(chip);
+    });
+    campaignContent.appendChild(chipsWrap);
+  }
+
+  // Export button
+  const exportBtn = document.createElement('a');
+  exportBtn.href = `/api/campaigns/${camp.id}/export?format=misp`;
+  exportBtn.download = `campaign-${camp.campaign_key || camp.id}.misp.json`;
+  exportBtn.className = 'btn-primary';
+  exportBtn.style.display = 'inline-block';
+  exportBtn.style.marginTop = '14px';
+  exportBtn.style.textDecoration = 'none';
+  exportBtn.style.padding = '7px 16px';
+  exportBtn.style.fontSize = '0.82rem';
+  exportBtn.textContent = 'Export (MISP)';
+  campaignContent.appendChild(exportBtn);
+
+  // Member cases
+  if (camp.cases && camp.cases.length) {
+    const relHeader = document.createElement('h3');
+    relHeader.textContent = `Member cases (${camp.cases.length})`;
+    relHeader.style.marginTop = '18px';
+    campaignContent.appendChild(relHeader);
+    const list = document.createElement('div');
+    list.className = 'actor-profile-cases';
+    (camp.cases || []).forEach(c => {
+      const rcard = document.createElement('button');
+      rcard.className = 'related-case-card';
+      rcard.appendChild(document.createTextNode(`#${c.id} · ${c.title || ''}`));
+      const rmeta = document.createElement('div');
+      rmeta.className = 'related-reasons';
+      const metaParts = [c.significance, c.damaged_party, c.attribution].filter(Boolean);
+      rmeta.textContent = metaParts.join(' · ');
+      rcard.appendChild(rmeta);
+      rcard.addEventListener('click', () => {
+        closeCampaign();
+        // Switch to Cases tab and select this case
+        document.querySelector('.tab[data-tab="cases"]').click();
+        selectCase(c.id);
+      });
+      list.appendChild(rcard);
+    });
+    campaignContent.appendChild(list);
+  }
+}
 
 // ── Cases ──────────────────────────────────────────────────────────────────
 // Case-centric view on top of pipeline/correlate.py's deduplicated incidents
@@ -2271,12 +2470,39 @@ function renderCaseDetail(c, items, researchRuns, relatedCases) {
   if (currentRole !== 'none') {
     header.appendChild(buildBookmarkToggle(c));
   }
-  const exportLink = document.createElement('a');
-  exportLink.className = 'link-button';
-  exportLink.href = `/api/cases/${c.id}/export?format=md`;
-  exportLink.textContent = 'Export (.md)';
-  exportLink.setAttribute('download', '');
-  header.appendChild(exportLink);
+  // Export dropdown — four formats, all token-free (no AI cost).
+  const exportWrap = document.createElement('div');
+  exportWrap.className = 'export-dropdown';
+  const exportBtn = document.createElement('button');
+  exportBtn.type = 'button';
+  exportBtn.className = 'link-button export-dropdown-toggle';
+  exportBtn.textContent = 'Export ▾';
+  const exportMenu = document.createElement('div');
+  exportMenu.className = 'export-dropdown-menu hidden';
+  const exportFormats = [
+    { label: 'Markdown (.md)', format: 'md' },
+    { label: 'JSON', format: 'json' },
+    { label: 'MISP event', format: 'misp' },
+    { label: 'CSV', format: 'csv' },
+  ];
+  exportFormats.forEach(({ label, format }) => {
+    const a = document.createElement('a');
+    a.className = 'export-dropdown-item';
+    a.href = `/api/cases/${c.id}/export?format=${format}`;
+    a.textContent = label;
+    a.setAttribute('download', '');
+    exportMenu.appendChild(a);
+  });
+  exportBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    exportMenu.classList.toggle('hidden');
+    if (!exportMenu.classList.contains('hidden')) {
+      document.addEventListener('click', () => exportMenu.classList.add('hidden'), { once: true });
+    }
+  });
+  exportWrap.appendChild(exportBtn);
+  exportWrap.appendChild(exportMenu);
+  header.appendChild(exportWrap);
 
   if (hasAdminToken()) {
     const mergeBtn = document.createElement('button');
@@ -2305,6 +2531,8 @@ function renderCaseDetail(c, items, researchRuns, relatedCases) {
     ['First seen', fmtTime(c.first_seen)],
     ['Last seen', fmtTime(c.last_seen)],
     ['Sources', String(c.source_count)],
+    // Machine-derived export confidence (roadmap #2) — read-only, never human-set.
+    ['Export confidence', c.export_confidence != null ? `${c.export_confidence.toFixed(0)}/100` : null],
   ];
   fields.forEach(([label, value]) => {
     if (!value) return;

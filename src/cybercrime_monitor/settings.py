@@ -127,21 +127,16 @@ class Settings(BaseSettings):
     # across research/agent.py, research/investigate.py and research/heal.py
     # (all three funnel through hermes/runner.py's run_agent) — they all hit
     # the same primary backend, so this is the one knob that actually
-    # protects it regardless of which job is dispatching. Sized for the
-    # NVIDIA NIM primary's published limits (2026-06-21): 0.83 req/s (~50/min)
-    # and 1M tokens/min. Tokens are not the binding constraint — a research
-    # turn runs a few thousand tokens, nowhere near 1M/min even at this
-    # concurrency. Requests/sec is: each concurrent run is a multi-turn
-    # hermes-agent loop (web search + page fetches between LLM calls), not a
-    # tight request loop, so observed per-run request rate is well under
-    # 1 req/s; 2 concurrent runs keeps sustained aggregate load under the
-    # 0.83 req/s ceiling with headroom for bursts, while still being a large
-    # improvement over the previous fully-serial (1 at a time) dispatch.
-    # Raise cautiously — and only after confirming actual request-rate
-    # headroom — since exceeding the cap just trades research throughput for
-    # 429s that burn the fallback_providers chain (kimi-coding -> devstral-2512)
-    # instead.
-    hermes_max_concurrent_runs: int = 2
+    # protects it regardless of which job is dispatching. Serial (1) is the
+    # conservative default: each hermes session is itself a multi-turn loop
+    # (web search + page fetches + multiple LLM calls), so 2 concurrent
+    # sessions at once roughly doubles the sustained API call rate against the
+    # primary and saturates it before the fallback chain can help — observed
+    # as widespread "empty/unparseable response" across all jobs (2026-06-26).
+    # Raise to 2 only after confirming the primary (and any fallback providers)
+    # can absorb the doubled sustained request rate without silent empty
+    # responses.
+    hermes_max_concurrent_runs: int = 1
     # Real (measured) token burn-rate tracking — see db.token_usage and
     # hermes/usage_ingest.py. hermes-agent measures its own token usage per
     # session in ~/.hermes/state.db (not estimated); this job copies that
@@ -162,12 +157,13 @@ class Settings(BaseSettings):
     hermes_research_interval_seconds: int = 120
     # How many eligible cases get pulled per tick and dispatched concurrently
     # (bounded by hermes_max_concurrent_runs, not run in lockstep with this
-    # number) — see research/agent.py's run_research_batch. Larger than the
-    # concurrency cap on purpose: while hermes_max_concurrent_runs workers are
-    # busy, the rest of the batch just queues for the next free slot within
-    # the same tick, so the job stays continuously busy instead of going idle
-    # between short ticks.
-    hermes_research_batch_size: int = 8
+    # number) — see research/agent.py's run_research_batch. Slightly larger
+    # than the concurrency cap so there's always a next case ready when a
+    # slot opens. Keep this small: asyncio.gather dispatches all cases
+    # simultaneously, so (batch_size - hermes_max_concurrent_runs) cases sit
+    # queued on the asyncio semaphore — a large queue starves the heal and
+    # investigate jobs, which share the same semaphore.
+    hermes_research_batch_size: int = 2
     # A *failed* research run (timeout, hermes error, malformed response —
     # see research.agent's docstring on db.get_cases_needing_research) gets
     # retried much sooner than a successful one: 24h of "don't bother, we
@@ -283,6 +279,17 @@ class Settings(BaseSettings):
     # disables the job; get_actor_profile then only returns whatever was
     # last materialized (or 404s if it never ran).
     actor_profiles_refresh_interval_seconds: int = 1800
+    # Machine-derived campaign clustering (roadmap #3, pipeline/campaigns.py)
+    # — connected-components over case_links, refreshed after every
+    # cross-correlation tick. Mirrors actor_profiles_refresh_interval_seconds'
+    # cadence/kill-switch shape. 0 disables the job; GET /api/campaigns then
+    # only returns whatever was last materialized (or an empty list).
+    campaign_refresh_interval_seconds: int = 1800
+    # Minimum case_links score for an edge to participate in campaign
+    # clustering. Set deliberately above cross_correlate's _MIN_LINK_SCORE
+    # (0.3) so a single weak shared-victim overlap can't silently merge
+    # unrelated campaigns — requires meaningful co-occurrence.
+    campaign_min_link_score: float = 0.4
     # Value-driven adaptive polling (quick win A1) — after each
     # _value_refresh tick, a source's *effective* poll interval is derived
     # from its cached sources/value.py classification instead of staying
@@ -434,12 +441,12 @@ class Settings(BaseSettings):
     # Items older than this are pruned (see db.py:prune_old_items, wired as a
     # daily job in scheduler.py) to keep the DB from growing unbounded.
     # Effective-critical cases/items are NEVER pruned regardless of age.
-    retention_days: int = 90
+    # 0 (default) disables pruning entirely — set explicitly to enable.
+    retention_days: int = 0
 
     # ai_activity rows are retained independently of items because the audit
-    # trail is often wanted longer than the raw feed. Defaults to the item
-    # retention so existing deployments behave the same until configured.
-    activity_retention_days: int = 90
+    # trail is often wanted longer than the raw feed. 0 disables pruning.
+    activity_retention_days: int = 0
 
     # ── Public-dashboard DoS resistance ─────────────────────────────────────
     # The dashboard is meant for one analyst's own browser tabs but is
@@ -474,6 +481,36 @@ class Settings(BaseSettings):
     # How long a PoW challenge (routes.py: GET /api/accounts/challenge)
     # remains solvable before its signature is rejected as expired.
     account_challenge_ttl_seconds: int = 120
+
+    # ── Threat-intel export (MISP / CSV) ────────────────────────────────────
+    # Token-free, deterministic export of case intel for import into a TIP
+    # (MISP) or spreadsheet tooling (CSV). See api/intel_export.py.
+    #
+    # intel_export_default_tlp: default TLP marking applied to every exported
+    # MISP event as a tag (tlp:clear/green/amber/amber+strict/red). Analysts
+    # set the sharing level in MISP before pushing to sync network — "amber"
+    # is the conservative default (your org and partners, don't republish).
+    intel_export_default_tlp: str = "amber"
+    # UUIDv5 namespace used to derive stable, deterministic event/attribute
+    # UUIDs for MISP (so re-exporting the same case updates rather than
+    # duplicates it). Override with a private UUID so your export namespace
+    # doesn't collide with anyone else running this software. The default is
+    # the RFC 4122 DNS namespace UUID (publicly specified, collision-free with
+    # case_key as the name component).
+    intel_export_namespace_uuid: str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    # Optional dedicated read-only token for the machine-to-machine MISP pull
+    # feed (GET /api/feed/misp). When non-empty, the feed accepts either this
+    # token OR the admin_token in the X-Admin-Token header. When empty, only
+    # the admin_token is accepted. Set to a long random string if you want to
+    # give a TIP read access without sharing the full admin token.
+    intel_feed_token: str = ""
+    # Machine-confidence gate for GET /api/feed/misp — cases whose
+    # case_export_confidence() score (0..100) is below this threshold are
+    # excluded from the feed. 0 disables the gate (all cases are included).
+    # The default (50) roughly requires at least warn-significance + 1 source
+    # OR info-significance + attribution + 2 sources before a case flows into
+    # an external TIP — keeps low-confidence / single-source noise out.
+    intel_feed_min_confidence: float = 50.0
 
 
 settings = Settings()

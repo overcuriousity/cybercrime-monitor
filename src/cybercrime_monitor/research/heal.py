@@ -232,10 +232,25 @@ async def _heal_one(db_conn, source: dict, *, scheduler, sse_broadcaster) -> Non
         )
         return
 
-    await _probe_and_apply(
-        db_conn, proposal_id=proposal_id, url=proposed_url, source=source, value=value,
-        scheduler=scheduler, sse_broadcaster=sse_broadcaster,
-    )
+    try:
+        await _probe_and_apply(
+            db_conn, proposal_id=proposal_id, url=proposed_url, source=source, value=value,
+            scheduler=scheduler, sse_broadcaster=sse_broadcaster,
+        )
+    except Exception:
+        # _probe_and_apply catches its own exceptions internally and updates
+        # the proposal status. If it somehow still raises (e.g. a DB error
+        # inside the probe exception handler), ensure the proposal doesn't
+        # stay at "pending" forever — transition it to rejected so the source
+        # remains eligible for heal on the next cooldown cycle.
+        try:
+            await db.update_heal_proposal_status(
+                db_conn, proposal_id=proposal_id, status="rejected",
+                error="unexpected error in _probe_and_apply",
+            )
+        except Exception:
+            pass
+        raise
 
 
 async def _probe_and_apply(
@@ -480,7 +495,14 @@ async def _maybe_remove_source(db_conn, source: dict, value: dict | None) -> Non
     proposal payload's removal_clock_started flag is what disabled_at is
     read from instead, so the audit trail stays honest about what actually
     happened to the file."""
-    proposals = await db.get_heal_proposals(db_conn, status="validated")
+    # Check ALL statuses, not just "validated": a clock-start proposal that
+    # got stuck at "pending" (transient DB error after create_heal_proposal
+    # committed but before update_heal_proposal_status succeeded) is still a
+    # real clock-start record. Querying only validated would miss it and
+    # create a new clock-start proposal every tick, accumulating pending
+    # orphans indefinitely (each one also triggering source_recently_proposed
+    # and blocking heal from investigating the broken source for 24h).
+    proposals = await db.get_heal_proposals(db_conn, status=None)
     disabled_at = None
     for p in proposals:
         if p["source_id"] != source["id"] or p.get("action") != "prune":

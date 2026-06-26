@@ -201,7 +201,7 @@ MERGE_SCHEMA = {
 # ═══════════════════════════════════════════════════════════════════════════
 
 RESEARCH_PROMPT_TEMPLATE = """\
-You are assisting a cybercrime intelligence monitor. Research the following \
+You are assisting a cybercrime/vulnerability intelligence monitor. Research the following \
 incident using web search and any pages you need to fetch. Try to: confirm \
 the incident is real and ongoing/recent, identify the threat actor or \
 seller if not already known, identify the victim organization if not \

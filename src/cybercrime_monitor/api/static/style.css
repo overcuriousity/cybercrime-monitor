@@ -820,6 +820,38 @@ mark { background: var(--prio-warn-bg); color: var(--prio-warn); padding: 0 2px;
 .btn-merge-case:hover { color: var(--prio-critical); text-decoration: underline; }
 .btn-merge-case:disabled { opacity: 0.5; cursor: default; }
 
+/* Export dropdown — four formats (md / json / MISP / CSV) in the case header */
+.export-dropdown { position: relative; display: inline-block; }
+.export-dropdown-toggle { /* inherits .link-button */ }
+.export-dropdown-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  min-width: 140px;
+  box-shadow: 0 4px 12px rgba(0,0,0,.18);
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  padding: 4px 0;
+}
+.export-dropdown-menu.hidden { display: none; }
+.export-dropdown-item {
+  display: block;
+  padding: 7px 14px;
+  font-size: 0.82rem;
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.export-dropdown-item:hover {
+  background: var(--bg);
+  color: var(--accent-hover);
+}
+
 .case-map-section {
   padding: 10px 16px 14px;
   background: var(--surface);
@@ -1196,6 +1228,50 @@ mark { background: var(--prio-warn-bg); color: var(--prio-warn); padding: 0 2px;
   flex-direction: column;
   gap: 6px;
   margin-top: 12px;
+}
+
+/* ── Campaign clustering panel (Landscape tab, roadmap #3) ─────────────────── */
+.landscape-campaigns-section {
+  margin-top: 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  padding: 12px;
+}
+.landscape-campaigns-section h3 {
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: var(--text-muted);
+  margin-bottom: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.campaign-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.campaign-card {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  padding: 12px 14px;
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+.campaign-card:hover { border-color: var(--accent); }
+.campaign-card-title {
+  font-weight: 600;
+  font-size: 0.9rem;
+  margin-bottom: 4px;
+}
+.campaign-card-meta {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-family: var(--font-mono);
+  margin-bottom: 6px;
 }
 
 /* ── Activity tab ────────────────────────────────────────────────────────── */

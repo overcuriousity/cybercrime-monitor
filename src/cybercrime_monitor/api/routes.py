@@ -6,6 +6,7 @@ import logging
 import re
 import secrets
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
@@ -41,13 +42,19 @@ from ..db import (
     fetch_items,
     get_actor_profile,
     get_all_source_values,
+    get_campaign,
+    get_campaign_for_case,
+    get_campaign_key_for_cases,
     get_case_by_id,
+    get_case_feedback_signals,
+    get_case_false_positive_signals,
     get_case_items,
     get_case_links,
     get_investigation,
     get_recent_extractions,
     get_research_runs_for_case,
     list_ai_activity,
+    list_campaigns,
     list_investigations,
     log_ai_activity,
     merge_cases,
@@ -71,6 +78,14 @@ from ..research import investigate as investigate_health
 from ..scheduler import load_sources
 from ..settings import settings
 from ..sources import value as source_value
+from .intel_export import (
+    campaign_to_misp_event,
+    case_export_confidence,
+    case_to_misp_event,
+    cases_to_csv,
+    cases_to_ioc_list,
+    cases_to_misp_response,
+)
 from .sse import TooManySubscribers, broadcaster
 
 log = logging.getLogger(__name__)
@@ -896,10 +911,216 @@ async def api_cases_by_country(
     return {"by_country": by_country}
 
 
+async def _attach_confidence_signals(db, cases: list[dict]) -> None:
+    """Batch-attach feedback_score and fp_ratio to each case dict in-place.
+
+    Fetches feedback verdicts and false_positive extraction counts for all
+    cases in two batched DB queries (O(1) query count regardless of list
+    size) then sets:
+      case["feedback_score"] — float 0..1 or None (no feedback rows)
+      case["fp_ratio"]       — float 0..1 (fraction of FP extractions)
+
+    These are read by case_export_confidence() to apply the bonus/penalty.
+    Cases without any feedback or extractions get neutral values (score not
+    affected beyond the base signals).
+    """
+    from .intel_export import feedback_score as _fb_score
+
+    if not cases:
+        return
+    case_ids = [c["id"] for c in cases]
+    fb_signals = await get_case_feedback_signals(db, case_ids)
+    fp_signals = await get_case_false_positive_signals(db, case_ids)
+    for c in cases:
+        cid = c["id"]
+        fb = fb_signals.get(cid)
+        c["feedback_score"] = _fb_score(fb) if fb else None
+        fp = fp_signals.get(cid)
+        if fp and fp["item_count"] > 0:
+            c["fp_ratio"] = fp["fp_count"] / fp["item_count"]
+        else:
+            c["fp_ratio"] = 0.0
+
+
+def _require_feed_auth(x_admin_token: str | None = Header(default=None)) -> None:
+    """Gate for the MISP pull feed — accepts either the admin token or the
+    dedicated (read-only) feed token from settings.intel_feed_token. Fails
+    closed: if neither is configured the feed is unreachable, which is safer
+    than silently public. When a feed token is configured a downstream TIP
+    gets read access without sharing the full admin capabilities."""
+    if _is_valid_admin_token(x_admin_token):
+        return
+    feed_token = settings.intel_feed_token
+    if feed_token and x_admin_token and hmac.compare_digest(x_admin_token, feed_token):
+        return
+    raise HTTPException(status_code=403, detail="Admin token or feed token required")
+
+
+# ── Batch / feed export — registered before /api/cases/{case_id} so FastAPI's
+# router matches the literal path segment "export" rather than treating it as
+# an integer case_id. ──────────────────────────────────────────────────────────
+
+@router.get("/api/cases/export")
+async def api_cases_batch_export(
+    db=Depends(get_db),
+    format: str = Query(default="misp", pattern="^(misp|csv|ioc)$"),
+    min_significance: str | None = Query(default=None),
+    crime_type: str | None = Query(default=None),
+    in_kev: bool | None = Query(default=None),
+    search: str | None = Query(default=None),
+    cve_id: str | None = Query(default=None),
+    ioc: str | None = Query(default=None),
+    since: str | None = Query(default=None),
+    until: str | None = Query(default=None),
+    country: str | None = Query(default=None),
+    limit: int = Query(default=500, le=1000, ge=1),
+):
+    """Batch threat-intel export of a filtered set of cases. Honors the same
+    filter params as GET /api/cases (significance, crime_type, in_kev, search,
+    cve_id, ioc, since, until, country) so the caller can export exactly what
+    the Cases tab is showing.
+
+    Formats (?format=):
+    - misp (default): MISP REST-API-style response wrapping all matching cases
+      as MISP events. Individual events contain IOCs/CVEs/ATT&CK/attribution
+      but NOT per-case source URLs or research findings (use the single-case
+      endpoint for the full bundle). Token-free.
+    - csv:  Flat CSV, one row per case, list fields pipe-separated.
+    - ioc:  Deduplicated flat IOC list across all matching cases (one per line);
+            suitable for blocklists / firewall deny-lists.
+
+    No auth required — same access model as GET /api/cases (public read).
+    All formatting is token-free (api/intel_export.py, no LLM calls).
+    """
+    since_norm = _normalize_date_filter(since, end_of_day=False)
+    until_norm = _normalize_date_filter(until, end_of_day=True)
+    cases = await fetch_cases(
+        db,
+        limit=limit,
+        offset=0,
+        min_significance=min_significance,
+        crime_type=crime_type,
+        in_kev=in_kev,
+        search=search,
+        cve_id=cve_id,
+        ioc=ioc,
+        since=since_norm,
+        until=until_norm,
+        country=country,
+    )
+    # Batch-attach feedback + FP signals for enriched confidence (roadmap #2)
+    await _attach_confidence_signals(db, cases)
+
+    ns = uuid.UUID(settings.intel_export_namespace_uuid)
+
+    if format == "misp":
+        # Batch resolve campaign membership for part-of-campaign RelatedEvent (roadmap #3)
+        campaign_key_map = await get_campaign_key_for_cases(db, [c["id"] for c in cases])
+        events = []
+        for c in cases:
+            camp_uuid = None
+            camp_key = campaign_key_map.get(c["id"])
+            if camp_key:
+                camp_uuid = str(uuid.uuid5(ns, f"campaign:{camp_key}"))
+            events.append(
+                case_to_misp_event(c, [], [], [],
+                                   tlp=settings.intel_export_default_tlp,
+                                   campaign_id=camp_uuid,
+                                   namespace=ns)
+            )
+        body = {"response": events}
+        count = len(cases)
+        return JSONResponse(
+            body,
+            headers={"Content-Disposition": f'attachment; filename="cases-export-{count}.misp.json"'},
+        )
+
+    if format == "csv":
+        csv_text = cases_to_csv(cases)
+        return PlainTextResponse(
+            csv_text, media_type="text/csv",
+            headers={"Content-Disposition": 'attachment; filename="cases-export.csv"'},
+        )
+
+    # format == "ioc"
+    ioc_text = cases_to_ioc_list(cases)
+    return PlainTextResponse(
+        ioc_text, media_type="text/plain",
+        headers={"Content-Disposition": 'attachment; filename="ioc-feed.txt"'},
+    )
+
+
+@router.get("/api/feed/misp", dependencies=[Depends(_require_feed_auth)])
+async def api_feed_misp(
+    db=Depends(get_db),
+    since: str | None = Query(default=None),
+    min_confidence: float | None = Query(default=None, ge=0, le=100),
+    limit: int = Query(default=1000, le=5000, ge=1),
+):
+    """Machine-to-machine MISP pull feed for a Threat Intelligence Platform.
+
+    Returns confirmed, high-confidence cases as a MISP REST-API response that
+    a TIP can poll periodically. Gating is entirely machine-driven:
+    - cases.status must be 'confirmed' (set by the research agent when it
+      verifies an incident — never set by a human).
+    - case_export_confidence() must meet the threshold (settings.
+      intel_feed_min_confidence, default 50). Pass ?min_confidence= to
+      override per-request.
+
+    Use ?since= (ISO timestamp, e.g. 2025-01-01T00:00:00+00:00) as a cursor
+    for incremental polling — returns only cases last_seen after that point.
+    No ?since= returns all feed-eligible cases (for initial TIP population).
+
+    Auth: X-Admin-Token header (admin token or dedicated feed token from
+    settings.intel_feed_token — see _require_feed_auth above).
+    Token-free rendering — no LLM calls.
+    """
+    since_norm = _normalize_date_filter(since, end_of_day=False)
+    # Fetch confirmed cases since cursor (or all-time on first poll).
+    # Status is filtered in the DB so non-confirmed cases never consume limit
+    # slots and push confirmed cases out of the result window.
+    # Confidence is still gated in Python — it depends on signals attached
+    # after the fetch, so it cannot be expressed in SQL without a schema change.
+    raw_cases = await fetch_cases(db, limit=limit, offset=0, since=since_norm, status="confirmed")
+    # Batch-attach feedback + false_positive signals before scoring (roadmap #2)
+    # — two batch DB queries, O(1) regardless of case count.
+    await _attach_confidence_signals(db, raw_cases)
+    confidence_floor = (
+        min_confidence if min_confidence is not None
+        else settings.intel_feed_min_confidence
+    )
+    eligible = [
+        c for c in raw_cases
+        if case_export_confidence(c) >= confidence_floor
+    ]
+    ns = uuid.UUID(settings.intel_export_namespace_uuid)
+    # Batch resolve campaign membership — one query, not one-per-case (roadmap #3)
+    campaign_key_map = await get_campaign_key_for_cases(db, [c["id"] for c in eligible])
+    events = []
+    for c in eligible:
+        camp_uuid = None
+        camp_key = campaign_key_map.get(c["id"])
+        if camp_key:
+            camp_uuid = str(uuid.uuid5(ns, f"campaign:{camp_key}"))
+        events.append(
+            case_to_misp_event(c, [], [], [],
+                               tlp=settings.intel_export_default_tlp,
+                               campaign_id=camp_uuid,
+                               namespace=ns)
+        )
+    body = {"response": events}
+    return JSONResponse(body, headers={"X-Feed-Case-Count": str(len(eligible))})
+
+
 async def _load_case_bundle(db, case_id: int) -> tuple[dict, list[dict], list[dict], list[dict]]:
     """Shared data fetch for the case detail pane and Markdown/JSON export.
     Returns (case, items, research_runs, related_cases) with JSON fields already
-    decoded and booleans normalised. Raises 404 if the case does not exist."""
+    decoded and booleans normalised. Raises 404 if the case does not exist.
+
+    Also attaches feedback_score/fp_ratio (roadmap #2) so case_export_confidence
+    returns the fully-enriched score, and export_confidence is available in the
+    case dict for the detail pane.
+    """
     case = await get_case_by_id(db, case_id)
     if case is None:
         raise HTTPException(status_code=404, detail="Case not found")
@@ -911,6 +1132,10 @@ async def _load_case_bundle(db, case_id: int) -> tuple[dict, list[dict], list[di
     # enrichment has resolved at least one of the case's CVEs.
     case["cwe_ids"] = json.loads(case["cwe_ids"]) if case["cwe_ids"] else []
     case["mitre_techniques"] = json.loads(case["mitre_techniques"]) if case["mitre_techniques"] else []
+    # Batch-attach feedback and false_positive signals (roadmap #2), wrapping
+    # the single case as a list so _attach_confidence_signals stays generic.
+    await _attach_confidence_signals(db, [case])
+    case["export_confidence"] = case_export_confidence(case)
     items = await get_case_items(db, case_id)
     research_runs = await get_research_runs_for_case(db, case_id)
     related = await get_case_links(db, case_id)
@@ -1027,23 +1252,58 @@ def _case_to_markdown(case: dict, items: list[dict], research_runs: list[dict], 
 
 @router.get("/api/cases/{case_id}/export")
 async def api_case_export(case_id: int, db=Depends(get_db), format: str = Query(default="md")):
-    """Markdown/JSON case report for sharing intel out of this single-
-    analyst console — same underlying data as GET /api/cases/{id}, just
-    rendered for a human reading it outside the dashboard rather than the
-    UI's detail pane."""
-    if format not in ("md", "json"):
-        raise HTTPException(status_code=400, detail="format must be 'md' or 'json'")
+    """Case report export. Supports four formats via ?format=:
+
+    - md   (default): Markdown report for human reading outside the dashboard.
+    - json: Raw JSON bundle (case + items + research_runs + related_cases).
+    - misp: MISP event JSON — full bundle with IOCs, CVEs, ATT&CK techniques,
+            attribution, source URLs, and TLP/confidence tags; ready for direct
+            import into MISP or any compatible TIP.
+    - csv:  Single-row CSV with all case fields; list values pipe-separated.
+
+    md/json are unchanged from prior behaviour. misp/csv are token-free
+    renderers (see api/intel_export.py) — no LLM calls.
+    """
+    if format not in ("md", "json", "misp", "csv"):
+        raise HTTPException(status_code=400, detail="format must be 'md', 'json', 'misp', or 'csv'")
 
     case, items, research_runs, related = await _load_case_bundle(db, case_id)
 
     if format == "json":
         return {"case": case, "items": items, "research_runs": research_runs, "related_cases": related}
 
-    markdown = _case_to_markdown(case, items, research_runs, related)
-    filename = f"case-{case_id}.md"
+    if format == "md":
+        markdown = _case_to_markdown(case, items, research_runs, related)
+        filename = f"case-{case_id}.md"
+        return PlainTextResponse(
+            markdown, media_type="text/markdown",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    if format == "misp":
+        ns = uuid.UUID(settings.intel_export_namespace_uuid)
+        # Resolve campaign membership for part-of-campaign RelatedEvent (roadmap #3)
+        camp_uuid = None
+        camp_key_map = await get_campaign_key_for_cases(db, [case_id])
+        camp_key = camp_key_map.get(case_id)
+        if camp_key:
+            camp_uuid = str(uuid.uuid5(ns, f"campaign:{camp_key}"))
+        event = case_to_misp_event(
+            case, items, research_runs, related,
+            tlp=settings.intel_export_default_tlp,
+            campaign_id=camp_uuid,
+            namespace=ns,
+        )
+        return JSONResponse(
+            event,
+            headers={"Content-Disposition": f'attachment; filename="case-{case_id}.misp.json"'},
+        )
+
+    # format == "csv"
+    csv_text = cases_to_csv([case])
     return PlainTextResponse(
-        markdown, media_type="text/markdown",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        csv_text, media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="case-{case_id}.csv"'},
     )
 
 
@@ -1056,6 +1316,69 @@ async def api_actor_profile(actor: str, db=Depends(get_db)):
     if profile is None:
         raise HTTPException(status_code=404, detail="No cases attributed to this actor")
     return profile
+
+
+# ── Campaign clustering (roadmap #3) ─────────────────────────────────────────
+# Machine-derived connected-components clusters over the case_links graph
+# (pipeline/campaigns.py, token-free). Three endpoints:
+#   GET /api/campaigns          — list all materialized campaigns
+#   GET /api/campaigns/{id}     — detail with member cases
+#   GET /api/campaigns/{id}/export?format=misp — MISP cluster event + members
+#
+# Route ordering: /api/campaigns/export must come BEFORE /api/campaigns/{id}
+# so FastAPI matches the literal "export" segment, not an integer id.
+
+@router.get("/api/campaigns")
+async def api_campaigns_list(db=Depends(get_db)):
+    """List all machine-derived campaign clusters (token-free, from the
+    campaigns materialized table refreshed by pipeline/campaigns.py)."""
+    return {"campaigns": await list_campaigns(db)}
+
+
+@router.get("/api/campaigns/{campaign_id}/export")
+async def api_campaign_export(
+    campaign_id: int,
+    db=Depends(get_db),
+    format: str = Query(default="misp", pattern="^misp$"),
+):
+    """Export a campaign cluster as a MISP cluster event.
+
+    The event contains:
+    - Union of all member IOC/CVE attributes.
+    - Dominant actor, sector, country, crime-type tags.
+    - RelatedEvent links to every member case's stable MISP event UUID.
+    - UUID derived deterministically from campaign_key so re-export updates
+      rather than duplicates the MISP event.
+
+    Token-free renderer (api/intel_export.campaign_to_misp_event).
+    """
+    campaign = await get_campaign(db, campaign_id)
+    if campaign is None:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    ns = uuid.UUID(settings.intel_export_namespace_uuid)
+    member_cases = campaign.get("cases") or []
+    # Attach confidence signals to members so their confidence scores are accurate
+    await _attach_confidence_signals(db, member_cases)
+    event = campaign_to_misp_event(
+        campaign, member_cases,
+        tlp=settings.intel_export_default_tlp,
+        namespace=ns,
+    )
+    camp_key = campaign.get("campaign_key", str(campaign_id))
+    return JSONResponse(
+        event,
+        headers={"Content-Disposition": f'attachment; filename="campaign-{camp_key}.misp.json"'},
+    )
+
+
+@router.get("/api/campaigns/{campaign_id}")
+async def api_campaign_detail(campaign_id: int, db=Depends(get_db)):
+    """Full detail for one campaign cluster — member cases, aggregate
+    IOCs/CVEs/sectors/countries, date range, dominant actor."""
+    campaign = await get_campaign(db, campaign_id)
+    if campaign is None:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    return campaign
 
 
 @router.post("/api/cases/{case_id}/research", dependencies=[Depends(require_admin)])
